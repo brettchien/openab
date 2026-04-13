@@ -17,6 +17,12 @@ use tracing::info;
 #[derive(Parser)]
 #[command(name = "openab")]
 #[command(about = "Discord bot that manages ACP agent sessions", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(clap::Subcommand)]
 enum Commands {
     /// Run the bot (default)
     Run {
@@ -40,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cmd = Commands::parse();
+    let cmd = Cli::parse().command.unwrap_or(Commands::Run { config: None });
 
     match cmd {
         Commands::Setup { output } => {
@@ -91,7 +97,6 @@ async fn main() -> anyhow::Result<()> {
                 allowed_users,
                 reactions_config: cfg.reactions,
                 stt_config: cfg.stt.clone(),
-
             };
 
             let intents = GatewayIntents::GUILD_MESSAGES
