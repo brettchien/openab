@@ -1,6 +1,6 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
-use crate::config::SttConfig;
+use crate::config::{AllowBots, SttConfig};
 use crate::format;
 use crate::media;
 use async_trait::async_trait;
@@ -14,6 +14,10 @@ use serenity::prelude::*;
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info};
+
+/// Hard cap on consecutive bot messages in a channel or thread.
+/// Prevents runaway loops between multiple bots in "all" mode.
+const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -117,19 +121,23 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
+    pub allow_bot_messages: AllowBots,
+    pub trusted_bot_ids: HashSet<u64>,
 }
 
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
+        let bot_id = ctx.cache.current_user().id;
+
+        // Always ignore own messages
+        if msg.author.id == bot_id {
             return;
         }
 
         let adapter = self.adapter.get_or_init(|| {
             Arc::new(DiscordAdapter::new(ctx.http.clone()))
         }).clone();
-        let bot_id = ctx.cache.current_user().id;
 
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
@@ -141,6 +149,56 @@ impl EventHandler for Handler {
                 .mention_roles
                 .iter()
                 .any(|r| msg.content.contains(&format!("<@&{}>", r)));
+
+        // Bot message gating (from upstream #321)
+        if msg.author.bot {
+            match self.allow_bot_messages {
+                AllowBots::Off => return,
+                AllowBots::Mentions => if !is_mentioned { return; },
+                AllowBots::All => {
+                    let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
+                    let history = ctx.cache.channel_messages(msg.channel_id)
+                        .map(|msgs| {
+                            let mut recent: Vec<_> = msgs.iter()
+                                .filter(|(mid, _)| **mid < msg.id)
+                                .map(|(_, m)| m.clone())
+                                .collect();
+                            recent.sort_unstable_by(|a, b| b.id.cmp(&a.id));
+                            recent.truncate(cap);
+                            recent
+                        })
+                        .filter(|msgs| !msgs.is_empty());
+
+                    let recent = if let Some(cached) = history {
+                        cached
+                    } else {
+                        match msg.channel_id
+                            .messages(&ctx.http, serenity::builder::GetMessages::new().before(msg.id).limit(MAX_CONSECUTIVE_BOT_TURNS))
+                            .await
+                        {
+                            Ok(msgs) => msgs,
+                            Err(e) => {
+                                tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
+                                return;
+                            }
+                        }
+                    };
+
+                    let consecutive_bot = recent.iter()
+                        .take_while(|m| m.author.bot && m.author.id != bot_id)
+                        .count();
+                    if consecutive_bot >= cap {
+                        tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
+                        return;
+                    }
+                },
+            }
+
+            if !self.trusted_bot_ids.is_empty() && !self.trusted_bot_ids.contains(&msg.author.id.get()) {
+                tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                return;
+            }
+        }
 
         let in_thread = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
@@ -217,10 +275,9 @@ impl EventHandler for Handler {
                         mime_clean,
                         u64::from(attachment.size),
                         &self.stt_config,
-                        None, // Discord CDN is public
+                        None,
                     ).await {
                         debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                        // Prepend transcript before the main text block
                         extra_blocks.insert(0, ContentBlock::Text {
                             text: format!("[Voice message transcript]: {transcript}"),
                         });
@@ -233,7 +290,7 @@ impl EventHandler for Handler {
                 attachment.content_type.as_deref(),
                 &attachment.filename,
                 u64::from(attachment.size),
-                None, // Discord CDN is public
+                None,
             ).await {
                 debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                 extra_blocks.push(block);
@@ -330,4 +387,3 @@ static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 fn strip_mention(content: &str) -> String {
     MENTION_RE.replace_all(content, "").trim().to_string()
 }
-

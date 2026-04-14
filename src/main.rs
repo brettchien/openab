@@ -110,9 +110,12 @@ async fn main() -> anyhow::Result<()> {
         let allowed_channels =
             parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
+        let trusted_bot_ids = parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
         info!(
             channels = allowed_channels.len(),
             users = allowed_users.len(),
+            trusted_bots = trusted_bot_ids.len(),
+            allow_bot_messages = ?discord_cfg.allow_bot_messages,
             "starting discord adapter"
         );
 
@@ -122,6 +125,8 @@ async fn main() -> anyhow::Result<()> {
             allowed_users,
             stt_config: cfg.stt.clone(),
             adapter: std::sync::OnceLock::new(),
+            allow_bot_messages: discord_cfg.allow_bot_messages,
+            trusted_bot_ids,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
