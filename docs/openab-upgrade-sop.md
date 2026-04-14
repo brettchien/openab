@@ -27,7 +27,7 @@
 
 > **Deployment naming pattern:** The deployment name follows `<release-name>-kiro`. For the default setup (`helm install openab …`), the deployment is `openab-kiro`. If you used a different release name (e.g. `my-bot`), the deployment is `my-bot-kiro`. Verify with:
 > ```bash
-> RELEASE_NAME=$(helm list -o json | jq -r '.[0].name')
+> RELEASE_NAME=$(helm list -o json | jq -r '.[] | select(.chart | startswith("openab-")) | .name' | head -1)
 > DEPLOYMENT="${RELEASE_NAME}-kiro"
 > echo "Deployment: $DEPLOYMENT"
 > ```
@@ -170,7 +170,7 @@ export KUBECONFIG=~/.kube/config
 # source openab-session-env.sh && echo "✅ Session env loaded" && exit 0
 
 # --- Resolve release and deployment names ---
-RELEASE_NAME=$(helm list -o json | jq -r '.[0].name')
+RELEASE_NAME=$(helm list -o json | jq -r '.[] | select(.chart | startswith("openab-")) | .name' | head -1)
 if [ -z "$RELEASE_NAME" ]; then
   echo "❌ No Helm release found. Is OpenAB installed?"
   exit 1
@@ -496,69 +496,6 @@ else
 fi
 ```
 
-### One-Click Backup Script
-
-The script below combines Steps 0–7 and the Verification Gate.
-
-```bash
-#!/bin/bash
-export KUBECONFIG=~/.kube/config
-source openab-session-env.sh
-
-BACKUP_DIR="openab-backup-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-
-POD=$(kubectl get pod \
-  -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/name=${DEPLOYMENT}" \
-  -o jsonpath='{.items[0].metadata.name}')
-if [ -z "$POD" ]; then echo "❌ Pod not found. Aborting." && exit 1; fi
-if ! kubectl exec "$POD" -- which tar > /dev/null 2>&1; then
-  echo "❌ tar not found in container. Aborting." && exit 1
-fi
-
-echo "export BACKUP_DIR=\"${BACKUP_DIR}\"" >> openab-session-env.sh
-
-FAILED_STEPS=()
-backup_step() {
-  local desc="$1"; shift
-  echo "=== $desc ==="
-  if ! "$@"; then
-    echo "⚠️  Failed: $desc"
-    FAILED_STEPS+=("$desc")
-  fi
-}
-
-backup_step "Helm values"       bash -c "helm get values '$RELEASE_NAME' -o yaml > $BACKUP_DIR/values.yaml"
-backup_step "Agent config"      kubectl cp "$POD:/home/agent/.kiro/agents/" "$BACKUP_DIR/agents/"
-backup_step "Steering files"    kubectl cp "$POD:/home/agent/.kiro/steering/" "$BACKUP_DIR/steering/"
-backup_step "hosts.yml"         kubectl cp "$POD:/home/agent/.config/gh/hosts.yml" "$BACKUP_DIR/hosts.yml"
-backup_step "kiro-cli auth DB"  kubectl cp "$POD:/home/agent/.local/share/kiro-cli/data.sqlite3" "$BACKUP_DIR/kiro-auth.sqlite3"
-backup_step "Kubernetes Secret" bash -c "kubectl get secret '${DEPLOYMENT}' -o yaml > $BACKUP_DIR/secret.yaml"
-backup_step "Helm history"      bash -c "helm history '$RELEASE_NAME' > $BACKUP_DIR/helm-history.txt"
-backup_step "PVC data"          kubectl cp "$POD:/home/agent/" "$BACKUP_DIR/pvc-data/"
-
-if kubectl exec "$POD" -- test -d /home/agent/.kiro/skills 2>/dev/null; then
-  backup_step "Skills" kubectl cp "$POD:/home/agent/.kiro/skills/" "$BACKUP_DIR/skills/"
-else
-  echo "⚠️ skills/ not found — skipping"
-fi
-
-echo ""
-echo "=== Backup Summary: $BACKUP_DIR ==="
-ls -la "$BACKUP_DIR/"
-
-if [ ${#FAILED_STEPS[@]} -gt 0 ]; then
-  echo "⚠️  Failed steps: ${FAILED_STEPS[*]}"
-  echo "   Review failures before proceeding with the upgrade."
-else
-  echo "✅ All backup steps completed."
-fi
-
-echo ""
-echo "🔐 SECURITY: $BACKUP_DIR/secret.yaml contains credentials. Do NOT commit."
-echo "   gpg --symmetric $BACKUP_DIR/secret.yaml"
-```
-
 ---
 
 ## III. Upgrade Execution
@@ -641,7 +578,7 @@ echo ""
 echo "  When confirmed OK, type:  CONFIRMED"
 echo "  To abort and rollback,    type:  ROLLBACK"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-read -r HUMAN_INPUT
+read -t 600 -r HUMAN_INPUT || { echo "❌ Timeout: no human input received within 600s. Aborting."; exit 1; }
 case "$HUMAN_INPUT" in
   CONFIRMED)
     echo "✅ Human confirmed — proceeding to Step 2"
@@ -748,7 +685,7 @@ echo ""
 echo "  When confirmed OK, type:  CONFIRMED"
 echo "  If issues found,   type:  ROLLBACK"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-read -r HUMAN_INPUT
+read -t 600 -r HUMAN_INPUT || { echo "❌ Timeout: no human input received within 600s. Aborting."; exit 1; }
 case "$HUMAN_INPUT" in
   CONFIRMED) echo "✅ Upgrade complete." ;;
   ROLLBACK)  echo "🔁 Rollback requested. Proceed to Section IV."; exit 2 ;;
