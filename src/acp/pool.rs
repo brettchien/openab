@@ -23,6 +23,21 @@ pub struct SessionPool {
     max_sessions: usize,
 }
 
+fn remove_if_same_handle<T>(
+    map: &mut HashMap<String, Arc<Mutex<T>>>,
+    key: &str,
+    expected: &Arc<Mutex<T>>,
+) -> Option<Arc<Mutex<T>>> {
+    let should_remove = map
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, expected));
+    if should_remove {
+        map.remove(key)
+    } else {
+        None
+    }
+}
+
 impl SessionPool {
     pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
         Self {
@@ -66,17 +81,18 @@ impl SessionPool {
                 .collect()
         };
 
-        let mut eviction_candidate: Option<(String, Instant, Option<String>)> = None;
+        let mut eviction_candidate: Option<(String, Arc<Mutex<AcpConnection>>, Instant, Option<String>)> = None;
         for (key, conn) in snapshot {
             if key == thread_id {
                 continue;
             }
+            let conn_handle = Arc::clone(&conn);
             let Ok(conn) = conn.try_lock() else {
                 continue;
             };
-            let candidate = (key, conn.last_active, conn.acp_session_id.clone());
+            let candidate = (key, conn_handle, conn.last_active, conn.acp_session_id.clone());
             match &eviction_candidate {
-                Some((_, oldest_last_active, _)) if candidate.1 >= *oldest_last_active => {}
+                Some((_, _, oldest_last_active, _)) if candidate.2 >= *oldest_last_active => {}
                 _ => eviction_candidate = Some(candidate),
             }
         }
@@ -134,8 +150,8 @@ impl SessionPool {
         }
 
         if state.active.len() >= self.max_sessions {
-            if let Some((key, _, sid)) = eviction_candidate {
-                if state.active.remove(&key).is_some() {
+            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
+                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.suspended.insert(key, sid);
@@ -189,11 +205,12 @@ impl SessionPool {
         for (key, conn) in snapshot {
             // Skip active sessions for this cleanup round instead of waiting on
             // their per-connection mutex. A busy session is not idle.
+            let conn_handle = Arc::clone(&conn);
             let Ok(conn) = conn.try_lock() else {
                 continue;
             };
             if conn.last_active < cutoff || !conn.alive() {
-                stale.push((key, conn.acp_session_id.clone()));
+                stale.push((key, conn_handle, conn.acp_session_id.clone()));
             }
         }
 
@@ -202,8 +219,8 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        for (key, sid) in stale {
-            if state.active.remove(&key).is_some() {
+        for (key, expected_conn, sid) in stale {
+            if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 if let Some(sid) = sid {
                     state.suspended.insert(key, sid);
@@ -217,5 +234,37 @@ impl SessionPool {
         let count = state.active.len();
         state.active.clear(); // Drop impl kills process groups
         info!(count, "pool shutdown complete");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_if_same_handle;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn remove_if_same_handle_removes_matching_entry() {
+        let expected = Arc::new(Mutex::new(1_u8));
+        let mut map = HashMap::from([("thread".to_string(), Arc::clone(&expected))]);
+
+        let removed = remove_if_same_handle(&mut map, "thread", &expected);
+
+        assert!(removed.is_some());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn remove_if_same_handle_keeps_replaced_entry() {
+        let stale = Arc::new(Mutex::new(1_u8));
+        let fresh = Arc::new(Mutex::new(2_u8));
+        let mut map = HashMap::from([("thread".to_string(), Arc::clone(&fresh))]);
+
+        let removed = remove_if_same_handle(&mut map, "thread", &stale);
+
+        assert!(removed.is_none());
+        let current = map.get("thread").expect("entry should remain");
+        assert!(Arc::ptr_eq(current, &fresh));
     }
 }
