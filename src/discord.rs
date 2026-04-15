@@ -791,17 +791,28 @@ fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> Str
     out
 }
 
+static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<@[!&]?\d+>").unwrap()
+});
+
 fn resolve_mentions(content: &str, bot_id: UserId, mentions: &[User]) -> String {
-    let bot_re = regex::Regex::new(&format!(r"<@!?{}>", bot_id)).unwrap();
-    let mut out = bot_re.replace_all(content, "").to_string();
+    // 1. Strip the bot's own trigger mention
+    let mut out = content
+        .replace(&format!("<@{}>", bot_id), "")
+        .replace(&format!("<@!{}>", bot_id), "");
+    // 2. Resolve known user mentions to @DisplayName
     for user in mentions {
         if user.id == bot_id {
             continue;
         }
         let label = user.global_name.as_deref().unwrap_or(&user.name);
-        let re = regex::Regex::new(&format!(r"<@!?{}>", user.id)).unwrap();
-        out = re.replace_all(&out, format!("@{}", label)).to_string();
+        let display = format!("@{}", label);
+        out = out
+            .replace(&format!("<@{}>", user.id), &display)
+            .replace(&format!("<@!{}>", user.id), &display);
     }
+    // 3. Fallback: replace any remaining unresolved mentions (including role mentions)
+    let out = MENTION_RE.replace_all(&out, "@unknown").to_string();
     out.trim().to_string()
 }
 
