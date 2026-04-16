@@ -1,27 +1,30 @@
-# OpenAB Upgrade SOP
+# OpenAB Install & Upgrade Guide
 
-> **[AI Instruction]** Follow this guide to upgrade an OpenAB Helm deployment. Execute each section in order. If any step fails, follow the ROLLBACK section. Do not skip the backup.
+> **[AI Instruction]** Follow this guide to install or upgrade an OpenAB Helm deployment. Execute each section in order. If any step fails, follow the ROLLBACK section. Do not skip the backup (for upgrades).
 
 ## Goal
 
-Enable an AI agent to upgrade OpenAB from any version to a target stable or beta version. Back up everything first, upgrade, validate, and automatically roll back if anything goes wrong.
+Enable an AI agent to fresh-install or upgrade OpenAB on Kubernetes. For upgrades: back up everything first, upgrade, validate, and automatically roll back if anything goes wrong.
 
 ## How to Use
 
 Tell your AI agent to follow this guide. Example prompts:
 
 ```
+# Fresh install with kiro on local k8s
+fresh install https://github.com/openabdev/openab v0.7.7 with kiro on my local k8s with all credentials in .env
+
 # Upgrade to latest stable
-Upgrade openab per docs/openab-upgrade-sop.md
+upgrade to latest stable for my local openab k8s deployment per https://github.com/openabdev/openab/blob/main/docs/ai-install-upgrade.md
 
 # Upgrade to a specific version
-Upgrade openab to 0.7.7 per the upgrade SOP
+upgrade to v0.7.7 for my local openab k8s deployment per https://github.com/openabdev/openab/blob/main/docs/ai-install-upgrade.md
 
 # Upgrade to a beta
-Upgrade openab to 0.7.7-beta.1 per the upgrade SOP
+upgrade to v0.7.7-beta.1 for my local openab k8s deployment per https://github.com/openabdev/openab/blob/main/docs/ai-install-upgrade.md
 
 # Rollback after a bad upgrade
-Rollback openab per the upgrade SOP — the upgrade to 0.7.7 failed
+rollback openab per the upgrade SOP — the upgrade to v0.7.7 failed
 ```
 
 ---
