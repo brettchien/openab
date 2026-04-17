@@ -41,7 +41,9 @@ app.kubernetes.io/component: {{ .agent }}
 {{- printf "%s-%s" (include "openab.fullname" .ctx) .agent | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion) */}}
+{{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion).
+    Caveat: "contains :" treats registry ports (e.g. my-registry:5000/img) as tagged.
+    Not an issue for ghcr.io / Docker Hub; revisit if custom registries with ports are needed. */}}
 {{- define "openab.agentImage" -}}
 {{- if and .cfg.image (kindIs "string" .cfg.image) (ne .cfg.image "") }}
 {{- if contains ":" .cfg.image }}
