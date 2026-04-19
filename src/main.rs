@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                     multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                     session_ttl: std::time::Duration::from_secs(ttl_secs),
                     max_bot_turns: discord_cfg.max_bot_turns,
-                    bot_turn_counts: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    bot_turns: tokio::sync::Mutex::new(discord::BotTurnTracker::new(discord_cfg.max_bot_turns)),
                 };
 
                 let intents = GatewayIntents::GUILD_MESSAGES
