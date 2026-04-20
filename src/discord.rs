@@ -244,6 +244,15 @@ impl EventHandler for Handler {
         let is_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id));
 
+        // Early multibot detection: cache that another bot is present in this
+        // channel/thread. Runs BEFORE bot message gating so we detect other
+        // bots even when their messages are filtered out. (#481)
+        if msg.author.bot && msg.author.id != bot_id {
+            let key = msg.channel_id.to_string();
+            let mut cache = self.multibot_threads.lock().await;
+            cache.entry(key).or_insert_with(tokio::time::Instant::now);
+        }
+
         // Bot message gating (from upstream #321)
         if msg.author.bot {
             match self.allow_bot_messages {
@@ -328,14 +337,6 @@ impl EventHandler for Handler {
 
         if !in_allowed_channel && !in_thread {
             return;
-        }
-
-        // Early multibot detection: if the current message is from another bot,
-        // this thread is multi-bot. Cache it now — no fetch needed.
-        if in_thread && msg.author.bot && msg.author.id != bot_id {
-            let key = msg.channel_id.to_string();
-            let mut cache = self.multibot_threads.lock().await;
-            cache.entry(key).or_insert_with(tokio::time::Instant::now);
         }
 
         // User message gating (mirrors Slack's AllowUsers logic).
@@ -818,10 +819,39 @@ fn resolve_mentions(content: &str, bot_id: UserId) -> String {
     out.trim().to_string()
 }
 
+/// Pure decision function: should this message be processed or ignored?
+/// Returns `true` if the message should be processed (bot responds).
+/// Extracted from the EventHandler::message gating logic for testability.
+#[cfg(test)]
+fn should_process_user_message(
+    mode: AllowUsers,
+    is_mentioned: bool,
+    in_thread: bool,
+    involved: bool,
+    other_bot_present: bool,
+) -> bool {
+    if is_mentioned {
+        return true;
+    }
+    match mode {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => in_thread && involved,
+        AllowUsers::MultibotMentions => {
+            if !in_thread || !involved {
+                return false;
+            }
+            !other_bot_present
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // --- Bot turn tracker tests ---
+
+    /// Basic increment: bot messages below the soft limit return Ok.
     #[test]
     fn bot_turns_increment() {
         let mut t = BotTurnTracker::new(5);
@@ -829,6 +859,7 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
     }
 
+    /// Soft limit: after N consecutive bot turns, returns SoftLimit.
     #[test]
     fn soft_limit_triggers() {
         let mut t = BotTurnTracker::new(3);
@@ -837,6 +868,7 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
     }
 
+    /// Human message resets both soft and hard counters, allowing bots to continue.
     #[test]
     fn human_resets_both_counters() {
         let mut t = BotTurnTracker::new(3);
@@ -849,6 +881,7 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
     }
 
+    /// Hard limit: absolute cap on bot turns, triggers after HARD_BOT_TURN_LIMIT.
     #[test]
     fn hard_limit_triggers() {
         let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
@@ -858,6 +891,7 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
     }
 
+    /// Hard limit resets on human message, allowing bots to continue.
     #[test]
     fn hard_limit_resets_on_human() {
         let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
@@ -869,6 +903,7 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
     }
 
+    /// When soft and hard limits are equal, hard limit takes precedence.
     #[test]
     fn hard_before_soft_when_equal() {
         let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
@@ -879,6 +914,7 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
     }
 
+    /// Turn counters are per-thread — one thread hitting the limit doesn't affect others.
     #[test]
     fn threads_are_independent() {
         let mut t = BotTurnTracker::new(3);
@@ -889,9 +925,157 @@ mod tests {
         assert_eq!(t.on_bot_message("t2"), TurnResult::Ok);
     }
 
+    /// Human message on an unknown thread is a no-op (should not panic).
     #[test]
     fn human_on_unknown_thread_is_noop() {
         let mut t = BotTurnTracker::new(5);
         t.on_human_message("unknown"); // should not panic
+    }
+
+    // --- resolve_mentions tests ---
+
+    /// Bot's own <@UID> mention is stripped from the prompt.
+    #[test]
+    fn resolve_mentions_strips_bot_mention() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("hello <@111> world", bot_id);
+        assert_eq!(result, "hello  world");
+    }
+
+    /// Bot's own legacy <@!UID> mention is also stripped.
+    #[test]
+    fn resolve_mentions_strips_bot_mention_legacy() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("hello <@!111> world", bot_id);
+        assert_eq!(result, "hello  world");
+    }
+
+    /// Other users' <@UID> mentions are preserved so the LLM can mention them back.
+    #[test]
+    fn resolve_mentions_preserves_other_user_mentions() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("<@111> say hi to <@222>", bot_id);
+        assert_eq!(result, "say hi to <@222>");
+    }
+
+    /// Role mentions <@&UID> are replaced with @(role) placeholder.
+    #[test]
+    fn resolve_mentions_replaces_role_mentions() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("hello <@&999>", bot_id);
+        assert_eq!(result, "hello @(role)");
+    }
+
+    /// Message containing only the bot mention results in empty string.
+    #[test]
+    fn resolve_mentions_empty_after_strip() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("<@111>", bot_id);
+        assert_eq!(result, "");
+    }
+
+    // --- should_process_user_message tests (GIVEN/WHEN/THEN) ---
+    // Tests the multibot-mentions gating logic extracted from EventHandler::message.
+    // The bug in #481 was that other bots' messages were filtered by bot gating
+    // before multibot detection could run, so the bot never learned the thread
+    // was multi-bot and responded without @mention.
+
+    /// GIVEN: multibot-mentions mode, single-bot thread, bot is involved
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds (natural conversation)
+    #[test]
+    fn multibot_mentions_single_bot_thread_no_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            false,          // other_bot_present
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, multi-bot thread (other bot has posted)
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot does NOT respond (requires @mention in multi-bot thread)
+    /// This is the exact scenario from bug #481.
+    #[test]
+    fn multibot_mentions_multi_bot_thread_no_mention() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            true,           // other_bot_present ← another bot posted
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, multi-bot thread
+    /// WHEN:  human sends message WITH @mention
+    /// THEN:  bot responds (explicit @mention always works)
+    #[test]
+    fn multibot_mentions_multi_bot_thread_with_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true,           // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            true,           // other_bot_present
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, not in a thread (main channel)
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot does NOT respond (main channel always requires @mention)
+    #[test]
+    fn multibot_mentions_main_channel_no_mention() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            false,          // in_thread (main channel)
+            false,          // involved
+            false,          // other_bot_present
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, in thread but bot is NOT involved
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot does NOT respond (not participating in this thread)
+    #[test]
+    fn multibot_mentions_not_involved() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            false,          // involved ← bot hasn't posted here
+            false,          // other_bot_present
+        ));
+    }
+
+    /// GIVEN: involved mode, multi-bot thread
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds (involved mode ignores multi-bot status)
+    #[test]
+    fn involved_mode_ignores_multibot() {
+        assert!(should_process_user_message(
+            AllowUsers::Involved,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            true,           // other_bot_present ← ignored in involved mode
+        ));
+    }
+
+    /// GIVEN: mentions mode
+    /// WHEN:  human sends message without @mention (even in own thread)
+    /// THEN:  bot does NOT respond (always requires @mention)
+    #[test]
+    fn mentions_mode_always_requires_mention() {
+        assert!(!should_process_user_message(
+            AllowUsers::Mentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            false,          // other_bot_present
+        ));
     }
 }
