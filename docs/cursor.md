@@ -73,25 +73,52 @@ helm install openab openab/openab \
 
 ## Model Selection
 
-List available models:
+### Startup default: `--model auto`
 
-```bash
-cursor-agent --list-models
-# or
-cursor-agent models
+`--model auto` in the `args` is load-bearing, not cosmetic. cursor-agent unconditionally overwrites its cli-config `selectedModel` at startup:
+
+| startup `args` | post-startup default |
+|---|---|
+| `["acp"]` (no `--model`) | `composer-2[fast=true]` — Cursor's coding-only model, **not** Auto |
+| `["acp", "--model", "auto"]` | `default[]` — true Auto (recommended) |
+| `["acp", "--model", "<name>"]` | the matching modelId + parameters |
+
+So **omit `--model auto` and every route lands on composer-2** regardless of what `/models` shows. `/models` switches only affect the live session; restarting the pod resets to whatever `args` dictates.
+
+### At-runtime `/models` (Discord slash command)
+
+Once the `openab-cursor` pod is running and a user has started a thread (by @mentioning the bot or any other trigger), three slash commands are available:
+
+- `/models` — switch the model for the current channel's session
+- `/agents` — switch agent mode (Agent / Plan / Ask)
+- `/cancel` — interrupt the in-flight prompt
+
+`/models` lists **all models the cursor-agent backend returns for the logged-in account** — the server-fetched list, not a baked-in allowlist. The list reflects account entitlements in real time, so a different Cursor account on the same binary can see a different list.
+
+#### Proactive probe + auto-fallback
+
+Some of the bracketed modelIds (notably the `claude-*` family and the `gpt-5.4` family on certain accounts) accept `session/set_config_option` successfully but then stream a plain-text error on the very next prompt:
+
+```
+Error: I: AI Model Not Found
+Model name is not valid: "<name>"
 ```
 
-To specify a model, pass `--model` as an arg:
+To collapse that one-turn delay, openab sends a silent probe prompt (`"ping"`) immediately after each model switch. The probe's response is captured in-memory and **never forwarded to the Discord channel**. On soft-reject detection (`AI Model Not Found` or `Model name is not valid`), openab auto-switches back to Auto (`default[]`) and surfaces the Cursor-side error in the Discord followup:
 
-```toml
-[agent]
-command = "cursor-agent"
-args = ["acp", "--model", "auto"]
+```
+⚠️ <name> unavailable (Cursor: <original error>), switched back to Auto
 ```
 
-In ACP mode, `--model` can be appended after `acp`. If omitted, the account default is used.
+Probe timeout is **15 seconds by default**, configurable via `probe_timeout_secs` in the `[agent]` section of `config.toml`. On timeout, the probe is cancelled via `session/cancel` and the same auto-fallback path runs:
 
-To verify which model is active, ask the agent "who are you" — the underlying model will typically self-identify (e.g. "I am Gemini, a large language model built by Google.").
+```
+⏱ <name> probe timed out (>{N}s), switched back to Auto
+```
+
+#### Asking "who are you"
+
+Cursor Auto routes to composer, which self-identifies as GPT. Thinking-mode models deliberate before replying. Treat `/models`'s followup message (derived from cursor-agent's structured `modelId`) as the source of truth, not the agent's self-identification.
 
 ## MCP Usage (ACP mode caveats)
 

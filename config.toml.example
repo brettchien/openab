@@ -32,6 +32,10 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
+# probe_timeout_secs = 15  # /models probe budget (default 15). After a model
+#                          # switch, openab sends a silent "ping" prompt to
+#                          # confirm routing works; on timeout or soft reject
+#                          # (e.g. "AI Model Not Found"), it falls back to Auto.
 
 # [agent]
 # command = "claude"
@@ -71,6 +75,8 @@ working_dir = "/home/agent"
 # args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
 # working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
+# # `--model auto` is load-bearing: omitting it routes all traffic through
+# # composer-2 regardless of /models selections.
 
 [pool]
 max_sessions = 10
