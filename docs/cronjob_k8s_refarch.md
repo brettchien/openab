@@ -33,8 +33,7 @@ Project Board
   PR-Screening
      |
      v
-Masami / Pahud
-  human or agent follow-up
+Human or agent follow-up
 ```
 
 ## What This Document Covers
@@ -52,32 +51,6 @@ This shape fits Kubernetes better:
 - failures are isolated per run
 - logs are attached to each job
 - `concurrencyPolicy: Forbid` prevents overlapping claimers
-
-## High-Level Architecture
-
-```text
-GitHub Project Board
-  Incoming
-     |
-     v
-CronJob: openab-project-screening
-  schedule: every 30 minutes
-     |
-     v
-Job Pod
-  image: ghcr.io/openabdev/openab-codex:latest
-  script: /opt/openab-project-screening/screen_once.sh
-     |
-     +--> GitHub API via gh
-     +--> Codex via codex exec
-     +--> Discord API via curl
-     |
-     v
-PR-Screening
-     |
-     v
-Masami / Pahud follow-up
-```
 
 ## Credential Model
 
@@ -108,12 +81,16 @@ spec:
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
+      # No retries — each run is one-shot. A failure should surface in job
+      # logs rather than silently re-claiming the same item.
       backoffLimit: 0
       template:
         spec:
           restartPolicy: Never
           containers:
             - name: project-screening
+              # Pin to a specific tag in production (e.g. :0.8.0) to ensure
+              # reproducible runs. :latest is used here for illustration only.
               image: ghcr.io/openabdev/openab-codex:latest
               command:
                 - bash
@@ -235,9 +212,9 @@ ${item_title}
 Status: moved to ${SCREENING_STATUS_NAME}"
 ```
 
-Thread naming:
+Thread naming (Node.js helper used by the script):
 
-```bash
+```javascript
 const base = `Screening: #${number}${title ? ` ${title}` : ""}`.trim();
 process.stdout.write(base.slice(0, 100) || `Screening: #${number}`);
 ```
@@ -322,14 +299,19 @@ kubectl -n default logs -f job/"$LATEST_JOB"
 
 A Helm chart can wire this under `projectScreening` values like:
 
+> **⚠️ Security note:** `githubToken` and `codexAuthJson` below are shown inline for illustration.
+> In practice, supply these via `--set` flags, environment variables, or an external secret manager
+> (e.g. Sealed Secrets, External Secrets Operator). **Do not commit credentials to version control.**
+
 ```yaml
 projectScreening:
   enabled: true
   schedule: "*/30 * * * *"
+  # Pin to a specific tag in production (e.g. :0.8.0)
   image: ghcr.io/openabdev/openab-codex:latest
   githubToken: "<token with project scope>"
   codexAuthJson: |
-    PASTE_THE_CONTENTS_OF_YOUR__HOME__CODEX__AUTH_JSON_HERE
+    <contents of ~/.codex/auth.json>
   discordReport:
     enabled: true
     secretName: "openab-kiro-codex"
