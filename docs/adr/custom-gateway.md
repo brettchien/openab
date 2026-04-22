@@ -228,6 +228,58 @@ Scheduled triggers are supported natively via any external scheduler (K8s CronJo
 
 ---
 
+## 5a. Example Integrations
+
+Two examples to illustrate how the gateway handles different event types — one chat platform, one non-chat event source.
+
+### Telegram: Chat-Style Webhook
+
+```
+Telegram servers ──POST /webhook/telegram──▶ Gateway
+  │
+  ├─ Adapter: validate bot_token, parse Update JSON
+  ├─ Normalize: extract chat_id, sender, text, mentions
+  │
+  ▼
+Gateway ──WebSocket──▶ OAB
+  event: { platform: "telegram", channel.id: "chat_12345",
+           sender.name: "Bob", content.text: "deploy to staging" }
+  │
+  ▼
+OAB reply ──WebSocket──▶ Gateway
+  │
+  ├─ Reply Router: POST https://api.telegram.org/bot.../sendMessage
+  └─ { chat_id: "chat_12345", text: "Deploying now..." }
+```
+
+Telegram is structurally similar to LINE — inbound webhook, no threads, push-style reply. The gateway adapter handles Telegram-specific auth and payload format; OAB sees the same unified event schema.
+
+### GitHub: Non-Chat Event Source
+
+```
+GitHub ──POST /webhook/github──▶ Gateway
+  │  (X-Hub-Signature-256 header)
+  │
+  ├─ Adapter: validate HMAC signature, parse pull_request.opened event
+  ├─ Normalize: repo as channel, PR author as sender, PR title+body as content
+  │
+  ▼
+Gateway ──WebSocket──▶ OAB
+  event: { platform: "github", channel.id: "openabdev/openab",
+           event_type: "pull_request", sender.name: "juntinyeh",
+           content.text: "PR #521: Feature/line — adds LINE adapter..." }
+  │
+  ▼
+OAB reply ──WebSocket──▶ Gateway
+  │
+  ├─ Reply Router: POST https://api.github.com/repos/.../issues/521/comments
+  └─ { body: "Auto-triage: this PR adds a new adapter..." }
+```
+
+GitHub shows the gateway handling a non-chat event. The adapter maps repo → channel, PR author → sender, and PR description → content. OAB processes it like any other message. The reply goes back as a PR comment via GitHub API.
+
+---
+
 ## 6. Architectural Differences from v1
 
 | Aspect | v1 (LINE in OAB) | Custom Gateway |
