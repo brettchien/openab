@@ -375,10 +375,10 @@ impl EventHandler for Handler {
                     owner_id = ?gc.owner_id,
                     has_thread_metadata = gc.thread_metadata.is_some(),
                     in_thread = result.0,
-                    bot_owns = result.1,
+                    bot_owns = ?result.1,
                     "thread check"
                 );
-                result
+                (result.0, result.1.unwrap_or(false))
             }
             Ok(other) => {
                 tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
@@ -879,7 +879,8 @@ fn resolve_mentions(content: &str, bot_id: UserId) -> String {
 /// Returns `(in_allowed_thread, bot_owns)`:
 /// - `in_allowed_thread`: true only if the channel IS a thread AND its parent
 ///   is permitted (via allowlist, `allow_all_channels`, or `in_allowed_channel`).
-/// - `bot_owns`: true if the thread's `owner_id` matches `bot_id`.
+/// - `bot_owns`: `None` if the channel is not a thread (ownership is meaningless);
+///   `Some(true/false)` if it IS a thread, indicating whether the bot owns it.
 ///
 /// Uses `thread_metadata.is_some()` — the canonical way to identify threads.
 /// `parent_id` is NOT reliable for thread detection: category children also
@@ -898,15 +899,15 @@ fn detect_thread(
     allowed_channels: &HashSet<u64>,
     allow_all_channels: bool,
     in_allowed_channel: bool,
-) -> (bool, bool) {
+) -> (bool, Option<bool>) {
     if !has_thread_metadata {
-        return (false, false);
+        return (false, None);
     }
     let in_allowed_thread = in_allowed_channel
         || allow_all_channels
         || parent_id.is_some_and(|pid| allowed_channels.contains(&pid));
     let bot_owns = owner_id.is_some_and(|oid| oid == bot_id);
-    (in_allowed_thread, bot_owns)
+    (in_allowed_thread, Some(bot_owns))
 }
 
 /// Pure decision function: should this message be processed or ignored?
@@ -1189,7 +1190,7 @@ mod tests {
             allowed_channels: HashSet<u64>,
             allow_all: bool,
             in_allowed: bool,
-            expect: (bool, bool), // (in_thread, bot_owns)
+            expect: (bool, Option<bool>), // (in_thread, bot_owns)
         }
 
         let cases = vec![
@@ -1203,7 +1204,7 @@ mod tests {
                 allowed_channels: allowed(&[]),
                 allow_all: false,
                 in_allowed: true,
-                expect: (false, false),
+                expect: (false, None),
             },
             Case {
                 name: "top-level text channel (no category)",
@@ -1214,7 +1215,7 @@ mod tests {
                 allowed_channels: allowed(&[]),
                 allow_all: false,
                 in_allowed: true,
-                expect: (false, false),
+                expect: (false, None),
             },
             Case {
                 name: "voice channel under category",
@@ -1225,7 +1226,7 @@ mod tests {
                 allowed_channels: allowed(&[]),
                 allow_all: false,
                 in_allowed: false,
-                expect: (false, false),
+                expect: (false, None),
             },
             // --- Thread channels: thread_metadata = Some ---
             Case {
@@ -1237,7 +1238,7 @@ mod tests {
                 allowed_channels: allowed(&[PARENT_CH]),
                 allow_all: false,
                 in_allowed: false,
-                expect: (true, true),
+                expect: (true, Some(true)),
             },
             Case {
                 name: "public thread, parent in allowlist, other user owns",
@@ -1248,7 +1249,7 @@ mod tests {
                 allowed_channels: allowed(&[PARENT_CH]),
                 allow_all: false,
                 in_allowed: false,
-                expect: (true, false),
+                expect: (true, Some(false)),
             },
             Case {
                 name: "thread, parent NOT in allowlist, not allow_all",
@@ -1259,7 +1260,7 @@ mod tests {
                 allowed_channels: allowed(&[]),
                 allow_all: false,
                 in_allowed: false,
-                expect: (false, true),
+                expect: (false, Some(true)),
             },
             Case {
                 name: "thread, allow_all_channels = true",
@@ -1270,7 +1271,7 @@ mod tests {
                 allowed_channels: allowed(&[]),
                 allow_all: true,
                 in_allowed: false,
-                expect: (true, false),
+                expect: (true, Some(false)),
             },
             Case {
                 name: "thread, in_allowed_channel = true (parent is the allowed channel)",
@@ -1281,7 +1282,7 @@ mod tests {
                 allowed_channels: allowed(&[]),
                 allow_all: false,
                 in_allowed: true,
-                expect: (true, false),
+                expect: (true, Some(false)),
             },
             // --- Defensive: partial data ---
             Case {
@@ -1293,7 +1294,7 @@ mod tests {
                 allowed_channels: allowed(&[PARENT_CH]),
                 allow_all: false,
                 in_allowed: false,
-                expect: (false, true), // can't verify parent → not allowed, but bot still owns
+                expect: (false, Some(true)), // can't verify parent → not allowed, but bot still owns
             },
         ];
 
