@@ -1119,7 +1119,8 @@ async fn handle_message(
     let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
     let other_bot_present = {
         let cache = adapter.multibot_threads.lock().await;
-        cache.contains_key(&thread_channel.channel_id)
+        thread_channel.thread_id.as_deref()
+            .is_some_and(|ts| cache.get(ts).is_some_and(|inst| inst.elapsed() < adapter.session_ttl))
     };
     if let Err(e) = router
         .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
