@@ -4,6 +4,7 @@ mod bot_turns;
 mod config;
 mod cron;
 mod discord;
+mod dispatch;
 mod error_display;
 mod format;
 mod markdown;
@@ -284,8 +285,18 @@ async fn main() -> anyhow::Result<()> {
             trusted_bots = trusted_bot_ids.len(),
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
+            message_processing_mode = ?discord_cfg.message_processing_mode,
+            max_buffered_messages = discord_cfg.max_buffered_messages,
             "starting discord adapter"
         );
+
+        let dispatcher = match discord_cfg.message_processing_mode {
+            config::MessageProcessingMode::Batched => Some(Arc::new(dispatch::Dispatcher::new(
+                router.clone(),
+                discord_cfg.max_buffered_messages,
+            ))),
+            config::MessageProcessingMode::PerMessage => None,
+        };
 
         let handler = discord::Handler {
             router,
@@ -303,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
             session_ttl: std::time::Duration::from_secs(ttl_secs),
             max_bot_turns: discord_cfg.max_bot_turns,
             bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(discord_cfg.max_bot_turns)),
+            dispatcher,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

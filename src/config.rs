@@ -116,9 +116,49 @@ pub struct DiscordConfig {
     /// Human message resets the counter. Default: 20.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
+    /// How to dispatch user messages to ACP turns. See `MessageProcessingMode`.
+    /// Default: `per-message` (no behavior change).
+    #[serde(default)]
+    pub message_processing_mode: MessageProcessingMode,
+    /// In `batched` mode only: cap of the per-thread bounded mpsc channel that
+    /// holds messages arriving during an in-flight turn. When full, additional
+    /// `submit` futures park until the consumer drains. Default: 10.
+    /// Ignored in `per-message` mode.
+    #[serde(default = "default_max_buffered_messages")]
+    pub max_buffered_messages: usize,
 }
 
 fn default_max_bot_turns() -> u32 { 20 }
+
+/// Controls how incoming user messages are dispatched to ACP turns.
+///
+/// - `PerMessage` (default): each message becomes its own ACP turn (current behavior).
+///   Messages arriving during an in-flight turn race for the per-thread mutex
+///   and end up dispatched as separate sequential turns.
+/// - `Batched`: messages arriving during an in-flight turn accumulate in a
+///   per-thread bounded `mpsc::channel`. When the in-flight turn finishes,
+///   the consumer drains the channel and dispatches one ACP turn carrying
+///   all accumulated messages. The first message after idle still fires
+///   immediately (zero added latency for isolated messages).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MessageProcessingMode {
+    #[default]
+    PerMessage,
+    Batched,
+}
+
+impl<'de> Deserialize<'de> for MessageProcessingMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().replace('_', "-").as_str() {
+            "per-message" => Ok(Self::PerMessage),
+            "batched" => Ok(Self::Batched),
+            other => Err(serde::de::Error::unknown_variant(other, &["per-message", "batched"])),
+        }
+    }
+}
+
+fn default_max_buffered_messages() -> usize { 10 }
 
 /// Controls whether the bot responds to user messages in threads without @mention.
 ///
@@ -479,6 +519,44 @@ command = "echo"
         write!(tmp, "{}", MINIMAL_TOML).unwrap();
         let cfg = load_config(tmp.path()).unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
+    }
+
+    #[test]
+    fn parse_message_processing_mode_default_is_per_message() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        let d = cfg.discord.unwrap();
+        assert_eq!(d.message_processing_mode, MessageProcessingMode::PerMessage);
+        assert_eq!(d.max_buffered_messages, 10);
+    }
+
+    #[test]
+    fn parse_message_processing_mode_batched_with_cap() {
+        let toml = r#"
+[discord]
+bot_token = "test"
+message_processing_mode = "batched"
+max_buffered_messages = 25
+
+[agent]
+command = "echo"
+"#;
+        let d = parse_config(toml, "test").unwrap().discord.unwrap();
+        assert_eq!(d.message_processing_mode, MessageProcessingMode::Batched);
+        assert_eq!(d.max_buffered_messages, 25);
+    }
+
+    #[test]
+    fn parse_message_processing_mode_rejects_unknown() {
+        let toml = r#"
+[discord]
+bot_token = "test"
+message_processing_mode = "debounce"
+
+[agent]
+command = "echo"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("debounce"), "expected error to mention bad variant: {err}");
     }
 
     #[tokio::test]

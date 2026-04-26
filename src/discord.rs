@@ -154,6 +154,9 @@ pub struct Handler {
     pub max_bot_turns: u32,
     /// Per-thread bot turn tracker. Both counters reset on human msg.
     pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
+    /// Turn-boundary message batcher. `Some` when `message_processing_mode = "batched"`,
+    /// `None` for `per-message` (the legacy per-message dispatch path).
+    pub dispatcher: Option<Arc<crate::dispatch::Dispatcher>>,
 }
 
 impl Handler {
@@ -603,16 +606,44 @@ impl EventHandler for Handler {
             cache.contains_key(&msg.channel_id.to_string())
         };
 
-        let router = self.router.clone();
-        tokio::spawn(async move {
-            let sender_json = serde_json::to_string(&sender).unwrap();
-            if let Err(e) = router
-                .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
-                .await
-            {
-                error!("handle_message error: {e}");
+        let sender_json = serde_json::to_string(&sender).unwrap();
+        let sender_name = sender.display_name.clone();
+
+        match self.dispatcher.clone() {
+            // Batched mode: hand off to per-thread dispatcher; consumer batches at turn boundaries.
+            Some(dispatcher) => {
+                let thread_key = format!(
+                    "discord:{}",
+                    thread_channel.thread_id.as_deref().unwrap_or(&thread_channel.channel_id)
+                );
+                let buf = crate::dispatch::BufferedMessage {
+                    prompt,
+                    extra_blocks,
+                    sender_json,
+                    trigger_msg,
+                    arrived_at: std::time::Instant::now(),
+                    sender_name,
+                };
+                tokio::spawn(async move {
+                    dispatcher
+                        .submit(thread_key, thread_channel, adapter, buf, other_bot_present)
+                        .await;
+                });
             }
-        });
+            // Per-message mode (default): unchanged path — one tokio::spawn per message,
+            // each races at the per-thread mutex inside AdapterRouter.
+            None => {
+                let router = self.router.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = router
+                        .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
+                        .await
+                    {
+                        error!("handle_message error: {e}");
+                    }
+                });
+            }
+        }
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
