@@ -215,6 +215,16 @@ pub struct SlackConfig {
     /// Human message resets the counter. Default: 20.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
+    /// How to dispatch user messages to ACP turns. See `MessageProcessingMode`.
+    /// Default: `per-message` (no behavior change).
+    #[serde(default)]
+    pub message_processing_mode: MessageProcessingMode,
+    /// In `batched` mode only: cap of the per-thread bounded mpsc channel that
+    /// holds messages arriving during an in-flight turn. When full, additional
+    /// `submit` futures park until the consumer drains (ADR §2.1 rule 4 — no
+    /// silent drop). Default: 30. Ignored in `per-message` mode.
+    #[serde(default = "default_max_buffered_messages")]
+    pub max_buffered_messages: usize,
 }
 
 #[derive(Debug, Deserialize)]

@@ -181,6 +181,8 @@ async fn main() -> anyhow::Result<()> {
             users = slack_cfg.allowed_users.len(),
             allow_bot_messages = ?slack_cfg.allow_bot_messages,
             allow_user_messages = ?slack_cfg.allow_user_messages,
+            message_processing_mode = ?slack_cfg.message_processing_mode,
+            max_buffered_messages = slack_cfg.max_buffered_messages,
             "starting slack adapter"
         );
         let router = router.clone();
@@ -188,6 +190,13 @@ async fn main() -> anyhow::Result<()> {
         let max_bot_turns = slack_cfg.max_bot_turns;
         let slack_shutdown_rx = shutdown_rx.clone();
         let adapter = shared_slack_adapter.clone().expect("shared_slack_adapter must exist when slack config is present");
+        let slack_dispatcher = match slack_cfg.message_processing_mode {
+            config::MessageProcessingMode::Batched => Some(Arc::new(dispatch::Dispatcher::new(
+                router.clone(),
+                slack_cfg.max_buffered_messages,
+            ))),
+            config::MessageProcessingMode::PerMessage => None,
+        };
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
@@ -202,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 max_bot_turns,
                 stt,
                 router,
+                slack_dispatcher,
                 slack_shutdown_rx,
             )
             .await

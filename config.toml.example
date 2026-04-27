@@ -37,6 +37,13 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         # "multibot-mentions" = like "involved", but require @mention
                                         #   once another bot has posted in the thread
 # max_bot_turns = 20                   # soft cap on consecutive bot turns per thread (human msg resets)
+# message_processing_mode = "per-message"  # "per-message" (default) | "batched"
+                                            # "batched" = messages arriving during an in-flight ACP turn
+                                            # accumulate per-thread; consumer dispatches one merged turn
+                                            # at the next boundary. First message after idle still fires
+                                            # immediately (zero added latency).
+# max_buffered_messages = 30               # batched mode only: per-thread mpsc channel cap (default 30).
+                                            # Submitters park on send when full (per-thread backpressure).
 
 [agent]
 command = "kiro-cli"

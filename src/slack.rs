@@ -493,6 +493,7 @@ pub async fn run_slack_adapter(
     max_bot_turns: u32,
     stt_config: SttConfig,
     router: Arc<AdapterRouter>,
+    dispatcher: Option<Arc<crate::dispatch::Dispatcher>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let queue = Arc::new(KeyedAsyncQueue::new());
@@ -590,6 +591,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let router = router.clone();
+                                                let dispatcher = dispatcher.clone();
                                                 let queue = queue.clone();
                                                 // Queue key: thread_ts if already in a thread, otherwise ts.
                                                 // app_mention always has a channel context, so ts alone
@@ -612,6 +614,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &router,
+                                                        dispatcher.as_ref(),
                                                     )
                                                     .await;
                                                 });
@@ -829,6 +832,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let router = router.clone();
+                                                let dispatcher = dispatcher.clone();
                                                 let queue = queue.clone();
                                                 // Queue key: thread_ts if in a thread, otherwise channel:ts.
                                                 // Prefixed with channel_id for non-thread messages because
@@ -852,6 +856,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &router,
+                                                        dispatcher.as_ref(),
                                                     )
                                                     .await;
                                                 });
@@ -923,6 +928,7 @@ async fn handle_message(
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     router: &Arc<AdapterRouter>,
+    dispatcher: Option<&Arc<crate::dispatch::Dispatcher>>,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1139,11 +1145,37 @@ async fn handle_message(
         thread_channel.thread_id.as_deref()
             .is_some_and(|ts| cache.get(ts).is_some_and(|inst| inst.elapsed() < adapter.session_ttl))
     };
-    if let Err(e) = router
-        .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
-        .await
-    {
-        error!("Slack handle_message error: {e}");
+
+    match dispatcher {
+        // Batched mode: hand off to per-thread dispatcher; consumer batches at turn boundaries.
+        Some(dispatcher) => {
+            let thread_key = format!(
+                "slack:{}",
+                thread_channel.thread_id.as_deref().unwrap_or(&thread_channel.channel_id)
+            );
+            let buf = crate::dispatch::BufferedMessage {
+                prompt,
+                extra_blocks,
+                sender_json,
+                trigger_msg,
+                arrived_at: std::time::Instant::now(),
+            };
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move {
+                dispatcher
+                    .submit(thread_key, thread_channel, adapter_dyn, buf, other_bot_present)
+                    .await;
+            });
+        }
+        // Per-message mode (default): unchanged path — direct router dispatch.
+        None => {
+            if let Err(e) = router
+                .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
+                .await
+            {
+                error!("Slack handle_message error: {e}");
+            }
+        }
     }
 }
 
