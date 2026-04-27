@@ -122,8 +122,8 @@ pub struct DiscordConfig {
     pub message_processing_mode: MessageProcessingMode,
     /// In `batched` mode only: cap of the per-thread bounded mpsc channel that
     /// holds messages arriving during an in-flight turn. When full, additional
-    /// `submit` futures park until the consumer drains. Default: 10.
-    /// Ignored in `per-message` mode.
+    /// `submit` futures park until the consumer drains (ADR §2.1 rule 4 — no
+    /// silent drop). Default: 30. Ignored in `per-message` mode.
     #[serde(default = "default_max_buffered_messages")]
     pub max_buffered_messages: usize,
 }
@@ -158,7 +158,7 @@ impl<'de> Deserialize<'de> for MessageProcessingMode {
     }
 }
 
-fn default_max_buffered_messages() -> usize { 10 }
+fn default_max_buffered_messages() -> usize { 30 }
 
 /// Controls whether the bot responds to user messages in threads without @mention.
 ///
@@ -526,7 +526,7 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         let d = cfg.discord.unwrap();
         assert_eq!(d.message_processing_mode, MessageProcessingMode::PerMessage);
-        assert_eq!(d.max_buffered_messages, 10);
+        assert_eq!(d.max_buffered_messages, 30);
     }
 
     #[test]

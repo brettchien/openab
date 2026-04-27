@@ -507,6 +507,8 @@ impl EventHandler for Handler {
             &msg.channel_id.to_string(),
             thread_parent_id.as_deref(),
             msg.author.bot,
+            // serenity 0.12 Timestamp Display impl emits RFC 3339.
+            &msg.timestamp.to_string(),
         );
 
         // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
@@ -607,7 +609,6 @@ impl EventHandler for Handler {
         };
 
         let sender_json = serde_json::to_string(&sender).unwrap();
-        let sender_name = sender.display_name.clone();
 
         match self.dispatcher.clone() {
             // Batched mode: hand off to per-thread dispatcher; consumer batches at turn boundaries.
@@ -622,7 +623,6 @@ impl EventHandler for Handler {
                     sender_json,
                     trigger_msg,
                     arrived_at: std::time::Instant::now(),
-                    sender_name,
                 };
                 tokio::spawn(async move {
                     dispatcher
@@ -967,6 +967,7 @@ fn build_sender_context(
     msg_channel_id: &str,
     thread_parent_id: Option<&str>,
     is_bot: bool,
+    timestamp: &str,
 ) -> SenderContext {
     SenderContext {
         schema: "openab.sender.v1".into(),
@@ -977,6 +978,7 @@ fn build_sender_context(
         channel_id: thread_parent_id.unwrap_or(msg_channel_id).to_string(),
         thread_id: thread_parent_id.map(|_| msg_channel_id.to_string()),
         is_bot,
+        timestamp: timestamp.to_string(),
     }
 }
 
@@ -1280,7 +1282,7 @@ mod tests {
     /// In-thread message: channel_id = parent, thread_id = thread channel ID.
     #[test]
     fn build_sender_context_in_thread() {
-        let ctx = build_sender_context("user1", "alice", "Alice", "thread_ch", Some("parent_ch"), false);
+        let ctx = build_sender_context("user1", "alice", "Alice", "thread_ch", Some("parent_ch"), false, "2026-04-30T00:00:00Z");
         assert_eq!(ctx.channel_id, "parent_ch");
         assert_eq!(ctx.thread_id, Some("thread_ch".to_string()));
         assert_eq!(ctx.channel, "discord");
@@ -1291,7 +1293,7 @@ mod tests {
     /// Non-thread message: channel_id = message channel, thread_id = None.
     #[test]
     fn build_sender_context_not_in_thread() {
-        let ctx = build_sender_context("user1", "alice", "Alice", "main_ch", None, false);
+        let ctx = build_sender_context("user1", "alice", "Alice", "main_ch", None, false, "2026-04-30T00:00:00Z");
         assert_eq!(ctx.channel_id, "main_ch");
         assert_eq!(ctx.thread_id, None);
     }
@@ -1299,7 +1301,7 @@ mod tests {
     /// Bot sender: is_bot flag propagated correctly.
     #[test]
     fn build_sender_context_bot_sender() {
-        let ctx = build_sender_context("bot1", "mybot", "MyBot", "ch", Some("parent"), true);
+        let ctx = build_sender_context("bot1", "mybot", "MyBot", "ch", Some("parent"), true, "2026-04-30T00:00:00Z");
         assert!(ctx.is_bot);
         assert_eq!(ctx.channel_id, "parent");
         assert_eq!(ctx.thread_id, Some("ch".to_string()));

@@ -1093,6 +1093,12 @@ async fn handle_message(
         channel_id: channel_id.clone(),
         thread_id: thread_ts.clone(),
         is_bot: is_bot_msg,
+        // Slack `ts` is "<epoch_seconds>.<fractional>"; convert to ISO 8601
+        // with millisecond precision. Falls back to dispatcher receive time
+        // if the event ts is malformed (extremely rare — Slack always sends
+        // a valid ts on message events).
+        timestamp: slack_ts_to_iso8601(&ts)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
     };
 
     let trigger_msg = MessageRef {
@@ -1139,6 +1145,29 @@ async fn handle_message(
     {
         error!("Slack handle_message error: {e}");
     }
+}
+
+/// Convert a Slack `ts` value ("1234567890.123456") to an ISO 8601 UTC string
+/// with millisecond precision. Returns `None` if the input is malformed.
+///
+/// Slack `ts` is the platform's authoritative message creation time; using it
+/// (rather than broker receive time) keeps the `<sender_context>.timestamp`
+/// field consistent with what Slack itself shows participants — see
+/// ADR "Batched Turn Packing" §3.2.
+fn slack_ts_to_iso8601(ts: &str) -> Option<String> {
+    let mut parts = ts.split('.');
+    let secs: i64 = parts.next()?.parse().ok()?;
+    let frac = parts.next().unwrap_or("0");
+    // Slack ts has 6-digit microsecond fractional; truncate to milliseconds for
+    // the ISO output. Pad short fractions so "1700000000.5" → 500ms not 5ms.
+    let mut padded = frac.to_string();
+    while padded.len() < 3 {
+        padded.push('0');
+    }
+    let millis: u32 = padded.get(..3)?.parse().ok()?;
+    let nanos = millis.saturating_mul(1_000_000);
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)?;
+    Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 /// Strip only the bot's own `<@BOT_UID>` trigger mention.

@@ -16,7 +16,11 @@ struct GatewayEvent {
     #[allow(dead_code)]
     schema: String,
     event_id: String,
-    #[allow(dead_code)]
+    /// Receive-time ISO 8601 UTC string emitted by the gateway service.
+    /// Best-effort platform timestamp — for non-Discord/Slack channels the
+    /// gateway records the time it received the inbound webhook, not the
+    /// originating platform's message creation time. Documented as
+    /// approximate in ADR "Batched Turn Packing" §3.2.
     timestamp: String,
     platform: String,
     channel: GwChannel,
@@ -376,6 +380,7 @@ pub async fn run_gateway_adapter(
                                         channel_id: event.channel.id.clone(),
                                         thread_id: event.channel.thread_id.clone(),
                                         is_bot: event.sender.is_bot,
+                                        timestamp: event.timestamp.clone(),
                                     };
                                     let sender_json = serde_json::to_string(&sender_ctx)
                                         .unwrap_or_default();

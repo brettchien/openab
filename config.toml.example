@@ -19,7 +19,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                             # accumulate per-thread; consumer dispatches one merged turn
                                             # at the next boundary. First message after idle still fires
                                             # immediately (zero added latency).
-# max_buffered_messages = 10               # batched mode only: per-thread mpsc channel cap (default 10).
+# max_buffered_messages = 30               # batched mode only: per-thread mpsc channel cap (default 30).
                                             # Submitters park on send when full (per-thread backpressure).
 
 # [slack]

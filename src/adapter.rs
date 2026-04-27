@@ -74,6 +74,9 @@ pub struct MessageRef {
 /// Compare with `ChannelRef`, which is used for **routing**: there
 /// `channel_id` is the ID the adapter sends messages to (for Discord
 /// threads, that's the thread's own channel ID, not the parent).
+///
+/// `schema` stays `openab.sender.v1` — the `timestamp` field is additive (ADR
+/// "Batched Turn Packing for ACP session/prompt"). Existing parsers ignore it.
 #[derive(Clone, Debug, Serialize)]
 pub struct SenderContext {
     pub schema: String,
@@ -87,6 +90,37 @@ pub struct SenderContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub is_bot: bool,
+    /// Platform message creation time, ISO 8601 UTC. Discord/Slack use the
+    /// platform's own message timestamp; gateway uses receive time as
+    /// best-effort. Distinguishes adjacent same-author repetitions in batched
+    /// dispatch and lets the agent compute relative arrival offsets.
+    pub timestamp: String,
+}
+
+/// Pack a single arrival event into the ContentBlocks the ACP agent sees.
+///
+/// Output (in arrival order): one Text block carrying
+/// `<sender_context>\n{sender_json}\n</sender_context>\n\n{prompt}`, followed
+/// by `extra_blocks` interleaved verbatim. Per ADR "Batched Turn Packing":
+/// `<sender_context>` is the structural boundary marker; attachments belong
+/// to the most recent preceding `<sender_context>` by array adjacency.
+///
+/// Empty `prompt` is intentionally preserved (voice-only / attachment-only
+/// arrival events still emit their `<sender_context>` block — Compliance §8
+/// rule "no suppression of empty-prompt turns").
+pub fn pack_arrival_event(
+    sender_json: &str,
+    prompt: &str,
+    extra_blocks: Vec<ContentBlock>,
+) -> Vec<ContentBlock> {
+    let mut out = Vec::with_capacity(1 + extra_blocks.len());
+    out.push(ContentBlock::Text {
+        text: format!(
+            "<sender_context>\n{sender_json}\n</sender_context>\n\n{prompt}"
+        ),
+    });
+    out.extend(extra_blocks);
+    out
 }
 
 // --- ChatAdapter trait ---
@@ -156,9 +190,15 @@ impl AdapterRouter {
         &self.pool
     }
 
-    /// Handle an incoming user message. The adapter is responsible for
-    /// filtering, resolving the thread, and building the SenderContext.
-    /// This method handles sender context injection, session management, and streaming.
+    /// Handle an incoming user message (per-message mode — preserved for
+    /// callers that haven't moved to batched dispatch).
+    ///
+    /// Builds ContentBlocks with the legacy asymmetric layout — text-typed
+    /// `extra_blocks` (e.g. STT transcripts) prepended before the
+    /// `<sender_context>` block, image-typed blocks appended after. Batched
+    /// mode uses [`pack_arrival_event`] + [`AdapterRouter::dispatch_batch`]
+    /// instead, which yields the symmetric arrival-order layout the ADR
+    /// specifies.
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_message(
         &self,
@@ -204,7 +244,67 @@ impl AdapterRouter {
                 .unwrap_or(&thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key).await {
+        self.dispatch_content_blocks(
+            adapter,
+            &thread_key,
+            thread_channel,
+            content_blocks,
+            trigger_msg,
+            other_bot_present,
+        )
+        .await
+    }
+
+    /// Dispatch a pre-packed batch of ContentBlocks as a single ACP turn.
+    ///
+    /// Used by the per-thread batching dispatcher: the caller has already
+    /// invoked [`pack_arrival_event`] once per buffered arrival event and
+    /// concatenated the results, so the resulting `Vec<ContentBlock>` carries
+    /// N `<sender_context>` repetitions with attachments interleaved in
+    /// arrival order. This entry point skips the legacy single-`<sender_context>`
+    /// wrapping that [`Self::handle_message`] applies.
+    ///
+    /// `trigger_msg` anchors reactions on the *trailing* arrival event, so
+    /// the user sees the bot react to the newest message in the batch.
+    pub async fn dispatch_batch(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        thread_key: &str,
+        thread_channel: &ChannelRef,
+        content_blocks: Vec<ContentBlock>,
+        trigger_msg: &MessageRef,
+        other_bot_present: bool,
+    ) -> Result<()> {
+        tracing::debug!(
+            platform = adapter.platform(),
+            block_count = content_blocks.len(),
+            "dispatching batched turn"
+        );
+        self.dispatch_content_blocks(
+            adapter,
+            thread_key,
+            thread_channel,
+            content_blocks,
+            trigger_msg,
+            other_bot_present,
+        )
+        .await
+    }
+
+    /// Shared back-end for `handle_message` and `dispatch_batch`: ensures the
+    /// per-thread session exists, sets up reaction state, runs the streaming
+    /// turn, and cleans up reactions.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_content_blocks(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        thread_key: &str,
+        thread_channel: &ChannelRef,
+        content_blocks: Vec<ContentBlock>,
+        trigger_msg: &MessageRef,
+        other_bot_present: bool,
+    ) -> Result<()> {
+        if let Err(e) = self.pool.get_or_create(thread_key).await {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
                 .send_message(thread_channel, &format!("⚠️ {msg}"))
@@ -225,7 +325,7 @@ impl AdapterRouter {
         let result = self
             .stream_prompt(
                 adapter,
-                &thread_key,
+                thread_key,
                 content_blocks,
                 thread_channel,
                 reactions.clone(),
@@ -626,5 +726,49 @@ mod tests {
             ..ch.clone()
         };
         assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
+    }
+
+    fn text_of(block: &ContentBlock) -> Option<&str> {
+        if let ContentBlock::Text { text } = block {
+            Some(text.as_str())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn pack_arrival_event_text_only() {
+        let blocks = pack_arrival_event(r#"{"sender_id":"A"}"#, "hello", vec![]);
+        assert_eq!(blocks.len(), 1);
+        let txt = text_of(&blocks[0]).unwrap();
+        assert!(txt.starts_with("<sender_context>\n"));
+        assert!(txt.contains(r#"{"sender_id":"A"}"#));
+        assert!(txt.ends_with("</sender_context>\n\nhello"));
+    }
+
+    #[test]
+    fn pack_arrival_event_interleaves_extras_in_arrival_order() {
+        let extras = vec![
+            ContentBlock::Text { text: "transcript".into() },
+            ContentBlock::Text { text: "follow-up".into() },
+        ];
+        let blocks = pack_arrival_event(r#"{"sender_id":"A"}"#, "look", extras);
+        assert_eq!(blocks.len(), 3);
+        // sender_context + prompt is the first block; extras follow in arrival order.
+        assert!(text_of(&blocks[0]).unwrap().contains("\n\nlook"));
+        assert_eq!(text_of(&blocks[1]).unwrap(), "transcript");
+        assert_eq!(text_of(&blocks[2]).unwrap(), "follow-up");
+    }
+
+    #[test]
+    fn pack_arrival_event_preserves_empty_prompt() {
+        // Voice-only / attachment-only arrival event: prompt is empty but the
+        // <sender_context> block is still emitted (ADR Compliance §8 rule:
+        // no suppression of empty-prompt turns).
+        let blocks = pack_arrival_event(r#"{"sender_id":"A"}"#, "", vec![]);
+        assert_eq!(blocks.len(), 1);
+        let txt = text_of(&blocks[0]).unwrap();
+        assert!(txt.contains("<sender_context>"));
+        assert!(txt.ends_with("</sender_context>\n\n"));
     }
 }
