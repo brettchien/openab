@@ -1,8 +1,9 @@
 # ADR: LINE Messaging API Adapter
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-22
-- **Author:** @chaodu-agent
+- **Last Updated:** 2026-04-28
+- **Author:** @chaodu-agent, @iamninihuang
 
 ---
 
@@ -101,17 +102,57 @@ LINE is not ideal when:
    - Group   → line:{groupId}
    - Room    → line:{roomId}
 6. Message is routed to AdapterRouter → ACP Session Pool → kiro-cli process
-7. Agent response is sent back via LINE Push Message API
+7. Agent response is sent back via LINE Reply API (free) or Push Message API (fallback)
 ```
 
-### Reply Strategy: Push Messages
+### Hybrid Reply/Push Dispatch Flow
+
+```
+LINE User                    Gateway                         OAB Core
+   │                            │                               │
+   │  message + replyToken      │                               │
+   │ ─────────────────────────▶ │                               │
+   │                            │  1. Verify HMAC signature     │
+   │                            │  2. Generate event_id (UUID)  │
+   │                            │  3. Cache:                    │
+   │                            │     event_id → replyToken     │
+   │                            │     (TTL 50s, max 10k)        │
+   │                            │                               │
+   │                            │  GatewayEvent { event_id }    │
+   │                            │ ─────────────────────────────▶│
+   │                            │                               │  Store event_id in
+   │                            │                               │  ChannelRef.origin_event_id
+   │                            │                               │
+   │                            │                               │  Agent processes...
+   │                            │                               │
+   │                            │  GatewayReply {               │
+   │                            │    reply_to: event_id         │
+   │                            │  }                            │
+   │                            │ ◀─────────────────────────────│
+   │                            │                               │
+   │                            │  4. Lookup cache(event_id)    │
+   │                            │     ├─ HIT + fresh            │
+   │     Reply API (FREE) ✅    │     │  → Reply API            │
+   │ ◀──────────────────────────│     │                         │
+   │                            │     ├─ HIT + expired          │
+   │     Push API (quota) 💰    │     │  → Push API fallback    │
+   │ ◀──────────────────────────│     │                         │
+   │                            │     └─ MISS                   │
+   │     Push API (quota) 💰    │        → Push API fallback    │
+   │ ◀──────────────────────────│                               │
+```
+
+### Reply Strategy: Hybrid Reply/Push Messages
 
 LINE offers two reply mechanisms:
-- **Reply message**: uses a reply token, but the token expires in 1 minute
-- **Push message**: no time limit, can send to any user/group at any time
+- **Reply message**: uses a reply token, but the token expires in 1 minute (free).
+- **Push message**: no time limit, can send to any user/group at any time (consumes quota).
 
-OpenAB uses **push messages** because agent processing typically exceeds the 1-minute reply token window. The trade-off is that push messages count against the monthly messaging quota on free-tier LINE accounts.
-
+Historically, OpenAB relied solely on **push messages** because agent processing can exceed the 1-minute reply token window. To optimize costs for free-tier accounts, OpenAB now uses a **Hybrid Strategy** implemented at the gateway level:
+1. The gateway caches incoming `replyToken`s keyed by `event_id` with a 50-second TTL.
+2. When OAB replies with a non-empty `reply_to` that matches a cached entry, the gateway routes the message via the free **Reply API**.
+3. If the token is expired, missing, or `reply_to` is empty, the gateway falls back to the **Push API**.
+4. A background task sweeps expired cache entries to prevent memory growth.
 ---
 
 ## 3. Architectural Differences from Discord/Slack
@@ -381,7 +422,7 @@ For v1:
 - LINE users can interact with OpenAB agents without switching to Discord or Slack
 - The inbound webhook pattern opens the door for future webhook-based platforms (Telegram, WhatsApp, etc.)
 - Using `axum` for the HTTP server provides a solid foundation for a general-purpose webhook gateway
-- Push message strategy avoids the 1-minute reply token limitation, enabling long-running agent tasks
+- Hybrid reply/push strategy optimizes cost: the gateway opportunistically uses the free Reply API when the agent responds within the token TTL, falling back to Push API for longer-running tasks
 
 ### Negative
 
@@ -414,8 +455,9 @@ To ensure this ADR is followed in implementation and future changes:
 
 ## Notes
 
-- **Version:** 0.1
+- **Version:** 0.2
 - **Changelog:**
+  - 0.2 (2026-04-28): Hybrid Reply/Push strategy implemented (#608). Updated status to Accepted. Added dispatch flow diagram. Reply strategy section rewritten from Push-only to hybrid. Core propagates `event_id` via `ChannelRef.origin_event_id` (#619).
   - 0.1 (2026-04-22): Initial proposed version
 
 ---

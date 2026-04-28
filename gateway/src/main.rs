@@ -8,6 +8,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
@@ -126,6 +127,19 @@ struct TelegramUser {
 
 // --- App state ---
 
+/// Cache entry for LINE reply tokens: (replyToken, insertion_time).
+/// Uses std::sync::Mutex — critical sections are short (insert/remove/retain)
+/// and never held across .await, so async Mutex overhead is unnecessary.
+type ReplyTokenCache = Arc<std::sync::Mutex<std::collections::HashMap<String, (String, Instant)>>>;
+
+/// Maximum age (in seconds) before a cached reply token is considered expired.
+/// LINE tokens are valid for ~1 minute; we use 50s as a conservative margin.
+const REPLY_TOKEN_TTL_SECS: u64 = 50;
+
+/// Maximum number of cached reply tokens. Prevents unbounded memory growth
+/// if webhooks arrive faster than OAB can reply (e.g. OAB offline, spam burst).
+const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
+
 struct AppState {
     bot_token: String,
     secret_token: Option<String>,
@@ -134,6 +148,11 @@ struct AppState {
     line_access_token: Option<String>,
     /// Broadcast channel: gateway → OAB (events)
     event_tx: broadcast::Sender<String>,
+    /// Cache: event_id → (LINE replyToken, timestamp).
+    /// Global across all OAB WebSocket clients. LINE reply tokens are single-use:
+    /// the first client to `remove()` a token wins the free Reply API call;
+    /// other clients for the same event naturally fall back to Push API.
+    reply_token_cache: ReplyTokenCache,
 }
 
 // --- Telegram webhook handler ---
@@ -329,9 +348,22 @@ async fn line_webhook(
             .and_then(|s| s.user_id.as_deref())
             .unwrap_or("unknown");
 
+        let event_id = format!("evt_{}", uuid::Uuid::new_v4());
+
+        // Cache the reply token for hybrid Reply/Push dispatch
+        if let Some(ref reply_token) = event.reply_token {
+            let mut cache = state.reply_token_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= REPLY_TOKEN_CACHE_MAX {
+                warn!(size = cache.len(), "reply token cache full, skipping insert");
+            } else {
+                cache.insert(event_id.clone(), (reply_token.clone(), Instant::now()));
+                info!(event_id = %event_id, "cached LINE replyToken");
+            }
+        }
+
         let gateway_event = GatewayEvent {
             schema: "openab.gateway.event.v1".into(),
-            event_id: format!("evt_{}", uuid::Uuid::new_v4()),
+            event_id,
             timestamp: chrono::Utc::now().to_rfc3339(),
             platform: "line".into(),
             event_type: "message".into(),
@@ -400,7 +432,6 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                         break;
                     }
                 }
-                // No reply forwarding needed on this path — replies go to Telegram directly
             }
         }
     });
@@ -408,6 +439,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
     // Receive OAB replies → Telegram
     let bot_token = state.bot_token.clone();
     let line_access_token = state.line_access_token.clone();
+    let reply_cache = state.reply_token_cache.clone();
     let event_tx_for_recv = state.event_tx.clone();
     // Track per-message reaction state (Telegram replaces all reactions atomically)
     let reaction_state: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>> =
@@ -535,19 +567,83 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
 
                         // Normal send_message — route by platform
                         if reply.platform == "line" {
-                            // LINE Push Message API
-                            if let Some(ref token) = line_access_token {
-                                info!(to = %reply.channel.id, "gateway → line");
-                                let _ = client
-                                    .post("https://api.line.me/v2/bot/message/push")
-                                    .bearer_auth(token)
-                                    .json(&serde_json::json!({
-                                        "to": reply.channel.id,
-                                        "messages": [{"type": "text", "text": reply.content.text}]
-                                    }))
-                                    .send()
-                                    .await
-                                    .map_err(|e| error!("line send error: {e}"));
+                            if let Some(ref access_token) = line_access_token {
+                                // Extract token from cache (drop lock before HTTP call)
+                                let cached_token = {
+                                    let mut cache = reply_cache.lock().unwrap_or_else(|e| e.into_inner());
+                                    cache
+                                        .remove(&reply.reply_to)
+                                        .and_then(|(token, cached_at)| {
+                                            if cached_at.elapsed().as_secs() < REPLY_TOKEN_TTL_SECS
+                                            {
+                                                Some(token)
+                                            } else {
+                                                info!("LINE replyToken expired, using Push API");
+                                                None
+                                            }
+                                        })
+                                };
+
+                                // Try Reply API first (free, no quota consumed)
+                                let mut used_reply = false;
+                                if let Some(reply_token) = cached_token {
+                                    info!(to = %reply.channel.id, "gateway → line (reply API)");
+                                    let resp = client
+                                        .post("https://api.line.me/v2/bot/message/reply")
+                                        .bearer_auth(access_token)
+                                        .json(&serde_json::json!({
+                                            "replyToken": reply_token,
+                                            "messages": [{"type": "text", "text": reply.content.text}]
+                                        }))
+                                        .send()
+                                        .await;
+                                    match resp {
+                                        Ok(r) if r.status().is_success() => {
+                                            used_reply = true;
+                                        }
+                                        Ok(r) => {
+                                            let status = r.status();
+                                            let body = r.text().await.unwrap_or_default();
+                                            // Only fallback to Push when LINE explicitly says
+                                            // the reply token is unusable (invalid/expired).
+                                            // LINE returns "Invalid reply token" or "expired"
+                                            // in the error body for token-specific failures.
+                                            let body_lower = body.to_lowercase();
+                                            let token_unusable = status.as_u16() == 400
+                                                && ((body_lower.contains("invalid")
+                                                    && body_lower.contains("reply token"))
+                                                    || body_lower.contains("expired"));
+                                            if token_unusable {
+                                                warn!(status = %status, body = %body, "LINE reply token unusable, falling back to Push");
+                                            } else {
+                                                // Ambiguous: 5xx, other 4xx, or unrecognized 400.
+                                                // Message may have been delivered — do NOT fallback.
+                                                error!(status = %status, body = %body, "LINE Reply API error, NOT falling back to Push (possible duplicate risk)");
+                                                used_reply = true;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Network/timeout error: delivery ambiguous, do NOT fallback
+                                            error!(err = %e, "LINE Reply API network error, NOT falling back to Push (possible duplicate risk)");
+                                            used_reply = true;
+                                        }
+                                    }
+                                }
+
+                                // Fallback to Push API
+                                if !used_reply {
+                                    info!(to = %reply.channel.id, "gateway → line (push API)");
+                                    let _ = client
+                                        .post("https://api.line.me/v2/bot/message/push")
+                                        .bearer_auth(access_token)
+                                        .json(&serde_json::json!({
+                                            "to": reply.channel.id,
+                                            "messages": [{"type": "text", "text": reply.content.text}]
+                                        }))
+                                        .send()
+                                        .await
+                                        .map_err(|e| error!("line push error: {e}"));
+                                }
                             }
                         } else {
                             // Telegram sendMessage
@@ -611,6 +707,8 @@ async fn main() -> Result<()> {
     }
 
     let (event_tx, _) = broadcast::channel::<String>(256);
+    let reply_token_cache: ReplyTokenCache =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let state = Arc::new(AppState {
         bot_token,
@@ -619,7 +717,29 @@ async fn main() -> Result<()> {
         line_channel_secret,
         line_access_token,
         event_tx,
+        reply_token_cache,
     });
+
+    // Background task: sweep expired reply tokens every REPLY_TOKEN_TTL_SECS
+    {
+        let cache_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(REPLY_TOKEN_TTL_SECS)).await;
+                let mut cache = cache_state.reply_token_cache.lock().unwrap_or_else(|e| e.into_inner());
+                let before = cache.len();
+                cache.retain(|_, (_, t)| t.elapsed().as_secs() < REPLY_TOKEN_TTL_SECS);
+                let after = cache.len();
+                if before != after {
+                    info!(
+                        removed = before - after,
+                        remaining = after,
+                        "reply token cache sweep"
+                    );
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route(&webhook_path, post(telegram_webhook))
