@@ -62,12 +62,16 @@ In the LINE Developers Console → **Messaging API** tab:
 [gateway]
 url = "ws://openab-gateway:8080/ws"
 platform = "line"
+# allowed_users = ["U1234567890abcdef"]   # restrict to specific LINE user IDs
+# allowed_channels = ["C1234567890abcdef"] # restrict to specific chat/group IDs
 
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
 ```
+
+> **Tip:** To find a LINE user ID, check the gateway logs — the sender ID is logged for each incoming message. By default all users and channels are allowed. Setting `allowed_users` or `allowed_channels` automatically restricts access to only those listed.
 
 ## 6. Add the Bot as Friend
 

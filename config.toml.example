@@ -31,6 +31,18 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         #   once another bot has posted in the thread
 # max_bot_turns = 20                   # soft cap on consecutive bot turns per thread (human msg resets)
 
+# [gateway]
+# url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
+# platform = "line"                     # "telegram" (default) | "line"
+# token = "${GATEWAY_TOKEN}"            # shared token for WebSocket auth (optional but recommended)
+# bot_username = "my_bot"               # for @mention gating in groups
+# allow_all_channels = true             # true = allow all channels; false = only allowed_channels
+#                                       # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_channels = ["C1234"]          # only checked when allow_all_channels = false
+# allow_all_users = true                # true = any user; false = only allowed_users
+#                                       # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_users = ["U5678"]             # only checked when allow_all_users = false
+
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]

@@ -258,19 +258,34 @@ impl ChatAdapter for GatewayAdapter {
 
 // --- Run the gateway adapter (connects to gateway WS, routes events to AdapterRouter) ---
 
+/// Resolved gateway configuration passed to the adapter at startup.
+pub struct GatewayParams {
+    pub url: String,
+    pub platform: String,
+    pub token: Option<String>,
+    pub bot_username: Option<String>,
+    pub allow_all_channels: bool,
+    pub allowed_channels: Vec<String>,
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
 pub async fn run_gateway_adapter(
-    gateway_url: String,
-    platform_name: String,
-    ws_token: Option<String>,
-    bot_username: Option<String>,
+    params: GatewayParams,
     router: Arc<AdapterRouter>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    // Leak the platform name for 'static lifetime — one allocation per adapter lifetime
-    let platform: &'static str = Box::leak(platform_name.into_boxed_str());
+    let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
     // Append auth token as query param if configured
-    let connect_url = match &ws_token {
+    let gateway_url = params.url;
+    let bot_username = params.bot_username;
+    let allow_all_channels = params.allow_all_channels;
+    let allowed_channels = params.allowed_channels;
+    let allow_all_users = params.allow_all_users;
+    let allowed_users = params.allowed_users;
+
+    let connect_url = match &params.token {
         Some(token) => {
             let sep = if gateway_url.contains('?') { "&" } else { "?" };
             format!("{gateway_url}{sep}token={token}")
@@ -336,6 +351,18 @@ pub async fn run_gateway_adapter(
                                 Ok(event) => {
                                     if event.sender.is_bot {
                                         continue; // skip bot messages
+                                    }
+
+                                    // Channel allowlist gate
+                                    if !allow_all_channels && !allowed_channels.contains(&event.channel.id) {
+                                        info!(channel = %event.channel.id, "gateway: channel not in allowed_channels, skipping");
+                                        continue;
+                                    }
+
+                                    // User allowlist gate
+                                    if !allow_all_users && !allowed_users.contains(&event.sender.id) {
+                                        info!(sender = %event.sender.id, "gateway: user not in allowed_users, skipping");
+                                        continue;
                                     }
 
                                     // @mention gating: in groups, only respond if bot is mentioned

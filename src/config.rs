@@ -188,6 +188,16 @@ pub struct GatewayConfig {
     pub token: Option<String>,
     /// Bot username for @mention gating in groups (e.g. "my_bot")
     pub bot_username: Option<String>,
+    /// Explicit flag: true = allow all channels, false = check allowed_channels list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_channels: Option<bool>,
+    /// Explicit flag: true = allow all users, false = check allowed_users list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_users: Option<bool>,
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 fn default_gateway_platform() -> String {
@@ -486,5 +496,66 @@ command = "echo"
         let result = load_config_from_url("https://invalid.test.example/config.toml").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("failed to fetch remote config"));
+    }
+
+    #[test]
+    fn parse_gateway_config_defaults() {
+        let toml = r#"
+[gateway]
+url = "ws://gw:8080/ws"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let gw = cfg.gateway.unwrap();
+        assert_eq!(gw.url, "ws://gw:8080/ws");
+        assert_eq!(gw.platform, "telegram");
+        assert!(gw.allowed_users.is_empty());
+        assert!(gw.allowed_channels.is_empty());
+        assert!(gw.allow_all_users.is_none());
+        assert!(gw.allow_all_channels.is_none());
+        // resolve_allow_all: empty lists → allow all
+        assert!(resolve_allow_all(gw.allow_all_users, &gw.allowed_users));
+        assert!(resolve_allow_all(gw.allow_all_channels, &gw.allowed_channels));
+    }
+
+    #[test]
+    fn parse_gateway_config_with_allowlists() {
+        let toml = r#"
+[gateway]
+url = "ws://gw:8080/ws"
+platform = "line"
+allowed_users = ["U1", "U2"]
+allowed_channels = ["C1"]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let gw = cfg.gateway.unwrap();
+        assert_eq!(gw.platform, "line");
+        assert_eq!(gw.allowed_users, vec!["U1", "U2"]);
+        assert_eq!(gw.allowed_channels, vec!["C1"]);
+        // resolve_allow_all: non-empty lists → restricted
+        assert!(!resolve_allow_all(gw.allow_all_users, &gw.allowed_users));
+        assert!(!resolve_allow_all(gw.allow_all_channels, &gw.allowed_channels));
+    }
+
+    #[test]
+    fn parse_gateway_config_explicit_allow_all_overrides_list() {
+        let toml = r#"
+[gateway]
+url = "ws://gw:8080/ws"
+allow_all_users = true
+allowed_users = ["U1"]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let gw = cfg.gateway.unwrap();
+        // explicit flag overrides non-empty list
+        assert!(resolve_allow_all(gw.allow_all_users, &gw.allowed_users));
     }
 }
