@@ -112,8 +112,8 @@ data:
     session_ttl_hours = {{ ($cfg.pool).sessionTtlHours | default 24 }}
 
     [reactions]
-    enabled = {{ ($cfg.reactions).enabled | default true }}
-    remove_after_reply = {{ ($cfg.reactions).removeAfterReply | default false }}
+    enabled = {{ if hasKey ($cfg.reactions) "enabled" }}{{ ($cfg.reactions).enabled }}{{ else }}true{{ end }}
+    remove_after_reply = {{ if hasKey ($cfg.reactions) "removeAfterReply" }}{{ ($cfg.reactions).removeAfterReply }}{{ else }}false{{ end }}
     {{- if ($cfg.reactions).toolDisplay }}
     {{- if not (has ($cfg.reactions).toolDisplay (list "full" "compact" "none")) }}
     {{- fail (printf "agents.%s.reactions.toolDisplay must be one of: full, compact, none — got: %s" $name ($cfg.reactions).toolDisplay) }}
@@ -163,14 +163,14 @@ data:
     {{- if or ($cfg.cronjobs) (($cfg.cron).usercronEnabled) (($cfg.cron).usercronPath) }}
 
     [cron]
-    usercron_enabled = {{ (($cfg.cron).usercronEnabled) | default false }}
+    usercron_enabled = {{ if hasKey ($cfg.cron) "usercronEnabled" }}{{ (($cfg.cron).usercronEnabled) }}{{ else }}false{{ end }}
     {{- if (($cfg.cron).usercronPath) }}
     usercron_path = {{ ($cfg.cron).usercronPath | toJson }}
     {{- end }}
     {{- range ($cfg.cronjobs) }}
 
     [[cron.jobs]]
-    enabled = {{ .enabled | default true }}
+    enabled = {{ if hasKey . "enabled" }}{{ .enabled }}{{ else }}true{{ end }}
     schedule = {{ .schedule | toJson }}
     channel = {{ .channel | toJson }}
     message = {{ .message | toJson }}
