@@ -77,7 +77,11 @@ https://your-gateway-host/webhook/feishu
 | `feishu.requireMention` | `FEISHU_REQUIRE_MENTION` | `true` | Require @mention in groups |
 | — | `FEISHU_DEDUPE_TTL_SECS` | `300` | Event deduplication cache TTL (seconds) |
 | — | `FEISHU_MESSAGE_LIMIT` | `4000` | Max message length before auto-splitting (bytes) |
+| — | `FEISHU_ALLOW_BOTS` | `off` | Bot message handling: `off` / `mentions` / `all` |
+| — | `FEISHU_TRUSTED_BOT_IDS` | — | Comma-separated open_id list of known bots |
+| — | `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel before suppression |
 | `gateway.botUsername` | — | — | Set to bot's `open_id` for @mention gating |
+| `gateway.streaming` | — | `false` | Enable streaming (typewriter) mode |
 
 ## @mention Gating
 
@@ -96,6 +100,52 @@ To disable mention gating: `feishu.requireMention: false`.
 - `appSecret`, `verificationToken`, and `encryptKey` are stored in a Kubernetes Secret, not in ConfigMap.
 - In webhook mode, always set both `verificationToken` and `encryptKey` for production.
 - The gateway enforces a 1 MB body size limit and per-IP rate limiting (120 req/60s) on the webhook endpoint.
+
+## Slash Commands
+
+The gateway intercepts slash commands before they reach the agent:
+
+| Command | Action |
+|---------|--------|
+| `/reset` | Clears the conversation session. |
+| `/cancel` | Sends a cancel signal to the running agent. |
+
+These work in both DMs and group chats, across all gateway platforms.
+
+## Rich Text (Post) Messages
+
+Agent replies are sent as Feishu **post** (rich text) messages instead of plain text. This enables:
+
+- Fenced code blocks with syntax highlighting
+- Clickable hyperlinks
+- Proper line breaks and paragraph structure
+
+Inline Markdown formatting (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`) is stripped to plain text because Feishu's post format does not support inline styles.
+
+## Streaming (Typewriter)
+
+Agent replies stream incrementally — a placeholder message appears immediately, then updates every ~1.5 seconds as the agent generates content. This matches Discord's streaming behavior.
+
+To enable streaming, set `streaming = true` in the gateway config:
+
+```toml
+[gateway]
+url = "ws://127.0.0.1:8080/ws"
+platform = "feishu"
+streaming = true
+```
+
+The gateway platform must support message editing (Feishu/Lark do). Platforms that don't support editing should leave `streaming = false` (default).
+
+## Bot-to-Bot Collaboration (Gateway-Side Only)
+
+The gateway adapter includes bot identification and filtering scaffolding (`AllowBots` enum, `FEISHU_TRUSTED_BOT_IDS`, `FEISHU_MAX_BOT_TURNS` with human-reset safety valve), matching Discord's `allow_bot_messages` design.
+
+Bot identification requires explicit configuration via `FEISHU_TRUSTED_BOT_IDS` because Feishu marks other bots as `sender_type="user"` — they cannot be identified from the event alone.
+
+> **Not yet functional.** Two blockers remain:
+> 1. **Feishu platform limitation:** Feishu does not deliver bot-sent messages to other bots' WebSocket connections.
+> 2. **OAB core limitation:** `src/gateway.rs` unconditionally drops `is_bot` events before they reach the router. When blocker 1 is lifted, the core guard must become adapter-aware to let gateway-filtered bot events through.
 
 ## Troubleshooting
 

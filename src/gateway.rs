@@ -86,43 +86,68 @@ struct GatewayResponse {
     request_id: String,
     success: bool,
     thread_id: Option<String>,
+    message_id: Option<String>,
     error: Option<String>,
 }
 
 // --- GatewayAdapter: ChatAdapter over WebSocket ---
 
 type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayResponse>>>>;
+type SharedWsTx = Arc<Mutex<futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    Message,
+>>>;
 
 pub struct GatewayAdapter {
-    ws_tx: Mutex<
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
-    >,
+    ws_tx: SharedWsTx,
     pending: PendingRequests,
     platform_name: &'static str,
+    streaming: bool,
 }
 
 impl GatewayAdapter {
     fn new(
-        ws_tx: futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        ws_tx: SharedWsTx,
         pending: PendingRequests,
         platform_name: &'static str,
+        streaming: bool,
     ) -> Self {
         Self {
-            ws_tx: Mutex::new(ws_tx),
+            ws_tx,
             pending,
             platform_name,
+            streaming,
         }
     }
+}
+
+/// Send a fire-and-forget reply via the shared WebSocket (no request-response).
+/// Used for slash command responses where we don't need message_id back.
+async fn send_fire_and_forget(
+    ws_tx: &SharedWsTx,
+    channel: &ChannelRef,
+    content: &str,
+) -> Result<()> {
+    let reply = GatewayReply {
+        schema: "openab.gateway.reply.v1".into(),
+        reply_to: channel.origin_event_id.clone().unwrap_or_default(),
+        platform: channel.platform.clone(),
+        channel: ReplyChannel {
+            id: channel.channel_id.clone(),
+            thread_id: channel.thread_id.clone(),
+        },
+        content: ReplyContent {
+            content_type: "text".into(),
+            text: content.into(),
+        },
+        command: None,
+        request_id: None,
+    };
+    let json = serde_json::to_string(&reply)?;
+    ws_tx.lock().await.send(Message::Text(json)).await?;
+    Ok(())
 }
 
 #[async_trait]
@@ -136,6 +161,20 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+        let req_id = if self.streaming {
+            Some(format!("req_{}", uuid::Uuid::new_v4()))
+        } else {
+            None
+        };
+
+        let pending_rx = if let Some(ref id) = req_id {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
+
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
             reply_to: channel.origin_event_id.clone().unwrap_or_default(),
@@ -149,13 +188,28 @@ impl ChatAdapter for GatewayAdapter {
                 text: content.into(),
             },
             command: None,
-            request_id: None,
+            request_id: req_id.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
+
+        // When streaming is enabled, wait for gateway to return real message_id
+        // (needed for edit_message). Otherwise fire-and-forget.
+        let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
+                _ => {
+                    self.pending.lock().await.remove(id);
+                    "gw_sent".into()
+                }
+            }
+        } else {
+            "gw_sent".into()
+        };
+
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: "gw_sent".into(),
+            message_id: msg_id,
         })
     }
 
@@ -251,8 +305,29 @@ impl ChatAdapter for GatewayAdapter {
         Ok(())
     }
 
+    async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: msg.message_id.clone(),
+            platform: msg.channel.platform.clone(),
+            channel: ReplyChannel {
+                id: msg.channel.channel_id.clone(),
+                thread_id: msg.channel.thread_id.clone(),
+            },
+            content: ReplyContent {
+                content_type: "text".into(),
+                text: content.into(),
+            },
+            command: Some("edit_message".into()),
+            request_id: None,
+        };
+        let json = serde_json::to_string(&reply)?;
+        self.ws_tx.lock().await.send(Message::Text(json)).await?;
+        Ok(())
+    }
+
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
-        false // send-once for Telegram
+        self.streaming
     }
 }
 
@@ -268,6 +343,7 @@ pub struct GatewayParams {
     pub allowed_channels: Vec<String>,
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
+    pub streaming: bool,
 }
 
 pub async fn run_gateway_adapter(
@@ -284,6 +360,7 @@ pub async fn run_gateway_adapter(
     let allowed_channels = params.allowed_channels;
     let allow_all_users = params.allow_all_users;
     let allowed_users = params.allowed_users;
+    let streaming = params.streaming;
 
     let connect_url = match &params.token {
         Some(token) => {
@@ -325,9 +402,11 @@ pub async fn run_gateway_adapter(
         };
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
+        let ws_tx: SharedWsTx = Arc::new(Mutex::new(ws_tx));
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
         let adapter: Arc<dyn ChatAdapter> =
-            Arc::new(GatewayAdapter::new(ws_tx, pending.clone(), platform));
+            Arc::new(GatewayAdapter::new(ws_tx.clone(), pending.clone(), platform, streaming));
+        let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
         loop {
@@ -349,8 +428,13 @@ pub async fn run_gateway_adapter(
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
                                 Ok(event) => {
+                                    // TODO: gateway adapters (feishu) do their own bot filtering
+                                    // via AllowBots + trusted_bot_ids, but Telegram does not.
+                                    // When Feishu lifts the bot-to-bot delivery restriction,
+                                    // this guard needs to become adapter-aware (e.g. a field on
+                                    // GatewayEvent indicating the adapter already filtered bots).
                                     if event.sender.is_bot {
-                                        continue; // skip bot messages
+                                        continue;
                                     }
 
                                     // Channel allowlist gate
@@ -415,6 +499,30 @@ pub async fn run_gateway_adapter(
                                     let adapter = adapter.clone();
                                     let router = router.clone();
                                     let prompt = event.content.text.clone();
+
+                                    // Slash command interception for gateway platforms
+                                    // (Feishu/LINE/Telegram don't have native slash commands)
+                                    // Use fire-and-forget send — slash command responses don't
+                                    // need message_id for streaming edits.
+                                    let trimmed = prompt.trim();
+                                    if trimmed == "/reset" {
+                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+                                        let msg = match router.pool().reset_session(&thread_key).await {
+                                            Ok(()) => "🔄 Session reset. Start a new conversation!",
+                                            Err(_) => "⚠️ No active session to reset.",
+                                        };
+                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, msg).await;
+                                        continue;
+                                    }
+                                    if trimmed == "/cancel" {
+                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+                                        let msg = match router.pool().cancel_session(&thread_key).await {
+                                            Ok(()) => "🛑 Cancel signal sent.".to_string(),
+                                            Err(e) => format!("⚠️ {e}"),
+                                        };
+                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
+                                        continue;
+                                    }
 
                                     tasks.spawn(async move {
                                         // If supergroup with no thread_id, create a forum topic
