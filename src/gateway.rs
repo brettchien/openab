@@ -1,4 +1,4 @@
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -348,10 +348,8 @@ pub struct GatewayParams {
 
 pub async fn run_gateway_adapter(
     params: GatewayParams,
-    router: Arc<AdapterRouter>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    dispatcher: Option<Arc<crate::dispatch::Dispatcher>>,
-    message_processing_mode: crate::config::MessageProcessingMode,
+    dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
     let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
@@ -505,10 +503,8 @@ pub async fn run_gateway_adapter(
                                     };
 
                                     let adapter = adapter.clone();
-                                    let router = router.clone();
                                     let prompt = event.content.text.clone();
                                     let dispatcher = dispatcher.clone();
-                                    let mode = message_processing_mode;
 
                                     // Slash command interception for gateway platforms
                                     // (Feishu/LINE/Telegram don't have native slash commands)
@@ -551,52 +547,28 @@ pub async fn run_gateway_adapter(
                                             channel.clone()
                                         };
 
-                                        match mode {
-                                            crate::config::MessageProcessingMode::PerMessage => {
-                                                if let Err(e) = router
-                                                    .handle_message(
-                                                        &adapter,
-                                                        &thread_channel,
-                                                        &sender_json,
-                                                        &prompt,
-                                                        vec![],
-                                                        &trigger_msg,
-                                                        false,
-                                                    )
-                                                    .await
-                                                {
-                                                    error!("gateway message handling error: {e}");
-                                                }
-                                            }
-                                            crate::config::MessageProcessingMode::Batched => {
-                                                if let Some(dispatcher) = dispatcher {
-                                                    let thread_key = format!(
-                                                        "{}:{}",
-                                                        thread_channel.platform,
-                                                        thread_channel.thread_id.as_deref()
-                                                            .unwrap_or(&thread_channel.channel_id)
-                                                    );
-                                                    let estimated_tokens =
-                                                        crate::dispatch::estimate_tokens(&prompt, &[]);
-                                                    let buf_msg = crate::dispatch::BufferedMessage {
-                                                        sender_json,
-                                                        prompt,
-                                                        extra_blocks: vec![],
-                                                        trigger_msg,
-                                                        arrived_at: std::time::Instant::now(),
-                                                        estimated_tokens,
-                                                        other_bot_present: false,
-                                                    };
-                                                    if let Err(e) = dispatcher
-                                                        .submit(thread_key, thread_channel, adapter, buf_msg)
-                                                        .await
-                                                    {
-                                                        error!("gateway dispatcher submit error: {e}");
-                                                    }
-                                                } else {
-                                                    error!("gateway batched mode enabled but no dispatcher configured");
-                                                }
-                                            }
+                                        let thread_key = format!(
+                                            "{}:{}",
+                                            thread_channel.platform,
+                                            thread_channel.thread_id.as_deref()
+                                                .unwrap_or(&thread_channel.channel_id)
+                                        );
+                                        let estimated_tokens =
+                                            crate::dispatch::estimate_tokens(&prompt, &[]);
+                                        let buf_msg = crate::dispatch::BufferedMessage {
+                                            sender_json,
+                                            prompt,
+                                            extra_blocks: vec![],
+                                            trigger_msg,
+                                            arrived_at: std::time::Instant::now(),
+                                            estimated_tokens,
+                                            other_bot_present: false,
+                                        };
+                                        if let Err(e) = dispatcher
+                                            .submit(thread_key, thread_channel, adapter, buf_msg)
+                                            .await
+                                        {
+                                            error!("gateway dispatcher submit error: {e}");
                                         }
                                     });
                                 }

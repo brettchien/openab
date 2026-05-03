@@ -160,9 +160,8 @@ pub struct Handler {
     pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
     /// Allow the bot to respond to Discord DMs.
     pub allow_dm: bool,
-    /// Batched-mode dispatcher (None in per-message mode).
-    pub dispatcher: Option<Arc<crate::dispatch::Dispatcher>>,
-    pub message_processing_mode: crate::config::MessageProcessingMode,
+    /// Per-thread dispatcher (PerMessage mode uses cap=1 for FIFO; Batched uses configured cap).
+    pub dispatcher: Arc<crate::dispatch::Dispatcher>,
 }
 
 impl Handler {
@@ -639,53 +638,27 @@ impl EventHandler for Handler {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
 
-        let router = self.router.clone();
-        let mode = self.message_processing_mode;
         let dispatcher = self.dispatcher.clone();
 
         tokio::spawn(async move {
             let sender_json = serde_json::to_string(&sender).unwrap();
-            match mode {
-                crate::config::MessageProcessingMode::PerMessage => {
-                    if let Err(e) = router
-                        .handle_message(
-                            &adapter,
-                            &thread_channel,
-                            &sender_json,
-                            &prompt,
-                            extra_blocks,
-                            &trigger_msg,
-                            other_bot_present_flag,
-                        )
-                        .await
-                    {
-                        error!("handle_message error: {e}");
-                    }
-                }
-                crate::config::MessageProcessingMode::Batched => {
-                    if let Some(dispatcher) = dispatcher {
-                        let thread_key = format!("discord:{}", thread_channel.channel_id);
-                        let estimated_tokens =
-                            crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
-                        let buf_msg = crate::dispatch::BufferedMessage {
-                            sender_json,
-                            prompt,
-                            extra_blocks,
-                            trigger_msg,
-                            arrived_at: std::time::Instant::now(),
-                            estimated_tokens,
-                            other_bot_present: other_bot_present_flag,
-                        };
-                        if let Err(e) = dispatcher
-                            .submit(thread_key, thread_channel, adapter, buf_msg)
-                            .await
-                        {
-                            error!("dispatcher submit error: {e}");
-                        }
-                    } else {
-                        error!("batched mode enabled but no dispatcher configured");
-                    }
-                }
+            let thread_key = format!("discord:{}", thread_channel.channel_id);
+            let estimated_tokens =
+                crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json,
+                prompt,
+                extra_blocks,
+                trigger_msg,
+                arrived_at: std::time::Instant::now(),
+                estimated_tokens,
+                other_bot_present: other_bot_present_flag,
+            };
+            if let Err(e) = dispatcher
+                .submit(thread_key, thread_channel, adapter, buf_msg)
+                .await
+            {
+                error!("dispatcher submit error: {e}");
             }
         });
     }
@@ -911,11 +884,7 @@ impl Handler {
     ) {
         let thread_key = format!("discord:{}", cmd.channel_id.get());
 
-        let dropped = self
-            .dispatcher
-            .as_ref()
-            .map(|d| d.cancel_buffered(&thread_key))
-            .unwrap_or(0);
+        let dropped = self.dispatcher.cancel_buffered(&thread_key);
 
         let cancel_result = self.router.pool().cancel_session(&thread_key).await;
 
@@ -942,11 +911,7 @@ impl Handler {
         let thread_key = format!("discord:{}", cmd.channel_id.get());
 
         // /reset is a superset of /cancel-all: drop buffered work, then tear down the session.
-        let dropped = self
-            .dispatcher
-            .as_ref()
-            .map(|d| d.cancel_buffered(&thread_key))
-            .unwrap_or(0);
+        let dropped = self.dispatcher.cancel_buffered(&thread_key);
 
         let result = self.router.pool().reset_session(&thread_key).await;
 

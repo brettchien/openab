@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::adapter::{ChatAdapter, ChannelRef, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -448,10 +448,8 @@ pub async fn run_slack_adapter(
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
     stt_config: SttConfig,
-    router: Arc<AdapterRouter>,
     mut shutdown_rx: watch::Receiver<bool>,
-    dispatcher: Option<Arc<crate::dispatch::Dispatcher>>,
-    message_processing_mode: crate::config::MessageProcessingMode,
+    dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
@@ -546,9 +544,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
-                                                let router = router.clone();
                                                 let dispatcher = dispatcher.clone();
-                                                let mode = message_processing_mode;
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -559,9 +555,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
-                                                        &router,
-                                                        dispatcher.as_ref(),
-                                                        mode,
+                                                        &dispatcher,
                                                     )
                                                     .await;
                                                 });
@@ -779,9 +773,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
-                                                let router = router.clone();
                                                 let dispatcher = dispatcher.clone();
-                                                let mode = message_processing_mode;
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -792,9 +784,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
-                                                        &router,
-                                                        dispatcher.as_ref(),
-                                                        mode,
+                                                        &dispatcher,
                                                     )
                                                     .await;
                                                 });
@@ -865,9 +855,7 @@ async fn handle_message(
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
-    router: &Arc<AdapterRouter>,
-    dispatcher: Option<&Arc<crate::dispatch::Dispatcher>>,
-    message_processing_mode: crate::config::MessageProcessingMode,
+    dispatcher: &Arc<crate::dispatch::Dispatcher>,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1079,41 +1067,25 @@ async fn handle_message(
         thread_channel.thread_id.as_deref()
             .is_some_and(|ts| cache.get(ts).is_some_and(|inst| inst.elapsed() < adapter.session_ttl))
     };
-    match message_processing_mode {
-        crate::config::MessageProcessingMode::PerMessage => {
-            if let Err(e) = router
-                .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
-                .await
-            {
-                error!("Slack handle_message error: {e}");
-            }
-        }
-        crate::config::MessageProcessingMode::Batched => {
-            if let Some(dispatcher) = dispatcher {
-                let thread_key = format!(
-                    "slack:{}",
-                    thread_channel.thread_id.as_deref().unwrap_or(&thread_channel.channel_id)
-                );
-                let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
-                let buf_msg = crate::dispatch::BufferedMessage {
-                    sender_json,
-                    prompt,
-                    extra_blocks,
-                    trigger_msg,
-                    arrived_at: std::time::Instant::now(),
-                    estimated_tokens,
-                    other_bot_present,
-                };
-                if let Err(e) = dispatcher
-                    .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
-                    .await
-                {
-                    error!("Slack dispatcher submit error: {e}");
-                }
-            } else {
-                error!("Slack batched mode enabled but no dispatcher configured");
-            }
-        }
+    let thread_key = format!(
+        "slack:{}",
+        thread_channel.thread_id.as_deref().unwrap_or(&thread_channel.channel_id)
+    );
+    let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+    let buf_msg = crate::dispatch::BufferedMessage {
+        sender_json,
+        prompt,
+        extra_blocks,
+        trigger_msg,
+        arrived_at: std::time::Instant::now(),
+        estimated_tokens,
+        other_bot_present,
+    };
+    if let Err(e) = dispatcher
+        .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
+        .await
+    {
+        error!("Slack dispatcher submit error: {e}");
     }
 }
 
