@@ -149,6 +149,17 @@ impl Dispatcher {
 
         let (tx, my_generation) = {
             let mut map = self.per_thread.lock().unwrap();
+
+            // Proactive stale-entry cleanup: if the consumer has exited (idle
+            // timeout or unexpected), remove the entry so `or_insert_with`
+            // creates a fresh one. Prevents map leak from one-shot thread keys
+            // and avoids the first-message-after-idle being treated as an error.
+            if let Some(handle) = map.get(&thread_key) {
+                if handle.consumer.is_finished() {
+                    map.remove(&thread_key);
+                }
+            }
+
             let entry = map.entry(thread_key.clone()).or_insert_with(|| {
                 let (tx, rx) = tokio::sync::mpsc::channel(cap);
                 let consumer = tokio::spawn(consumer_loop(
@@ -172,25 +183,62 @@ impl Dispatcher {
         };
 
         if let Err(e) = tx.send(msg).await {
-            // Consumer has exited — race-safe eviction under lock (§2.5).
+            // Consumer has exited between our check and the send — race-safe
+            // eviction under lock (§2.5), then transparent retry once.
             {
                 let mut map = self.per_thread.lock().unwrap();
                 Self::try_evict_locked(&mut map, &thread_key, my_generation);
             }
             let failed_msg = e.0;
-            let _ = adapter
-                .add_reaction(
-                    &failed_msg.trigger_msg,
-                    &self.router.reactions_config().emojis.error,
-                )
-                .await;
-            let _ = adapter
-                .send_message(
-                    &thread_channel,
-                    &format!("⚠️ {}", format_user_error("dispatch consumer exited unexpectedly")),
-                )
-                .await;
-            return Err(DispatchError::ConsumerDead);
+
+            // Retry: spawn a fresh consumer and re-send. If this also fails,
+            // surface the error to the user.
+            let retry_g = self.next_generation.fetch_add(1, Ordering::Relaxed);
+            let (retry_tx, retry_gen) = {
+                let mut map = self.per_thread.lock().unwrap();
+                let entry = map.entry(thread_key.clone()).or_insert_with(|| {
+                    let (tx, rx) = tokio::sync::mpsc::channel(cap);
+                    let consumer = tokio::spawn(consumer_loop(
+                        thread_key.clone(),
+                        thread_channel.clone(),
+                        rx,
+                        Arc::clone(&router),
+                        Arc::clone(&adapter),
+                        cap,
+                        max_tokens,
+                    ));
+                    ThreadHandle {
+                        tx,
+                        consumer,
+                        generation: retry_g,
+                        channel_id: thread_channel.channel_id.clone(),
+                        adapter_kind: adapter.platform().to_string(),
+                    }
+                });
+                (entry.tx.clone(), entry.generation)
+            };
+
+            if let Err(e2) = retry_tx.send(failed_msg).await {
+                // Retry also failed — truly unexpected. Surface error.
+                {
+                    let mut map = self.per_thread.lock().unwrap();
+                    Self::try_evict_locked(&mut map, &thread_key, retry_gen);
+                }
+                let failed_msg = e2.0;
+                let _ = adapter
+                    .add_reaction(
+                        &failed_msg.trigger_msg,
+                        &self.router.reactions_config().emojis.error,
+                    )
+                    .await;
+                let _ = adapter
+                    .send_message(
+                        &thread_channel,
+                        &format!("⚠️ {}", format_user_error("dispatch consumer exited unexpectedly")),
+                    )
+                    .await;
+                return Err(DispatchError::ConsumerDead);
+            }
         }
         Ok(())
     }
