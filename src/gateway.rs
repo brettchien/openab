@@ -489,7 +489,7 @@ pub async fn run_gateway_adapter(
                                         is_bot: event.sender.is_bot,
                                         // Gateway: use event timestamp if available, else broker receive time
                                         timestamp: if event.timestamp.is_empty() {
-                                            chrono_now_iso8601()
+                                            crate::timestamp::now_iso8601()
                                         } else {
                                             event.timestamp.clone()
                                         },
@@ -504,6 +504,7 @@ pub async fn run_gateway_adapter(
 
                                     let adapter = adapter.clone();
                                     let prompt = event.content.text.clone();
+                                    let sender_name = event.sender.name.clone();
                                     let dispatcher = dispatcher.clone();
 
                                     // Slash command interception for gateway platforms
@@ -557,6 +558,7 @@ pub async fn run_gateway_adapter(
                                             crate::dispatch::estimate_tokens(&prompt, &[]);
                                         let buf_msg = crate::dispatch::BufferedMessage {
                                             sender_json,
+                                            sender_name,
                                             prompt,
                                             extra_blocks: vec![],
                                             trigger_msg,
@@ -608,28 +610,3 @@ pub async fn run_gateway_adapter(
     } // outer reconnect loop
 }
 
-/// Best-effort ISO 8601 UTC timestamp for the current moment (no external crate).
-fn chrono_now_iso8601() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Reuse the same days_to_ymd logic inline
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let h = time_secs / 3600;
-    let m = (time_secs % 3600) / 60;
-    let s = time_secs % 60;
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z % 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.000Z")
-}

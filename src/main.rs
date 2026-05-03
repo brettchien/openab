@@ -14,6 +14,7 @@ mod setup;
 mod slack;
 mod stt;
 mod gateway;
+mod timestamp;
 
 use adapter::AdapterRouter;
 use clap::Parser;

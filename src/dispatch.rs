@@ -29,6 +29,10 @@ use crate::reactions::StatusReactionController;
 pub struct BufferedMessage {
     /// Serialised SenderContext JSON (already built by the platform adapter).
     pub sender_json: String,
+    /// Author display name — denormalised from `sender_json` so observability
+    /// fields (per-event tracing in `dispatch_batch`) don't pay a JSON parse.
+    /// Per ADR §2.3 each arrival event carries its sender name.
+    pub sender_name: String,
     /// User-visible prompt text (verbatim, never transformed).
     pub prompt: String,
     /// Attachment blocks (images, STT transcripts) in arrival order.
@@ -58,6 +62,8 @@ impl std::fmt::Display for DispatchError {
         }
     }
 }
+
+impl std::error::Error for DispatchError {}
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -340,6 +346,7 @@ async fn dispatch_batch(
         .iter()
         .map(|m| m.arrived_at.elapsed().as_millis())
         .collect();
+    let senders: Vec<&str> = batch.iter().map(|m| m.sender_name.as_str()).collect();
 
     // Pack all arrival events into one Vec<ContentBlock> (§3.3).
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
@@ -421,6 +428,7 @@ async fn dispatch_batch(
         agent_dispatch_ms   = agent_dispatch_ms,
         tokens_per_event    = ?tokens_per_event,
         wait_ms             = ?wait_ms,
+        senders             = ?senders,
         "batch dispatched",
     );
 }

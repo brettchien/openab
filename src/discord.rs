@@ -641,12 +641,14 @@ impl EventHandler for Handler {
         let dispatcher = self.dispatcher.clone();
 
         tokio::spawn(async move {
+            let sender_name = sender.sender_name.clone();
             let sender_json = serde_json::to_string(&sender).unwrap();
             let thread_key = format!("discord:{}", thread_channel.channel_id);
             let estimated_tokens =
                 crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
+                sender_name,
                 prompt,
                 extra_blocks,
                 trigger_msg,

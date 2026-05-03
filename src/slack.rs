@@ -1026,7 +1026,7 @@ async fn handle_message(
         channel_id: channel_id.clone(),
         thread_id: thread_ts.clone(),
         is_bot: is_bot_msg,
-        timestamp: slack_ts_to_iso8601(&ts),
+        timestamp: crate::timestamp::slack_ts_to_iso8601(&ts),
     };
 
     let trigger_msg = MessageRef {
@@ -1074,6 +1074,7 @@ async fn handle_message(
     let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
     let buf_msg = crate::dispatch::BufferedMessage {
         sender_json,
+        sender_name: sender.sender_name.clone(),
         prompt,
         extra_blocks,
         trigger_msg,
@@ -1108,45 +1109,6 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
         .as_str()
         .or_else(|| file["url_private"].as_str())
         .unwrap_or("")
-}
-
-/// Convert a Slack epoch-seconds timestamp (e.g. "1714204397.123456") to ISO 8601 UTC.
-/// Returns a best-effort string; falls back to the raw ts on parse failure.
-fn slack_ts_to_iso8601(ts: &str) -> String {
-    // Slack ts format: "<unix_seconds>.<microseconds>"
-    let mut parts = ts.splitn(2, '.');
-    let secs = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
-    // Take first 3 digits of fractional part as milliseconds
-    let frac = parts.next().unwrap_or("000");
-    let ms: u64 = frac.chars().take(3).collect::<String>().parse().unwrap_or(0);
-
-    // Manual ISO 8601 from unix timestamp (no external crate needed)
-    // Days since epoch → year/month/day
-    let total_secs = secs;
-    let days = total_secs / 86400;
-    let time_secs = total_secs % 86400;
-    let h = time_secs / 3600;
-    let m = (time_secs % 3600) / 60;
-    let s = time_secs % 60;
-
-    // Gregorian calendar calculation
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
-}
-
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z % 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 /// Strip MIME parameters like `; charset=utf-8` so type-detection helpers see
