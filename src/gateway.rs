@@ -505,6 +505,7 @@ pub async fn run_gateway_adapter(
                                     let adapter = adapter.clone();
                                     let prompt = event.content.text.clone();
                                     let sender_name = event.sender.name.clone();
+                                    let sender_id = event.sender.id.clone();
                                     let dispatcher = dispatcher.clone();
 
                                     // Slash command interception for gateway platforms
@@ -548,11 +549,14 @@ pub async fn run_gateway_adapter(
                                             channel.clone()
                                         };
 
-                                        let thread_key = format!(
-                                            "{}:{}",
-                                            thread_channel.platform,
-                                            thread_channel.thread_id.as_deref()
-                                                .unwrap_or(&thread_channel.channel_id)
+                                        let thread_id = thread_channel
+                                            .thread_id
+                                            .as_deref()
+                                            .unwrap_or(&thread_channel.channel_id);
+                                        let thread_key = dispatcher.key(
+                                            &thread_channel.platform,
+                                            thread_id,
+                                            &sender_id,
                                         );
                                         let estimated_tokens =
                                             crate::dispatch::estimate_tokens(&prompt, &[]);

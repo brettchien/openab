@@ -199,16 +199,22 @@ async fn main() -> anyhow::Result<()> {
         let max_bot_turns = slack_cfg.max_bot_turns;
         let slack_shutdown_rx = shutdown_rx.clone();
         let adapter = shared_slack_adapter.clone().expect("shared_slack_adapter must exist when slack config is present");
-        // Dispatcher is the sole serialization path for both modes. PerMessage =
-        // cap 1 (each message dispatches alone, FIFO), Batched = configured cap.
-        let slack_cap = match slack_cfg.message_processing_mode {
-            config::MessageProcessingMode::PerMessage => 1,
-            config::MessageProcessingMode::Batched => slack_cfg.max_buffered_messages,
+        // Dispatcher is the sole serialization path for all modes. PerMessage = cap 1
+        // (each message dispatches alone, FIFO). PerThread / PerLane = configured cap;
+        // grouping decides whether senders share a buffer or get their own lane.
+        let (slack_cap, slack_grouping) = match slack_cfg.message_processing_mode {
+            config::MessageProcessingMode::PerMessage =>
+                (1, dispatch::BatchGrouping::PerThread),
+            config::MessageProcessingMode::PerThread =>
+                (slack_cfg.max_buffered_messages, dispatch::BatchGrouping::PerThread),
+            config::MessageProcessingMode::PerLane =>
+                (slack_cfg.max_buffered_messages, dispatch::BatchGrouping::PerLane),
         };
         let slack_dispatcher = Arc::new(dispatch::Dispatcher::new(
             router.clone(),
             slack_cap,
             slack_cfg.max_batch_tokens,
+            slack_grouping,
         ));
         dispatchers.lock().unwrap().push(slack_dispatcher.clone());
         Some(tokio::spawn(async move {
@@ -241,14 +247,19 @@ async fn main() -> anyhow::Result<()> {
         let router = router.clone();
         let shutdown_rx = shutdown_rx.clone();
         info!(url = %gw_cfg.url, "starting gateway adapter");
-        let gw_cap = match gw_cfg.message_processing_mode {
-            config::MessageProcessingMode::PerMessage => 1,
-            config::MessageProcessingMode::Batched => gw_cfg.max_buffered_messages,
+        let (gw_cap, gw_grouping) = match gw_cfg.message_processing_mode {
+            config::MessageProcessingMode::PerMessage =>
+                (1, dispatch::BatchGrouping::PerThread),
+            config::MessageProcessingMode::PerThread =>
+                (gw_cfg.max_buffered_messages, dispatch::BatchGrouping::PerThread),
+            config::MessageProcessingMode::PerLane =>
+                (gw_cfg.max_buffered_messages, dispatch::BatchGrouping::PerLane),
         };
         let gw_dispatcher = Arc::new(dispatch::Dispatcher::new(
             router.clone(),
             gw_cap,
             gw_cfg.max_batch_tokens,
+            gw_grouping,
         ));
         dispatchers.lock().unwrap().push(gw_dispatcher.clone());
         let params = gateway::GatewayParams {
@@ -334,14 +345,19 @@ async fn main() -> anyhow::Result<()> {
             "starting discord adapter"
         );
 
-        let discord_cap = match discord_cfg.message_processing_mode {
-            config::MessageProcessingMode::PerMessage => 1,
-            config::MessageProcessingMode::Batched => discord_cfg.max_buffered_messages,
+        let (discord_cap, discord_grouping) = match discord_cfg.message_processing_mode {
+            config::MessageProcessingMode::PerMessage =>
+                (1, dispatch::BatchGrouping::PerThread),
+            config::MessageProcessingMode::PerThread =>
+                (discord_cfg.max_buffered_messages, dispatch::BatchGrouping::PerThread),
+            config::MessageProcessingMode::PerLane =>
+                (discord_cfg.max_buffered_messages, dispatch::BatchGrouping::PerLane),
         };
         let discord_dispatcher = Arc::new(dispatch::Dispatcher::new(
             router.clone(),
             discord_cap,
             discord_cfg.max_batch_tokens,
+            discord_grouping,
         ));
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 

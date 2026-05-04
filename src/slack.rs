@@ -1067,10 +1067,11 @@ async fn handle_message(
         thread_channel.thread_id.as_deref()
             .is_some_and(|ts| cache.get(ts).is_some_and(|inst| inst.elapsed() < adapter.session_ttl))
     };
-    let thread_key = format!(
-        "slack:{}",
-        thread_channel.thread_id.as_deref().unwrap_or(&thread_channel.channel_id)
-    );
+    let thread_id = thread_channel
+        .thread_id
+        .as_deref()
+        .unwrap_or(&thread_channel.channel_id);
+    let thread_key = dispatcher.key("slack", thread_id, &sender.sender_id);
     let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
     let buf_msg = crate::dispatch::BufferedMessage {
         sender_json,

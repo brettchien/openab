@@ -7,22 +7,32 @@ use std::path::Path;
 /// Controls how incoming messages are dispatched to ACP turns.
 ///
 /// - `PerMessage` (default): each message becomes its own ACP turn (v0.8.2-beta.1 behaviour).
-/// - `Batched`: messages that arrive while a turn is in flight are buffered and merged
-///   into one ACP turn at the next turn boundary (see ADR: turn-boundary-batching-adr.md).
+/// - `PerThread`: one buffer per thread; all senders in a thread share a single batch and
+///   produce one ACP turn per turn boundary.
+/// - `PerLane`: one buffer per (thread, sender); each sender batches independently and gets
+///   its own ACP turn — no silent-drop risk when multiple senders address the same thread.
+///
+/// The legacy alias `"batched"` resolves to `PerLane` (the recommended batching default).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageProcessingMode {
     #[default]
     PerMessage,
-    Batched,
+    PerThread,
+    PerLane,
 }
 
 impl<'de> Deserialize<'de> for MessageProcessingMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         match s.to_lowercase().replace('-', "_").as_str() {
-            "per_message" | "per-message" => Ok(Self::PerMessage),
-            "batched" => Ok(Self::Batched),
-            other => Err(serde::de::Error::unknown_variant(other, &["per-message", "batched"])),
+            "per_message" => Ok(Self::PerMessage),
+            "per_thread" => Ok(Self::PerThread),
+            // "batched" is a legacy alias for PerLane — the new default batching mode.
+            "per_lane" | "batched" => Ok(Self::PerLane),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["per-message", "per-thread", "per-lane"],
+            )),
         }
     }
 }
@@ -646,6 +656,98 @@ command = "echo"
     #[test]
     fn tool_display_default_is_full() {
         assert_eq!(ToolDisplay::default(), ToolDisplay::Full);
+    }
+
+    #[test]
+    fn message_processing_mode_parses_per_message() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "per-message"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::PerMessage
+        );
+    }
+
+    #[test]
+    fn message_processing_mode_parses_per_thread() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "per-thread"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::PerThread
+        );
+    }
+
+    #[test]
+    fn message_processing_mode_parses_per_lane() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "per-lane"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::PerLane
+        );
+    }
+
+    // Legacy alias: "batched" used to mean per-thread; it now resolves to PerLane
+    // (the recommended batching default). Existing configs continue to load.
+    #[test]
+    fn message_processing_mode_batched_alias_is_per_lane() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "batched"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::PerLane
+        );
+    }
+
+    #[test]
+    fn message_processing_mode_default_is_per_message() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::PerMessage
+        );
+    }
+
+    #[test]
+    fn message_processing_mode_unknown_value_errors() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "bogus"
+
+[agent]
+command = "echo"
+"#;
+        assert!(parse_config(toml, "test").is_err());
     }
 
     #[test]

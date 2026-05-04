@@ -641,9 +641,11 @@ impl EventHandler for Handler {
         let dispatcher = self.dispatcher.clone();
 
         tokio::spawn(async move {
+            let sender_id = sender.sender_id.clone();
             let sender_name = sender.sender_name.clone();
             let sender_json = serde_json::to_string(&sender).unwrap();
-            let thread_key = format!("discord:{}", thread_channel.channel_id);
+            let thread_key =
+                dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
             let estimated_tokens =
                 crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
             let buf_msg = crate::dispatch::BufferedMessage {
@@ -884,11 +886,20 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        let thread_key = format!("discord:{}", cmd.channel_id.get());
+        // Session pool key is always per-thread (B4-a: cancel the in-flight ACP turn even
+        // in PerLane mode — it's the only escape hatch from a runaway turn, and the
+        // shared session means there's only one in-flight turn anyway).
+        let session_key = format!("discord:{}", cmd.channel_id.get());
+        // Dispatcher key follows the configured grouping. In PerLane mode this scopes
+        // the buffer drop to the invoker's own lane (B1=X).
+        let invoker_id = cmd.user.id.to_string();
+        let dispatcher_key = self
+            .dispatcher
+            .key("discord", &cmd.channel_id.get().to_string(), &invoker_id);
 
-        let dropped = self.dispatcher.cancel_buffered(&thread_key);
+        let dropped = self.dispatcher.cancel_buffered(&dispatcher_key);
 
-        let cancel_result = self.router.pool().cancel_session(&thread_key).await;
+        let cancel_result = self.router.pool().cancel_session(&session_key).await;
 
         let msg = match (cancel_result, dropped) {
             (Ok(()), 0) => "🛑 Cancel signal sent.".to_string(),
@@ -910,12 +921,17 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        let thread_key = format!("discord:{}", cmd.channel_id.get());
+        // Session pool key is always per-thread (see /cancel-all for rationale).
+        let session_key = format!("discord:{}", cmd.channel_id.get());
+        let invoker_id = cmd.user.id.to_string();
+        let dispatcher_key = self
+            .dispatcher
+            .key("discord", &cmd.channel_id.get().to_string(), &invoker_id);
 
         // /reset is a superset of /cancel-all: drop buffered work, then tear down the session.
-        let dropped = self.dispatcher.cancel_buffered(&thread_key);
+        let dropped = self.dispatcher.cancel_buffered(&dispatcher_key);
 
-        let result = self.router.pool().reset_session(&thread_key).await;
+        let result = self.router.pool().reset_session(&session_key).await;
 
         let msg = match result {
             Ok(()) if dropped > 0 => {

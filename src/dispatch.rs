@@ -48,6 +48,22 @@ pub struct BufferedMessage {
     pub other_bot_present: bool,
 }
 
+/// How `thread_key` is built for the dispatcher's per-thread map.
+///
+/// - `PerThread`: one mpsc per thread → all senders in a thread share one batch → one
+///   ACP turn per batch (cheaper, but risks silent drop when the agent's single reply
+///   forgets to address some senders).
+/// - `PerLane`: one mpsc per (thread, sender) → each sender batches independently and
+///   gets a dedicated ACP turn. Sessions are still shared per-thread; turns serialise
+///   through the shared session.
+///
+/// Derived from `config::MessageProcessingMode` in `main.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchGrouping {
+    PerThread,
+    PerLane,
+}
+
 /// Error returned by `Dispatcher::submit`.
 #[derive(Debug)]
 pub enum DispatchError {
@@ -104,6 +120,7 @@ pub struct Dispatcher {
     router: Arc<AdapterRouter>,
     max_buffered_messages: usize,
     max_batch_tokens: usize,
+    grouping: BatchGrouping,
 }
 
 impl Dispatcher {
@@ -111,6 +128,7 @@ impl Dispatcher {
         router: Arc<AdapterRouter>,
         max_buffered_messages: usize,
         max_batch_tokens: usize,
+        grouping: BatchGrouping,
     ) -> Self {
         Self {
             per_thread: Mutex::new(HashMap::new()),
@@ -118,6 +136,22 @@ impl Dispatcher {
             router,
             max_buffered_messages,
             max_batch_tokens,
+            grouping,
+        }
+    }
+
+    /// Build the dispatcher key for a (platform, thread, sender) tuple.
+    ///
+    /// In `PerThread` mode the sender is ignored; in `PerLane` mode the sender is appended
+    /// so each (thread, sender) pair gets its own mpsc and consumer.
+    ///
+    /// Note: this is the *dispatcher* key, not the *session pool* key. Session pool keys
+    /// are always `<platform>:<thread_id>` regardless of grouping (the ACP session is
+    /// shared per-thread by design).
+    pub fn key(&self, platform: &str, thread_id: &str, sender_id: &str) -> String {
+        match self.grouping {
+            BatchGrouping::PerThread => format!("{platform}:{thread_id}"),
+            BatchGrouping::PerLane => format!("{platform}:{thread_id}:{sender_id}"),
         }
     }
 
@@ -807,5 +841,45 @@ mod tests {
     async fn try_evict_locked_returns_false_when_absent() {
         let mut map: HashMap<String, ThreadHandle> = HashMap::new();
         assert!(!Dispatcher::try_evict_locked(&mut map, "missing", 0));
+    }
+
+    // BatchGrouping → thread_key shape.
+    fn make_dispatcher(grouping: BatchGrouping) -> Dispatcher {
+        // The router is wrapped in Arc but never used by `key()` itself; we use
+        // a dummy AdapterRouter built via the same path main.rs would use.
+        // For a pure-keying test we'd ideally not need it, but the constructor demands one.
+        // Construct a minimal router via the public test helpers in adapter.rs if available;
+        // otherwise we fall back to building one with a dummy SessionPool.
+        use crate::acp::SessionPool;
+        let agent_cfg = crate::config::AgentConfig {
+            command: "/bin/true".into(),
+            args: vec![],
+            working_dir: "/tmp".into(),
+            env: std::collections::HashMap::new(),
+            inherit_env: vec![],
+        };
+        let pool = Arc::new(SessionPool::new(agent_cfg, 1));
+        let router = Arc::new(AdapterRouter::new(
+            pool,
+            crate::config::ReactionsConfig::default(),
+            crate::markdown::TableMode::Off,
+        ));
+        Dispatcher::new(router, 10, 24_000, grouping)
+    }
+
+    #[tokio::test]
+    async fn key_per_thread_ignores_sender() {
+        let d = make_dispatcher(BatchGrouping::PerThread);
+        assert_eq!(d.key("discord", "T1", "userA"), "discord:T1");
+        assert_eq!(d.key("discord", "T1", "userB"), "discord:T1");
+    }
+
+    #[tokio::test]
+    async fn key_per_lane_includes_sender() {
+        let d = make_dispatcher(BatchGrouping::PerLane);
+        assert_eq!(d.key("discord", "T1", "userA"), "discord:T1:userA");
+        assert_eq!(d.key("discord", "T1", "userB"), "discord:T1:userB");
+        // Different threads remain distinct.
+        assert_eq!(d.key("slack", "T2", "userA"), "slack:T2:userA");
     }
 }
