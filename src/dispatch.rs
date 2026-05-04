@@ -155,6 +155,18 @@ impl Dispatcher {
         }
     }
 
+    /// Build the shared session pool key for a routed channel.
+    ///
+    /// Unlike dispatcher keys, session keys never include sender identity.
+    /// They track the logical conversation thread across all grouping modes.
+    fn session_key(thread_channel: &ChannelRef) -> String {
+        let logical_thread_id = thread_channel
+            .thread_id
+            .as_deref()
+            .unwrap_or(&thread_channel.channel_id);
+        format!("{}:{}", thread_channel.platform, logical_thread_id)
+    }
+
     /// Submit one arrival event for the given thread.
     ///
     /// - If the thread has no active consumer, one is spawned lazily.
@@ -351,6 +363,7 @@ impl Dispatcher {
                     "shutdown dropped pending messages without dispatch",
                 );
             }
+            handle.consumer.abort();
         }
         map.clear();
     }
@@ -453,6 +466,7 @@ async fn dispatch_batch(
 ) {
     let dispatch_start = Instant::now();
     let batch_size = batch.len();
+    let session_key = Dispatcher::session_key(thread_channel);
 
     // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
     // Parallelized so first-token latency isn't paid for N serial reaction RPCs.
@@ -486,7 +500,7 @@ async fn dispatch_batch(
     let packed_block_count = content_blocks.len();
 
     // Ensure session exists.
-    if let Err(e) = router.pool().get_or_create(thread_key).await {
+    if let Err(e) = router.pool().get_or_create(&session_key).await {
         let user_msg = format_user_error(&e.to_string());
         let _ = adapter
             .send_message(thread_channel, &format!("⚠️ {user_msg}"))
@@ -508,7 +522,7 @@ async fn dispatch_batch(
     let result = router
         .stream_prompt_blocks(
             adapter,
-            thread_key,
+            &session_key,
             content_blocks,
             thread_channel,
             reactions.clone(),
