@@ -14,10 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::acp::ContentBlock;
+use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
 
@@ -103,8 +105,75 @@ impl ThreadHandle {
 }
 
 // ---------------------------------------------------------------------------
+// DispatchTarget — trait seam between Dispatcher and AdapterRouter
+// ---------------------------------------------------------------------------
+
+/// Surface that `consumer_loop` / `dispatch_batch` need from the underlying
+/// router. Extracted as a trait so the dispatcher can be unit-tested without
+/// spinning up a real `SessionPool` (which forks ACP CLI subprocesses).
+/// `AdapterRouter` is the production implementor; tests use a mock that
+/// records calls.
+#[async_trait]
+pub trait DispatchTarget: Send + Sync + 'static {
+    fn reactions_config(&self) -> &ReactionsConfig;
+
+    /// Ensure the ACP session for `session_key` exists (idempotent).
+    async fn ensure_session(&self, session_key: &str) -> Result<()>;
+
+    /// Drive one ACP turn with the pre-packed `content_blocks`.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_prompt_blocks(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        session_key: &str,
+        content_blocks: Vec<ContentBlock>,
+        thread_channel: &ChannelRef,
+        reactions: Arc<StatusReactionController>,
+        other_bot_present: bool,
+    ) -> Result<()>;
+}
+
+#[async_trait]
+impl DispatchTarget for AdapterRouter {
+    fn reactions_config(&self) -> &ReactionsConfig {
+        AdapterRouter::reactions_config(self)
+    }
+
+    async fn ensure_session(&self, session_key: &str) -> Result<()> {
+        self.pool().get_or_create(session_key).await
+    }
+
+    async fn stream_prompt_blocks(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        session_key: &str,
+        content_blocks: Vec<ContentBlock>,
+        thread_channel: &ChannelRef,
+        reactions: Arc<StatusReactionController>,
+        other_bot_present: bool,
+    ) -> Result<()> {
+        AdapterRouter::stream_prompt_blocks(
+            self,
+            adapter,
+            session_key,
+            content_blocks,
+            thread_channel,
+            reactions,
+            other_bot_present,
+        )
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
+
+/// Default idle timeout for per-thread consumer tasks. When no message arrives
+/// within this window the consumer exits, allowing `per_thread` map cleanup on
+/// the next `submit` (via `SendError` → `try_evict_locked`). Prevents unbounded
+/// task/memory growth from one-shot thread keys (e.g. Slack non-thread messages).
+pub const DEFAULT_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Per-thread message dispatcher for batched mode.
 ///
@@ -117,26 +186,46 @@ pub struct Dispatcher {
     /// every `submit` and consumed only when a fresh handle is inserted; wasted
     /// values are fine because generations need only be monotonic, not contiguous.
     next_generation: AtomicU64,
-    router: Arc<AdapterRouter>,
+    target: Arc<dyn DispatchTarget>,
     max_buffered_messages: usize,
     max_batch_tokens: usize,
     grouping: BatchGrouping,
+    idle_timeout: Duration,
 }
 
 impl Dispatcher {
     pub fn new(
-        router: Arc<AdapterRouter>,
+        target: Arc<dyn DispatchTarget>,
         max_buffered_messages: usize,
         max_batch_tokens: usize,
         grouping: BatchGrouping,
     ) -> Self {
-        Self {
-            per_thread: Mutex::new(HashMap::new()),
-            next_generation: AtomicU64::new(0),
-            router,
+        Self::with_idle_timeout(
+            target,
             max_buffered_messages,
             max_batch_tokens,
             grouping,
+            DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        )
+    }
+
+    /// Like `new`, but with a custom consumer idle timeout. Test-only knob —
+    /// production code should use `new` (which applies `DEFAULT_CONSUMER_IDLE_TIMEOUT`).
+    pub fn with_idle_timeout(
+        target: Arc<dyn DispatchTarget>,
+        max_buffered_messages: usize,
+        max_batch_tokens: usize,
+        grouping: BatchGrouping,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            per_thread: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
+            target,
+            max_buffered_messages,
+            max_batch_tokens,
+            grouping,
+            idle_timeout,
         }
     }
 
@@ -186,8 +275,9 @@ impl Dispatcher {
         msg: BufferedMessage,
     ) -> Result<(), DispatchError> {
         let cap = self.max_buffered_messages;
-        let router = Arc::clone(&self.router);
+        let target = Arc::clone(&self.target);
         let max_tokens = self.max_batch_tokens;
+        let idle_timeout = self.idle_timeout;
 
         // Pre-fetch a generation in case we end up inserting a fresh handle.
         // Wasted if the entry already exists; generations need only be monotonic.
@@ -212,10 +302,11 @@ impl Dispatcher {
                     thread_key.clone(),
                     thread_channel.clone(),
                     rx,
-                    Arc::clone(&router),
+                    Arc::clone(&target),
                     Arc::clone(&adapter),
                     cap,
                     max_tokens,
+                    idle_timeout,
                 ));
                 ThreadHandle {
                     tx,
@@ -248,10 +339,11 @@ impl Dispatcher {
                         thread_key.clone(),
                         thread_channel.clone(),
                         rx,
-                        Arc::clone(&router),
+                        Arc::clone(&target),
                         Arc::clone(&adapter),
                         cap,
                         max_tokens,
+                        idle_timeout,
                     ));
                     ThreadHandle {
                         tx,
@@ -274,7 +366,7 @@ impl Dispatcher {
                 let _ = adapter
                     .add_reaction(
                         &failed_msg.trigger_msg,
-                        &self.router.reactions_config().emojis.error,
+                        &self.target.reactions_config().emojis.error,
                     )
                     .await;
                 let _ = adapter
@@ -373,21 +465,16 @@ impl Dispatcher {
 // consumer_loop
 // ---------------------------------------------------------------------------
 
-/// Idle timeout for per-thread consumer tasks. When no message arrives within
-/// this window the consumer exits, allowing `per_thread` map cleanup on the
-/// next `submit` (via `SendError` → `try_evict_locked`). Prevents unbounded
-/// task/memory growth from one-shot thread keys (e.g. Slack non-thread messages).
-const CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 min
-
 #[allow(clippy::too_many_arguments)]
 async fn consumer_loop(
     thread_key: String,
     thread_channel: ChannelRef,
     mut rx: tokio::sync::mpsc::Receiver<BufferedMessage>,
-    router: Arc<AdapterRouter>,
+    target: Arc<dyn DispatchTarget>,
     adapter: Arc<dyn ChatAdapter>,
     max_batch: usize,
     max_tokens: usize,
+    idle_timeout: Duration,
 ) {
     // `pending` holds a message that exceeded the token cap for the current batch;
     // it becomes the first message of the next batch, preserving FIFO.
@@ -395,13 +482,13 @@ async fn consumer_loop(
 
     loop {
         // I1: block until at least one message arrives (zero latency for first message).
-        // Idle timeout: if no message arrives within CONSUMER_IDLE_TIMEOUT the
-        // consumer exits, freeing the task and mpsc. The next `submit` for this
-        // thread_key will observe `SendError`, evict the stale entry, and lazily
-        // spawn a fresh consumer (§2.5 generation check prevents mis-eviction).
+        // Idle timeout: if no message arrives within `idle_timeout` the consumer
+        // exits, freeing the task and mpsc. The next `submit` for this thread_key
+        // will observe `SendError`, evict the stale entry, and lazily spawn a
+        // fresh consumer (§2.5 generation check prevents mis-eviction).
         let first = match pending.take() {
             Some(msg) => msg,
-            None => match tokio::time::timeout(CONSUMER_IDLE_TIMEOUT, rx.recv()).await {
+            None => match tokio::time::timeout(idle_timeout, rx.recv()).await {
                 Ok(Some(msg)) => msg,
                 Ok(None) => {
                     // All senders dropped → shutdown() or cancel_buffered_thread().
@@ -443,7 +530,7 @@ async fn consumer_loop(
         dispatch_batch(
             &thread_key,
             &thread_channel,
-            &router,
+            &target,
             &adapter,
             batch,
             bot_present,
@@ -459,7 +546,7 @@ async fn consumer_loop(
 async fn dispatch_batch(
     thread_key: &str,
     thread_channel: &ChannelRef,
-    router: &Arc<AdapterRouter>,
+    target: &Arc<dyn DispatchTarget>,
     adapter: &Arc<dyn ChatAdapter>,
     batch: Vec<BufferedMessage>,
     other_bot_present: bool,
@@ -470,7 +557,7 @@ async fn dispatch_batch(
 
     // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
     // Parallelized so first-token latency isn't paid for N serial reaction RPCs.
-    let queued_emoji = &router.reactions_config().emojis.queued;
+    let queued_emoji = &target.reactions_config().emojis.queued;
     futures_util::future::join_all(
         batch
             .iter()
@@ -500,7 +587,7 @@ async fn dispatch_batch(
     let packed_block_count = content_blocks.len();
 
     // Ensure session exists.
-    if let Err(e) = router.pool().get_or_create(&session_key).await {
+    if let Err(e) = target.ensure_session(&session_key).await {
         let user_msg = format_user_error(&e.to_string());
         let _ = adapter
             .send_message(thread_channel, &format!("⚠️ {user_msg}"))
@@ -509,7 +596,7 @@ async fn dispatch_batch(
         return;
     }
 
-    let reactions_config = router.reactions_config().clone();
+    let reactions_config = target.reactions_config().clone();
     let reactions = Arc::new(StatusReactionController::new(
         reactions_config.enabled,
         adapter.clone(),
@@ -519,7 +606,7 @@ async fn dispatch_batch(
     ));
     // 👀 already applied above; skip set_queued() to avoid double-reaction.
 
-    let result = router
+    let result = target
         .stream_prompt_blocks(
             adapter,
             &session_key,
@@ -1028,5 +1115,267 @@ mod tests {
         // Give the runtime a tick to process abort + map drop.
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(abort.is_finished());
+    }
+
+    // -----------------------------------------------------------------------
+    // consumer_loop / dispatch_batch integration tests (NIT 2)
+    //
+    // These drive `consumer_loop` directly with a pre-populated mpsc, using
+    // `MockDispatchTarget` to record the calls that would otherwise hit a
+    // real `AdapterRouter` (and through it, ACP CLI subprocesses). This
+    // gives deterministic coverage of the orchestration paths the existing
+    // unit tests don't reach: greedy drain, token-cap overflow, idle timeout.
+    // -----------------------------------------------------------------------
+
+    /// One recorded `stream_prompt_blocks` invocation.
+    #[derive(Clone)]
+    struct RecordedDispatch {
+        block_count: usize,
+        other_bot_present: bool,
+    }
+
+    /// Mock `DispatchTarget` — records calls; never touches a real session pool.
+    struct MockDispatchTarget {
+        reactions: ReactionsConfig,
+        calls: Mutex<Vec<RecordedDispatch>>,
+        /// If set, `ensure_session` returns this error once.
+        ensure_err: Mutex<Option<String>>,
+        /// If set, `stream_prompt_blocks` returns this error once.
+        stream_err: Mutex<Option<String>>,
+    }
+
+    impl MockDispatchTarget {
+        fn new() -> Self {
+            Self {
+                reactions: ReactionsConfig::default(),
+                calls: Mutex::new(Vec::new()),
+                ensure_err: Mutex::new(None),
+                stream_err: Mutex::new(None),
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedDispatch> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl DispatchTarget for MockDispatchTarget {
+        fn reactions_config(&self) -> &ReactionsConfig {
+            &self.reactions
+        }
+
+        async fn ensure_session(&self, _session_key: &str) -> Result<()> {
+            if let Some(msg) = self.ensure_err.lock().unwrap().take() {
+                return Err(anyhow::anyhow!(msg));
+            }
+            Ok(())
+        }
+
+        async fn stream_prompt_blocks(
+            &self,
+            _adapter: &Arc<dyn ChatAdapter>,
+            _session_key: &str,
+            content_blocks: Vec<ContentBlock>,
+            _thread_channel: &ChannelRef,
+            _reactions: Arc<StatusReactionController>,
+            other_bot_present: bool,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(RecordedDispatch {
+                block_count: content_blocks.len(),
+                other_bot_present,
+            });
+            if let Some(msg) = self.stream_err.lock().unwrap().take() {
+                return Err(anyhow::anyhow!(msg));
+            }
+            Ok(())
+        }
+    }
+
+    /// Mock `ChatAdapter` — every method is a no-op success. The dispatch loop
+    /// invokes `add_reaction` (queued 👀), `platform`, and on the error path
+    /// `send_message`; nothing else needs real behavior here.
+    struct MockChatAdapter;
+
+    #[async_trait]
+    impl ChatAdapter for MockChatAdapter {
+        fn platform(&self) -> &'static str { "mock" }
+        fn message_limit(&self) -> usize { 2000 }
+
+        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            Ok(MessageRef { channel: channel.clone(), message_id: "mock-msg".into() })
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> { Ok(()) }
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> { Ok(()) }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool { false }
+    }
+
+    fn make_channel(thread: &str) -> ChannelRef {
+        ChannelRef {
+            platform: "mock".into(),
+            channel_id: thread.into(),
+            thread_id: Some(thread.into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    fn make_msg(prompt: &str, tokens: usize) -> BufferedMessage {
+        BufferedMessage {
+            sender_json: r#"{"schema":"openab.sender.v1","sender_id":"u","sender_name":"u"}"#.into(),
+            sender_name: "u".into(),
+            prompt: prompt.into(),
+            extra_blocks: vec![],
+            trigger_msg: MessageRef {
+                channel: make_channel("T"),
+                message_id: format!("m-{prompt}"),
+            },
+            arrived_at: Instant::now(),
+            estimated_tokens: tokens,
+            other_bot_present: false,
+        }
+    }
+
+    /// Pre-load `msgs` into a fresh mpsc, drop the sender, and run
+    /// `consumer_loop` to completion. Returns the recorded dispatches.
+    async fn run_consumer_with_messages(
+        msgs: Vec<BufferedMessage>,
+        max_batch: usize,
+        max_tokens: usize,
+    ) -> Vec<RecordedDispatch> {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
+        for m in msgs {
+            tx.send(m).await.unwrap();
+        }
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            max_batch,
+            max_tokens,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        mock.calls()
+    }
+
+    #[tokio::test]
+    async fn consumer_dispatches_single_message_as_one_batch() {
+        let calls = run_consumer_with_messages(vec![make_msg("hi", 10)], 10, 24_000).await;
+        assert_eq!(calls.len(), 1);
+        // pack_arrival_event with no extra_blocks → 1 Text block per message.
+        assert_eq!(calls[0].block_count, 1);
+        assert!(!calls[0].other_bot_present);
+    }
+
+    #[tokio::test]
+    async fn consumer_greedy_drain_combines_queued_messages_into_one_batch() {
+        // 3 messages already in the queue when the consumer wakes → greedy
+        // drain pulls all 3, packs them into one batch, dispatches once.
+        let calls = run_consumer_with_messages(
+            vec![make_msg("a", 50), make_msg("b", 50), make_msg("c", 50)],
+            10,
+            24_000,
+        )
+        .await;
+        assert_eq!(calls.len(), 1, "expected a single batched dispatch");
+        assert_eq!(calls[0].block_count, 3, "one Text block per arrival event");
+    }
+
+    #[tokio::test]
+    async fn consumer_token_cap_splits_batch_preserving_fifo() {
+        // max_tokens=100, two 80-token messages → cumulative 160 > 100, so
+        // msg2 becomes `pending` and is dispatched in the next batch.
+        let calls =
+            run_consumer_with_messages(vec![make_msg("a", 80), make_msg("b", 80)], 10, 100).await;
+        assert_eq!(calls.len(), 2, "token cap should split into two batches");
+        assert_eq!(calls[0].block_count, 1);
+        assert_eq!(calls[1].block_count, 1);
+    }
+
+    #[tokio::test]
+    async fn consumer_exits_after_idle_timeout_with_no_messages() {
+        // No messages ever arrive; consumer should exit once `idle_timeout`
+        // elapses. Keep `tx` alive so the exit path is the timeout, not the
+        // "all senders dropped" branch.
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+        let consumer = tokio::spawn(consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            10,
+            24_000,
+            Duration::from_millis(50),
+        ));
+        // Wait enough for the timeout branch + a tick for the task to finish.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(consumer.is_finished(), "consumer should exit after idle timeout");
+        // No dispatches should have been recorded.
+        assert!(mock.calls().is_empty());
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn submit_evicts_dead_handle_and_retries_with_fresh_consumer() {
+        // §2.5: if `tx.send()` returns `SendError` (consumer's rx dropped
+        // mid-flight), `submit` evicts the stale entry under lock and spawns
+        // a fresh consumer. Manufacture this state by inserting a handle
+        // whose consumer is still parked but whose rx has been dropped.
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let d = Dispatcher::new(target, 10, 24_000, BatchGrouping::Thread);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        let key = "mock:T".to_string();
+        let parked = {
+            let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(10);
+            drop(rx); // closes the channel → next tx.send() yields SendError
+            let consumer = tokio::spawn(std::future::pending::<()>());
+            let abort = consumer.abort_handle();
+            let handle = ThreadHandle {
+                tx,
+                consumer,
+                generation: 999,
+                channel_id: "T".into(),
+                adapter_kind: "mock".into(),
+            };
+            d.per_thread.lock().unwrap().insert(key.clone(), handle);
+            abort
+        };
+
+        d.submit(key, make_channel("T"), adapter, make_msg("hello", 10))
+            .await
+            .expect("retry should spawn a fresh consumer");
+        // Give the freshly spawned consumer time to drain + dispatch.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1, "fresh consumer should have dispatched the retry");
+        assert_eq!(calls[0].block_count, 1);
+
+        parked.abort();
     }
 }
