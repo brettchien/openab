@@ -39,7 +39,7 @@ impl<'de> Deserialize<'de> for MessageProcessingMode {
 /// Inspired by Hermes Agent's `DISCORD_ALLOW_BOTS` 3-value design:
 /// - `Off` (default): ignore all bot messages (safe default, no behavior change)
 /// - `Mentions`: only process bot messages that @mention this bot (natural loop breaker)
-/// - `All`: process all bot messages (capped at `MAX_CONSECUTIVE_BOT_TURNS`)
+/// - `All`: process all bot messages (hard-capped at 1000 consecutive bot turns)
 ///
 /// The bot's own messages are always ignored regardless of this setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -143,7 +143,7 @@ pub struct DiscordConfig {
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
     /// Max consecutive bot turns (without human intervention) before throttling.
-    /// Human message resets the counter. Default: 20.
+    /// Human message resets the counter. Default: 100.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
     /// Allow the bot to respond to Discord direct messages (DMs).
@@ -161,7 +161,7 @@ pub struct DiscordConfig {
     pub max_batch_tokens: usize,
 }
 
-fn default_max_bot_turns() -> u32 { 20 }
+fn default_max_bot_turns() -> u32 { 100 }
 fn default_max_buffered_messages() -> usize { 10 }
 fn default_max_batch_tokens() -> usize { 24_000 }
 
@@ -217,7 +217,7 @@ pub struct SlackConfig {
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
     /// Max consecutive bot turns (without human intervention) before throttling.
-    /// Human message resets the counter. Default: 20.
+    /// Human message resets the counter. Default: 100.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
     /// Message dispatch mode. Default: per-message.

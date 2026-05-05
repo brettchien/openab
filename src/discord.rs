@@ -21,7 +21,7 @@ use tracing::{debug, error, info};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
 /// Prevents runaway loops between multiple bots in "all" mode.
-const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
+const MAX_CONSECUTIVE_BOT_TURNS: u32 = 1000;
 
 /// Maximum entries in the participation cache before eviction.
 const PARTICIPATION_CACHE_MAX: usize = 1000;
@@ -368,6 +368,7 @@ impl EventHandler for Handler {
                 AllowBots::Mentions => if !is_mentioned { return; },
                 AllowBots::All => {
                     let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
+                    let limit = std::cmp::min(MAX_CONSECUTIVE_BOT_TURNS, 100) as u8;
                     let history = ctx.cache.channel_messages(msg.channel_id)
                         .map(|msgs| {
                             let mut recent: Vec<_> = msgs.iter()
@@ -384,7 +385,7 @@ impl EventHandler for Handler {
                         cached
                     } else {
                         match msg.channel_id
-                            .messages(&ctx.http, serenity::builder::GetMessages::new().before(msg.id).limit(MAX_CONSECUTIVE_BOT_TURNS))
+                            .messages(&ctx.http, serenity::builder::GetMessages::new().before(msg.id).limit(limit))
                             .await
                         {
                             Ok(msgs) => msgs,

@@ -40,7 +40,7 @@ Discord adapter. Requires a Discord bot token.
 | `trusted_bot_ids` | string[] | `[]` | When non-empty, only these bot IDs pass the bot gate. Empty = any bot (mode permitting). Ignored when `allow_bot_messages = "off"`. |
 | `allow_user_messages` | string | `"involved"` | `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread. |
 | `allow_dm` | bool | `false` | `true` = respond to Discord DMs; `false` = ignore DMs. `allowed_users` still applies in DMs. Each DM user consumes one session slot. |
-| `max_bot_turns` | u32 | `20` | Max consecutive bot turns per thread before throttling. Human message resets the counter. Note: when `allow_bot_messages = "all"`, a separate hardcoded cap of 10 (`MAX_CONSECUTIVE_BOT_TURNS`) stops bot replies regardless of this value. |
+| `max_bot_turns` | u32 | `100` | Max consecutive bot turns per thread before throttling (soft limit). Human message resets the counter. A compiled-in hard cap of 1000 consecutive bot messages is always enforced. |
 
 ---
 
@@ -59,7 +59,7 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 | `allow_bot_messages` | string | `"off"` | Same as Discord. |
 | `trusted_bot_ids` | string[] | `[]` | Slack Bot User IDs (`U...`). Find via: click bot profile → Copy member ID. |
 | `allow_user_messages` | string | `"involved"` | Same as Discord. |
-| `max_bot_turns` | u32 | `20` | Same as Discord. |
+| `max_bot_turns` | u32 | `100` | Same as Discord. |
 
 ---
 

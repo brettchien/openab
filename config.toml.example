@@ -31,7 +31,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         # "mentions" = always require @mention
                                         # "multibot-mentions" = like "involved", but require @mention
                                         #   once another bot has posted in the thread
-# max_bot_turns = 20                   # soft cap on consecutive bot turns per thread (human msg resets)
+# max_bot_turns = 100                  # soft cap on consecutive bot turns per thread (human msg resets)
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway

@@ -431,7 +431,7 @@ impl ChatAdapter for SlackAdapter {
 // --- Socket Mode event loop ---
 
 /// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
-const MAX_CONSECUTIVE_BOT_TURNS: usize = 10;
+const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 
 /// Run the Slack adapter using Socket Mode (persistent WebSocket, no public URL needed).
 /// Reconnects automatically on disconnect.
@@ -667,7 +667,8 @@ pub async fn run_slack_adapter(
                                                         AllowBots::All => {
                                                             // Loop protection: count consecutive bot msgs (fail-closed)
                                                             if let Some(thread_ts) = event["thread_ts"].as_str() {
-                                                                let limit_str = (MAX_CONSECUTIVE_BOT_TURNS + 1).to_string();
+                                                                let cap = MAX_CONSECUTIVE_BOT_TURNS;
+                                                                let limit_str = std::cmp::min(cap + 1, 1000).to_string();
                                                                 match adapter.api_get(
                                                                     "conversations.replies",
                                                                     &[
@@ -685,8 +686,8 @@ pub async fn run_slack_adapter(
                                                                                         || m["subtype"].as_str() == Some("bot_message")
                                                                                 })
                                                                                 .count();
-                                                                            if consecutive >= MAX_CONSECUTIVE_BOT_TURNS {
-                                                                                warn!("bot turn cap reached ({MAX_CONSECUTIVE_BOT_TURNS}), ignoring");
+                                                                            if consecutive >= cap {
+                                                                                warn!(channel_id, cap, "bot turn cap reached, ignoring");
                                                                                 continue;
                                                                             }
                                                                         }

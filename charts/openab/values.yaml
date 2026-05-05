@@ -157,10 +157,11 @@ agents:
       trustedBotIds: []
       # maxBotTurns: soft cap on consecutive bot turns per thread before
       # the bot stops auto-replying. A human message resets the counter.
-      # Default 20 (Rust-side `default_max_bot_turns()`). Raise for long
+      # Default 100 (Rust-side `default_max_bot_turns()`). Raise for long
       # multi-agent collaborations; lower to throttle runaway loops more
-      # aggressively. Hard cap remains 100 regardless (compiled-in).
-      # maxBotTurns: 20
+      # aggressively. Compiled-in hard cap of 1000 consecutive bot messages
+      # is always enforced (not configurable).
+      # maxBotTurns: 100
       # messageProcessingMode: "per-message" (default) | "per-thread" | "per-lane"
       # per-thread: all senders in a thread share one batch → one ACP turn per turn boundary
       # per-lane:   each (thread, sender) batches independently → no silent-drop risk
@@ -189,10 +190,11 @@ agents:
       allowUserMessages: "involved"
       # maxBotTurns: soft cap on consecutive bot turns per thread before
       # the bot stops auto-replying. A human message resets the counter.
-      # Default 20 (Rust-side `default_max_bot_turns()`). Raise for long
+      # Default 100 (Rust-side `default_max_bot_turns()`). Raise for long
       # multi-agent collaborations; lower to throttle runaway loops more
-      # aggressively. Hard cap remains 100 regardless (compiled-in).
-      # maxBotTurns: 20
+      # aggressively. Compiled-in hard cap of 1000 consecutive bot messages
+      # is always enforced (not configurable).
+      # maxBotTurns: 100
       # messageProcessingMode: "per-message" (default) | "per-thread" | "per-lane"
       # per-thread: all senders in a thread share one batch → one ACP turn per turn boundary
       # per-lane:   each (thread, sender) batches independently → no silent-drop risk
