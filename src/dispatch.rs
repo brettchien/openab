@@ -720,12 +720,20 @@ mod tests {
             "hello",
             vec![],
         );
-        assert_eq!(blocks.len(), 1);
+        // sender_context delimiter + prompt = 2 blocks
+        assert_eq!(blocks.len(), 2);
         if let ContentBlock::Text { text } = &blocks[0] {
             assert!(text.contains("<sender_context>"));
-            assert!(text.contains("hello"));
+            assert!(text.contains("</sender_context>"));
+            // Header is delimiter only — prompt lives in its own block.
+            assert!(!text.contains("hello"));
         } else {
-            panic!("expected Text block");
+            panic!("expected Text delimiter block");
+        }
+        if let ContentBlock::Text { text } = &blocks[1] {
+            assert_eq!(text, "hello");
+        } else {
+            panic!("expected Text prompt block");
         }
     }
 
@@ -736,25 +744,34 @@ mod tests {
             ContentBlock::Image { media_type: "image/png".into(), data: "abc".into() },
         ];
         let blocks = AdapterRouter::pack_arrival_event("{}", "prompt", extra);
-        // header + 2 extra = 3 blocks
-        assert_eq!(blocks.len(), 3);
-        // extra blocks follow the header in arrival order
+        // delimiter + transcript + prompt + image = 4 blocks
+        assert_eq!(blocks.len(), 4);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text.contains("<sender_context>")));
         assert!(matches!(&blocks[1], ContentBlock::Text { text } if text.contains("Voice transcript")));
-        assert!(matches!(&blocks[2], ContentBlock::Image { .. }));
+        assert!(matches!(&blocks[2], ContentBlock::Text { text } if text == "prompt"));
+        assert!(matches!(&blocks[3], ContentBlock::Image { .. }));
     }
 
     #[test]
     fn pack_arrival_event_batch_n2() {
-        // Two arrival events concatenated → 2 header blocks
+        // Two arrival events concatenated → 2 (header + prompt) pairs = 4 blocks.
         let mut all: Vec<ContentBlock> = Vec::new();
         all.extend(AdapterRouter::pack_arrival_event(r#"{"ts":"T1"}"#, "msg1", vec![]));
         all.extend(AdapterRouter::pack_arrival_event(r#"{"ts":"T2"}"#, "msg2", vec![]));
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 4);
         if let ContentBlock::Text { text } = &all[0] {
-            assert!(text.contains("msg1"));
+            assert!(text.contains(r#""ts":"T1""#));
+            assert!(!text.contains("msg1"));
         }
         if let ContentBlock::Text { text } = &all[1] {
-            assert!(text.contains("msg2"));
+            assert_eq!(text, "msg1");
+        }
+        if let ContentBlock::Text { text } = &all[2] {
+            assert!(text.contains(r#""ts":"T2""#));
+            assert!(!text.contains("msg2"));
+        }
+        if let ContentBlock::Text { text } = &all[3] {
+            assert_eq!(text, "msg2");
         }
     }
 
@@ -779,30 +796,32 @@ mod tests {
                 data: "imgB".into(),
             }],
         ));
-        // header(M1) + header(M2) + image(M2) = 3 blocks
-        assert_eq!(all.len(), 3);
-        // M1's header carries text only
+        // header(M1) + prompt(M1) + header(M2) + image(M2) = 4 blocks
+        // (M2 has empty prompt, so its prompt block is omitted)
+        assert_eq!(all.len(), 4);
         if let ContentBlock::Text { text } = &all[0] {
             assert!(text.contains(r#""sender_id":"A""#));
             assert!(text.contains(r#""ts":"T1""#));
-            assert!(text.contains("see this image"));
         } else {
-            panic!("expected Text header for M1");
+            panic!("expected Text delimiter for M1");
         }
-        // M2's header carries empty prompt (line after </sender_context> is blank)
         if let ContentBlock::Text { text } = &all[1] {
-            assert!(text.contains(r#""ts":"T2""#));
-            assert!(text.ends_with("\n\n"), "M2 prompt must be empty: {text:?}");
+            assert_eq!(text, "see this image");
         } else {
-            panic!("expected Text header for M2");
+            panic!("expected Text prompt for M1");
         }
-        // M2's image follows immediately after its header (structural attribution)
-        assert!(matches!(&all[2], ContentBlock::Image { .. }));
+        if let ContentBlock::Text { text } = &all[2] {
+            assert!(text.contains(r#""ts":"T2""#));
+        } else {
+            panic!("expected Text delimiter for M2");
+        }
+        // M2's image follows immediately after its delimiter (no prompt block).
+        assert!(matches!(&all[3], ContentBlock::Image { .. }));
     }
 
     // ADR §3.6 Scenario C — fragmented multi-author batch.
     // Repeated sender_id is preserved across non-adjacent messages; bob's interjection
-    // is kept as-is (no silent drop, no reorder).
+    // is kept as-is (no silent drop, no temporal reorder).
     #[test]
     fn pack_arrival_event_scenario_c_multi_author_interleaved() {
         let mut all: Vec<ContentBlock> = Vec::new();
@@ -824,31 +843,44 @@ mod tests {
                 data: "imgC".into(),
             }],
         ));
-        // 3 headers + 1 image = 4 blocks
-        assert_eq!(all.len(), 4);
-        // Order is preserved (no reorder).
+        // M1: header + prompt = 2 blocks
+        // M2: header + prompt = 2 blocks
+        // M3: header + image = 2 blocks (empty prompt → no prompt block)
+        // total = 6
+        assert_eq!(all.len(), 6);
         let h1 = match &all[0] {
             ContentBlock::Text { text } => text,
-            _ => panic!("expected Text"),
+            _ => panic!("expected Text delimiter for M1"),
         };
-        let h2 = match &all[1] {
+        let p1 = match &all[1] {
             ContentBlock::Text { text } => text,
-            _ => panic!("expected Text"),
+            _ => panic!("expected Text prompt for M1"),
         };
-        let h3 = match &all[2] {
+        let h2 = match &all[2] {
             ContentBlock::Text { text } => text,
-            _ => panic!("expected Text"),
+            _ => panic!("expected Text delimiter for M2"),
         };
-        assert!(h1.contains(r#""sender_id":"A""#) && h1.contains("see this image"));
-        assert!(h2.contains(r#""sender_id":"B""#) && h2.contains("what?"));
-        assert!(h3.contains(r#""sender_id":"A""#));
+        let p2 = match &all[3] {
+            ContentBlock::Text { text } => text,
+            _ => panic!("expected Text prompt for M2"),
+        };
+        let h3 = match &all[4] {
+            ContentBlock::Text { text } => text,
+            _ => panic!("expected Text delimiter for M3"),
+        };
+        assert!(h1.contains(r#""sender_id":"A""#) && h1.contains(r#""ts":"T1""#));
+        assert_eq!(p1, "see this image");
+        assert!(h2.contains(r#""sender_id":"B""#) && h2.contains(r#""ts":"T2""#));
+        assert_eq!(p2, "what?");
+        assert!(h3.contains(r#""sender_id":"A""#) && h3.contains(r#""ts":"T3""#));
         // M3's image attached to M3 only.
-        assert!(matches!(&all[3], ContentBlock::Image { .. }));
+        assert!(matches!(&all[5], ContentBlock::Image { .. }));
     }
 
     // ADR §3.6 Scenario D — voice-only message in a batch.
-    // M2 has empty prompt + transcript text block. Per ADR, transcript moves AFTER
-    // <sender_context> (vs. v0.8.2-beta.1's prepended position).
+    // Within each arrival, transcript Text blocks precede the prompt block so the
+    // agent sees voice content before any typed text. The sender_context delimiter
+    // still opens each arrival.
     #[test]
     fn pack_arrival_event_scenario_d_voice_only() {
         let mut all: Vec<ContentBlock> = Vec::new();
@@ -872,27 +904,34 @@ mod tests {
             "what?",
             vec![],
         ));
-        // header(M1) + image(M1) + header(M2) + transcript(M2) + header(M3) = 5
-        assert_eq!(all.len(), 5);
+        // M1: header + prompt + image = 3
+        // M2: header + transcript = 2 (empty prompt → no prompt block)
+        // M3: header + prompt = 2
+        // total = 7
+        assert_eq!(all.len(), 7);
         if let ContentBlock::Text { text } = &all[0] {
             assert!(text.contains(r#""ts":"T1""#));
-            assert!(text.contains("look at this"));
+            assert!(!text.contains("look at this"));
         }
-        assert!(matches!(&all[1], ContentBlock::Image { .. }));
-        // M2 header has empty prompt; transcript follows AFTER the header (not before).
-        if let ContentBlock::Text { text } = &all[2] {
-            assert!(text.contains(r#""ts":"T2""#));
-            assert!(text.ends_with("\n\n"));
+        if let ContentBlock::Text { text } = &all[1] {
+            assert_eq!(text, "look at this");
         }
+        assert!(matches!(&all[2], ContentBlock::Image { .. }));
         if let ContentBlock::Text { text } = &all[3] {
+            assert!(text.contains(r#""ts":"T2""#));
+        }
+        // Transcript precedes prompt (and prompt is omitted here because empty).
+        if let ContentBlock::Text { text } = &all[4] {
             assert!(text.contains("Voice message transcript"));
             assert!(text.contains("sync about the deploy"));
         } else {
-            panic!("expected transcript Text block as M2 attachment");
+            panic!("expected transcript Text block after M2 delimiter");
         }
-        if let ContentBlock::Text { text } = &all[4] {
+        if let ContentBlock::Text { text } = &all[5] {
             assert!(text.contains(r#""sender_id":"B""#));
-            assert!(text.contains("what?"));
+        }
+        if let ContentBlock::Text { text } = &all[6] {
+            assert_eq!(text, "what?");
         }
     }
 
@@ -1286,8 +1325,8 @@ mod tests {
     async fn consumer_dispatches_single_message_as_one_batch() {
         let calls = run_consumer_with_messages(vec![make_msg("hi", 10)], 10, 24_000).await;
         assert_eq!(calls.len(), 1);
-        // pack_arrival_event with no extra_blocks → 1 Text block per message.
-        assert_eq!(calls[0].block_count, 1);
+        // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
+        assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
     }
 
@@ -1302,7 +1341,8 @@ mod tests {
         )
         .await;
         assert_eq!(calls.len(), 1, "expected a single batched dispatch");
-        assert_eq!(calls[0].block_count, 3, "one Text block per arrival event");
+        // 3 arrivals × (delimiter + prompt) = 6 blocks.
+        assert_eq!(calls[0].block_count, 6);
     }
 
     #[tokio::test]
@@ -1312,8 +1352,9 @@ mod tests {
         let calls =
             run_consumer_with_messages(vec![make_msg("a", 80), make_msg("b", 80)], 10, 100).await;
         assert_eq!(calls.len(), 2, "token cap should split into two batches");
-        assert_eq!(calls[0].block_count, 1);
-        assert_eq!(calls[1].block_count, 1);
+        // Each batch holds one arrival → delimiter + prompt = 2 blocks.
+        assert_eq!(calls[0].block_count, 2);
+        assert_eq!(calls[1].block_count, 2);
     }
 
     #[tokio::test]
@@ -1379,7 +1420,8 @@ mod tests {
 
         let calls = mock.calls();
         assert_eq!(calls.len(), 1, "fresh consumer should have dispatched the retry");
-        assert_eq!(calls[0].block_count, 1);
+        // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
+        assert_eq!(calls[0].block_count, 2);
 
         parked.abort();
     }

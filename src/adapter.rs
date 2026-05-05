@@ -170,24 +170,38 @@ impl AdapterRouter {
         &self.reactions_config
     }
 
-    /// Pack one arrival event into ContentBlocks using the uniform per-arrival template:
-    ///   Text { "<sender_context>\n{json}\n</sender_context>\n\n{prompt}" }
-    ///   [extra_blocks in arrival order]
+    /// Pack one arrival event into ContentBlocks. Per-arrival layout:
+    ///   Text { "<sender_context>\n{json}\n</sender_context>" }   <- delimiter
+    ///   [Text blocks from extra_blocks (e.g. STT transcripts)]
+    ///   Text { "{prompt}" }                                       <- omitted if empty
+    ///   [non-Text blocks from extra_blocks (e.g. Image)]
     ///
-    /// This is the single packing code path for both per-message and batched dispatch
-    /// (ADR §3.5). For a batch of N messages, call this N times and concatenate.
+    /// The sender_context block stands alone so it can serve as a structural
+    /// delimiter between arrivals in batched dispatch — agents can scan for
+    /// `<sender_context>` openers to find arrival boundaries. Within an arrival,
+    /// transcript text precedes the typed prompt to match pre-batching adapter
+    /// behavior (voice content first), and images trail the prompt as before.
+    /// This is the single packing code path for both per-message and batched
+    /// dispatch (ADR §3.5). For a batch of N messages, call this N times and
+    /// concatenate.
     pub fn pack_arrival_event(
         sender_json: &str,
         prompt: &str,
         extra_blocks: Vec<ContentBlock>,
     ) -> Vec<ContentBlock> {
-        let header = format!(
-            "<sender_context>\n{}\n</sender_context>\n\n{}",
-            sender_json, prompt
-        );
-        let mut blocks = Vec::with_capacity(1 + extra_blocks.len());
+        let header = format!("<sender_context>\n{}\n</sender_context>", sender_json);
+        let (texts, others): (Vec<_>, Vec<_>) = extra_blocks
+            .into_iter()
+            .partition(|b| matches!(b, ContentBlock::Text { .. }));
+        let mut blocks = Vec::with_capacity(2 + texts.len() + others.len());
         blocks.push(ContentBlock::Text { text: header });
-        blocks.extend(extra_blocks);
+        blocks.extend(texts);
+        if !prompt.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: prompt.to_string(),
+            });
+        }
+        blocks.extend(others);
         blocks
     }
 
