@@ -322,6 +322,11 @@ impl Dispatcher {
         if let Err(e) = tx.send(msg).await {
             // Consumer has exited between our check and the send — race-safe
             // eviction under lock (§2.5), then transparent retry once.
+            //
+            // Safe to re-acquire `per_thread` here: the first lock guard above
+            // was dropped before `tx.send().await`, so this acquisition cannot
+            // deadlock against the await point. The same property holds for the
+            // retry acquisition below.
             {
                 let mut map = self.per_thread.lock().unwrap();
                 Self::try_evict_locked(&mut map, &thread_key, my_generation);
