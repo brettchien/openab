@@ -4,6 +4,36 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Controls how incoming messages are dispatched to ACP turns.
+///
+/// - `Message` (default): each message becomes its own ACP turn (v0.8.2-beta.1 behaviour).
+/// - `Thread`: one buffer per thread; all senders in a thread share a single batch and
+///   produce one ACP turn per turn boundary.
+/// - `Lane`: one buffer per (thread, sender); each sender batches independently and gets
+///   its own ACP turn — no silent-drop risk when multiple senders address the same thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MessageProcessingMode {
+    #[default]
+    Message,
+    Thread,
+    Lane,
+}
+
+impl<'de> Deserialize<'de> for MessageProcessingMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "per_message" => Ok(Self::Message),
+            "per_thread" => Ok(Self::Thread),
+            "per_lane" => Ok(Self::Lane),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["per-message", "per-thread", "per-lane"],
+            )),
+        }
+    }
+}
+
 /// Controls whether the bot processes messages from other Discord bots.
 ///
 /// Inspired by Hermes Agent's `DISCORD_ALLOW_BOTS` 3-value design:
@@ -120,9 +150,20 @@ pub struct DiscordConfig {
     /// Default: false (opt-in). `allowed_users` still applies in DMs.
     #[serde(default)]
     pub allow_dm: bool,
+    /// Message dispatch mode. Default: per-message (v0.8.2-beta.1 behaviour).
+    #[serde(default)]
+    pub message_processing_mode: MessageProcessingMode,
+    /// Batched mode only: per-thread channel capacity. Default: 10.
+    #[serde(default = "default_max_buffered_messages")]
+    pub max_buffered_messages: usize,
+    /// Batched mode only: soft token cap for greedy drain. Default: 24000.
+    #[serde(default = "default_max_batch_tokens")]
+    pub max_batch_tokens: usize,
 }
 
 fn default_max_bot_turns() -> u32 { 20 }
+fn default_max_buffered_messages() -> usize { 10 }
+fn default_max_batch_tokens() -> usize { 24_000 }
 
 /// Controls whether the bot responds to user messages in threads without @mention.
 ///
@@ -179,6 +220,15 @@ pub struct SlackConfig {
     /// Human message resets the counter. Default: 20.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
+    /// Message dispatch mode. Default: per-message.
+    #[serde(default)]
+    pub message_processing_mode: MessageProcessingMode,
+    /// Batched mode only: per-thread channel capacity. Default: 10.
+    #[serde(default = "default_max_buffered_messages")]
+    pub max_buffered_messages: usize,
+    /// Batched mode only: soft token cap for greedy drain. Default: 24000.
+    #[serde(default = "default_max_batch_tokens")]
+    pub max_batch_tokens: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +255,15 @@ pub struct GatewayConfig {
     /// Enable streaming (typewriter) mode — requires gateway platform to support message editing.
     #[serde(default)]
     pub streaming: bool,
+    /// Message dispatch mode. Default: per-message.
+    #[serde(default)]
+    pub message_processing_mode: MessageProcessingMode,
+    /// Batched mode only: per-thread channel capacity. Default: 10.
+    #[serde(default = "default_max_buffered_messages")]
+    pub max_buffered_messages: usize,
+    /// Batched mode only: soft token cap for greedy drain. Default: 24000.
+    #[serde(default = "default_max_batch_tokens")]
+    pub max_batch_tokens: usize,
 }
 
 fn default_gateway_platform() -> String {
@@ -285,7 +344,7 @@ impl<'de> Deserialize<'de> for ToolDisplay {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ReactionsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -452,6 +511,23 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
     let expanded = expand_env_vars(raw);
     let config: Config = toml::from_str(&expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
+
+    // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
+    // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
+    // batch to size 1 — functionally per-message via a confusing path).
+    if let Some(ref d) = config.discord {
+        anyhow::ensure!(d.max_buffered_messages > 0, "discord.max_buffered_messages must be > 0");
+        anyhow::ensure!(d.max_batch_tokens > 0, "discord.max_batch_tokens must be > 0");
+    }
+    if let Some(ref s) = config.slack {
+        anyhow::ensure!(s.max_buffered_messages > 0, "slack.max_buffered_messages must be > 0");
+        anyhow::ensure!(s.max_batch_tokens > 0, "slack.max_batch_tokens must be > 0");
+    }
+    if let Some(ref g) = config.gateway {
+        anyhow::ensure!(g.max_buffered_messages > 0, "gateway.max_buffered_messages must be > 0");
+        anyhow::ensure!(g.max_batch_tokens > 0, "gateway.max_batch_tokens must be > 0");
+    }
+
     Ok(config)
 }
 
@@ -582,6 +658,94 @@ command = "echo"
     #[test]
     fn tool_display_default_is_full() {
         assert_eq!(ToolDisplay::default(), ToolDisplay::Full);
+    }
+
+    #[test]
+    fn message_processing_mode_parses_per_message() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "per-message"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::Message
+        );
+    }
+
+    #[test]
+    fn message_processing_mode_parses_per_thread() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "per-thread"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::Thread
+        );
+    }
+
+    #[test]
+    fn message_processing_mode_parses_per_lane() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "per-lane"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::Lane
+        );
+    }
+
+    // The legacy alias "batched" was removed: only per-message / per-thread / per-lane
+    // are accepted. Configs still using "batched" must migrate to an explicit value.
+    #[test]
+    fn message_processing_mode_batched_is_rejected() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "batched"
+
+[agent]
+command = "echo"
+"#;
+        assert!(parse_config(toml, "test").is_err());
+    }
+
+    #[test]
+    fn message_processing_mode_default_is_per_message() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().message_processing_mode,
+            MessageProcessingMode::Message
+        );
+    }
+
+    #[test]
+    fn message_processing_mode_unknown_value_errors() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+message_processing_mode = "bogus"
+
+[agent]
+command = "echo"
+"#;
+        assert!(parse_config(toml, "test").is_err());
     }
 
     #[test]

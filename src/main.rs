@@ -4,6 +4,7 @@ mod bot_turns;
 mod config;
 mod cron;
 mod discord;
+mod dispatch;
 mod error_display;
 mod format;
 mod markdown;
@@ -13,6 +14,7 @@ mod setup;
 mod slack;
 mod stt;
 mod gateway;
+mod timestamp;
 
 use adapter::AdapterRouter;
 use clap::Parser;
@@ -20,7 +22,7 @@ use serenity::gateway::GatewayError;
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
 /// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM. SIGTERM is what Kubernetes
@@ -142,12 +144,24 @@ async fn main() -> anyhow::Result<()> {
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Dispatcher handles tracked here so SIGTERM cleanup can call shutdown() on each (ADR §6.8).
+    // Also shared with the cleanup task for periodic stale-entry sweeping.
+    // Arc<Mutex<Vec<…>>> because: outer Arc shared with cleanup task + shutdown,
+    // Mutex guards startup-time pushes, inner Arc<Dispatcher> shared with each adapter.
+    // All pushes happen at startup; runtime access is read-only (lock is uncontended).
+    let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
+
     // Spawn cleanup task
     let cleanup_pool = pool.clone();
+    let cleanup_dispatchers = dispatchers.clone();
     let cleanup_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             cleanup_pool.cleanup_idle(ttl_secs).await;
+            // Sweep stale per-thread dispatcher entries (idle-exited consumers).
+            for d in cleanup_dispatchers.lock().unwrap().iter() {
+                d.sweep_stale();
+            }
         }
     });
 
@@ -188,6 +202,21 @@ async fn main() -> anyhow::Result<()> {
         let max_bot_turns = slack_cfg.max_bot_turns;
         let slack_shutdown_rx = shutdown_rx.clone();
         let adapter = shared_slack_adapter.clone().expect("shared_slack_adapter must exist when slack config is present");
+        // Dispatcher is the sole serialization path for all modes. Message = cap 1
+        // (each message dispatches alone, FIFO). Thread / Lane = configured cap;
+        // grouping decides whether senders share a buffer or get their own lane.
+        let (slack_cap, slack_grouping, slack_idle) = dispatch::dispatch_params(
+            &slack_cfg.message_processing_mode,
+            slack_cfg.max_buffered_messages,
+        );
+        let slack_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            slack_cap,
+            slack_cfg.max_batch_tokens,
+            slack_grouping,
+            slack_idle,
+        ));
+        dispatchers.lock().unwrap().push(slack_dispatcher.clone());
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
@@ -201,8 +230,8 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
                 stt,
-                router,
                 slack_shutdown_rx,
+                slack_dispatcher,
             )
             .await
             {
@@ -218,6 +247,18 @@ async fn main() -> anyhow::Result<()> {
         let router = router.clone();
         let shutdown_rx = shutdown_rx.clone();
         info!(url = %gw_cfg.url, "starting gateway adapter");
+        let (gw_cap, gw_grouping, gw_idle) = dispatch::dispatch_params(
+            &gw_cfg.message_processing_mode,
+            gw_cfg.max_buffered_messages,
+        );
+        let gw_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            gw_cap,
+            gw_cfg.max_batch_tokens,
+            gw_grouping,
+            gw_idle,
+        ));
+        dispatchers.lock().unwrap().push(gw_dispatcher.clone());
         let params = gateway::GatewayParams {
             url: gw_cfg.url,
             platform: gw_cfg.platform,
@@ -229,8 +270,9 @@ async fn main() -> anyhow::Result<()> {
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
         };
+        let gw_router = router.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = gateway::run_gateway_adapter(params, router, shutdown_rx).await {
+            if let Err(e) = gateway::run_gateway_adapter(params, shutdown_rx, gw_dispatcher, gw_router).await {
                 error!("gateway adapter error: {e}");
             }
         }))
@@ -301,6 +343,19 @@ async fn main() -> anyhow::Result<()> {
             "starting discord adapter"
         );
 
+        let (discord_cap, discord_grouping, discord_idle) = dispatch::dispatch_params(
+            &discord_cfg.message_processing_mode,
+            discord_cfg.max_buffered_messages,
+        );
+        let discord_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            discord_cap,
+            discord_cfg.max_batch_tokens,
+            discord_grouping,
+            discord_idle,
+        ));
+        dispatchers.lock().unwrap().push(discord_dispatcher.clone());
+
         let handler = discord::Handler {
             router,
             allow_all_channels,
@@ -318,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
             max_bot_turns: discord_cfg.max_bot_turns,
             bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(discord_cfg.max_bot_turns)),
             allow_dm: discord_cfg.allow_dm,
+            dispatcher: discord_dispatcher,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
@@ -377,6 +433,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = cron_handle {
         // cron.rs drains in-flight tasks for up to 30s, so wait slightly longer
         let _ = tokio::time::timeout(std::time::Duration::from_secs(35), handle).await;
+    }
+    // Drain per-thread dispatchers and log buffered_lost counts before pool shutdown (ADR §6.8).
+    for d in dispatchers.lock().unwrap().iter() {
+        d.shutdown();
     }
     let shutdown_pool = pool;
     shutdown_pool.shutdown().await;

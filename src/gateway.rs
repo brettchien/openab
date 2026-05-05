@@ -491,8 +491,9 @@ pub struct GatewayParams {
 
 pub async fn run_gateway_adapter(
     params: GatewayParams,
-    router: Arc<AdapterRouter>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    dispatcher: Arc<crate::dispatch::Dispatcher>,
+    router: Arc<crate::adapter::AdapterRouter>,
 ) -> Result<()> {
     let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
@@ -630,6 +631,12 @@ pub async fn run_gateway_adapter(
                                         channel_id: event.channel.id.clone(),
                                         thread_id: event.channel.thread_id.clone(),
                                         is_bot: event.sender.is_bot,
+                                        // Gateway: use event timestamp if available, else broker receive time
+                                        timestamp: Some(if event.timestamp.is_empty() {
+                                            crate::timestamp::now_iso8601()
+                                        } else {
+                                            event.timestamp.clone()
+                                        }),
                                     };
                                     let sender_json = serde_json::to_string(&sender_ctx)
                                         .unwrap_or_default();
@@ -640,8 +647,10 @@ pub async fn run_gateway_adapter(
                                     };
 
                                     let adapter = adapter.clone();
-                                    let router = router.clone();
                                     let prompt = event.content.text.clone();
+                                    let sender_name = event.sender.name.clone();
+                                    let sender_id = event.sender.id.clone();
+                                    let dispatcher = dispatcher.clone();
 
                                     // Convert gateway attachments to ContentBlocks
                                     let mut extra_blocks = Vec::new();
@@ -672,12 +681,16 @@ pub async fn run_gateway_adapter(
                                     // need message_id for streaming edits.
                                     let trimmed = prompt.trim();
                                     if trimmed == "/reset" {
-                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
-                                        let msg = match router.pool().reset_session(&thread_key).await {
-                                            Ok(()) => "🔄 Session reset. Start a new conversation!",
-                                            Err(_) => "⚠️ No active session to reset.",
+                                        let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
+                                        let thread_key = format!("{}:{}", event.platform, thread_id_str);
+                                        let dropped = dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
+                                        let msg = match (router.pool().reset_session(&thread_key).await, dropped) {
+                                            (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
+                                            (Ok(()), n) => format!("🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"),
+                                            (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
+                                            (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
                                         };
-                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, msg).await;
+                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
                                         continue;
                                     }
                                     if trimmed == "/cancel" {
@@ -714,19 +727,33 @@ pub async fn run_gateway_adapter(
                                             channel.clone()
                                         };
 
-                                        if let Err(e) = router
-                                            .handle_message(
-                                                &adapter,
-                                                &thread_channel,
-                                                &sender_json,
-                                                &prompt,
-                                                extra_blocks,
-                                                &trigger_msg,
-                                                false,
-                                            )
+                                        let thread_id = thread_channel
+                                            .thread_id
+                                            .as_deref()
+                                            .unwrap_or(&thread_channel.channel_id);
+                                        let thread_key = dispatcher.key(
+                                            &thread_channel.platform,
+                                            thread_id,
+                                            &sender_id,
+                                        );
+                                        let estimated_tokens =
+                                            crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+                                        let buf_msg = crate::dispatch::BufferedMessage {
+                                            sender_json,
+                                            sender_name,
+                                            prompt,
+                                            extra_blocks,
+                                            trigger_msg,
+                                            arrived_at: std::time::Instant::now(),
+                                            estimated_tokens,
+                                            // TODO: implement gateway multibot detection
+                                            other_bot_present: false,
+                                        };
+                                        if let Err(e) = dispatcher
+                                            .submit(thread_key, thread_channel, adapter, buf_msg)
                                             .await
                                         {
-                                            error!("gateway message handling error: {e}");
+                                            error!("gateway dispatcher submit error: {e}");
                                         }
                                     });
                                 }
@@ -765,3 +792,4 @@ pub async fn run_gateway_adapter(
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
     } // outer reconnect loop
 }
+

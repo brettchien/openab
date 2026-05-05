@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::adapter::{ChatAdapter, ChannelRef, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -428,50 +428,6 @@ impl ChatAdapter for SlackAdapter {
     }
 }
 
-// --- Per-thread async queue (inspired by OpenClaw's KeyedAsyncQueue) ---
-
-/// Serialize async work per key while allowing unrelated keys to run concurrently.
-/// Same-key tasks execute in FIFO order; different keys run in parallel.
-/// Idle keys are cleaned up automatically after the last task settles.
-struct KeyedAsyncQueue {
-    tails: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
-}
-
-impl KeyedAsyncQueue {
-    fn new() -> Self {
-        Self {
-            tails: tokio::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Acquire a per-key permit. The returned guard must be held for the
-    /// duration of the async work. Dropping it allows the next queued task
-    /// for the same key to proceed.
-    ///
-    /// Performs lazy cleanup of idle semaphores to prevent unbounded growth
-    /// in long-running deployments.
-    async fn acquire(&self, key: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let sem = {
-            let mut tails = self.tails.lock().await;
-            // Lazy cleanup: evict idle entries (available_permits == 1 means no one is holding or waiting)
-            if tails.len() > 100 {
-                tails.retain(|_, sem| Arc::strong_count(sem) > 1 || sem.available_permits() < 1);
-            }
-            tails
-                .entry(key.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
-                .clone()
-        };
-        match sem.acquire_owned().await {
-            Ok(permit) => Some(permit),
-            Err(e) => {
-                warn!(key, error = %e, "semaphore closed, skipping message");
-                None
-            }
-        }
-    }
-}
-
 // --- Socket Mode event loop ---
 
 /// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
@@ -492,10 +448,9 @@ pub async fn run_slack_adapter(
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
     stt_config: SttConfig,
-    router: Arc<AdapterRouter>,
     mut shutdown_rx: watch::Receiver<bool>,
+    dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
-    let queue = Arc::new(KeyedAsyncQueue::new());
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
 
@@ -589,19 +544,8 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
-                                                let router = router.clone();
-                                                let queue = queue.clone();
-                                                // Queue key: thread_ts if already in a thread, otherwise ts.
-                                                // app_mention always has a channel context, so ts alone
-                                                // is unique enough (unlike message events in DMs where
-                                                // we prefix with channel_id to avoid ts collisions).
-                                                let queue_key = event["thread_ts"]
-                                                    .as_str()
-                                                    .or_else(|| event["ts"].as_str())
-                                                    .unwrap_or("")
-                                                    .to_string();
+                                                let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
-                                                    let Some(_permit) = queue.acquire(&queue_key).await else { return };
                                                     handle_message(
                                                         &event,
                                                         &adapter,
@@ -611,7 +555,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
-                                                        &router,
+                                                        &dispatcher,
                                                     )
                                                     .await;
                                                 });
@@ -665,8 +609,7 @@ pub async fn run_slack_adapter(
                                                 // --- Bot turn tracking ---
                                                 // Runs before self-check so ALL bot messages (including own)
                                                 // count toward the per-thread limit. Matches Discord #483.
-                                                // Keyed on thread_ts when in a thread, else channel:ts (the
-                                                // same key shape used for per-thread queueing below).
+                                                // Keyed on thread_ts when in a thread, else channel:ts.
                                                 // Non-thread messages get a unique key per message, so the
                                                 // counter never accumulates — intentional, because bot-to-bot
                                                 // loops only happen inside threads.
@@ -821,27 +764,17 @@ pub async fn run_slack_adapter(
                                                     }
                                                 }
 
-                                                // Dispatch to handle_message (serialized per thread)
+                                                // Dispatch to handle_message (per-thread serialization comes
+                                                // from Dispatcher consumer task in batched mode and from
+                                                // pool.with_connection in per-message mode).
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
-                                                let router = router.clone();
-                                                let queue = queue.clone();
-                                                // Queue key: thread_ts if in a thread, otherwise channel:ts.
-                                                // Prefixed with channel_id for non-thread messages because
-                                                // DMs and channels can have overlapping ts values — the
-                                                // prefix ensures keys are globally unique.
-                                                let queue_key = event["thread_ts"]
-                                                    .as_str()
-                                                    .map(|s| s.to_string())
-                                                    .unwrap_or_else(|| {
-                                                        format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or(""))
-                                                    });
+                                                let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
-                                                    let Some(_permit) = queue.acquire(&queue_key).await else { return };
                                                     handle_message(
                                                         &event,
                                                         &adapter,
@@ -851,7 +784,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
-                                                        &router,
+                                                        &dispatcher,
                                                     )
                                                     .await;
                                                 });
@@ -922,7 +855,7 @@ async fn handle_message(
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
-    router: &Arc<AdapterRouter>,
+    dispatcher: &Arc<crate::dispatch::Dispatcher>,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1093,6 +1026,7 @@ async fn handle_message(
         channel_id: channel_id.clone(),
         thread_id: thread_ts.clone(),
         is_bot: is_bot_msg,
+        timestamp: Some(crate::timestamp::slack_ts_to_iso8601(&ts)),
     };
 
     let trigger_msg = MessageRef {
@@ -1133,11 +1067,27 @@ async fn handle_message(
         thread_channel.thread_id.as_deref()
             .is_some_and(|ts| cache.get(ts).is_some_and(|inst| inst.elapsed() < adapter.session_ttl))
     };
-    if let Err(e) = router
-        .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
+    let thread_id = thread_channel
+        .thread_id
+        .as_deref()
+        .unwrap_or(&thread_channel.channel_id);
+    let thread_key = dispatcher.key("slack", thread_id, &sender.sender_id);
+    let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+    let buf_msg = crate::dispatch::BufferedMessage {
+        sender_json,
+        sender_name: sender.sender_name.clone(),
+        prompt,
+        extra_blocks,
+        trigger_msg,
+        arrived_at: std::time::Instant::now(),
+        estimated_tokens,
+        other_bot_present,
+    };
+    if let Err(e) = dispatcher
+        .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
         .await
     {
-        error!("Slack handle_message error: {e}");
+        error!("Slack dispatcher submit error: {e}");
     }
 }
 

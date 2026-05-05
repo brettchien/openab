@@ -160,6 +160,8 @@ pub struct Handler {
     pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
     /// Allow the bot to respond to Discord DMs.
     pub allow_dm: bool,
+    /// Per-thread dispatcher (Message mode uses cap=1 for FIFO; Thread/Lane use configured cap).
+    pub dispatcher: Arc<crate::dispatch::Dispatcher>,
 }
 
 impl Handler {
@@ -536,6 +538,7 @@ impl EventHandler for Handler {
             &msg.channel_id.to_string(),
             thread_parent_id.as_deref(),
             msg.author.bot,
+            &msg.timestamp.to_rfc3339().unwrap_or_default(),
         );
 
         // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
@@ -631,7 +634,7 @@ impl EventHandler for Handler {
         let trigger_msg = discord_msg_ref(&msg);
 
         // Per-thread streaming: check if another bot is present in this thread
-        let other_bot_present = {
+        let other_bot_present_flag = {
             let cache = self.multibot_threads.lock().await;
             cache.contains_key(&msg.channel_id.to_string())
         };
@@ -644,14 +647,31 @@ impl EventHandler for Handler {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
 
-        let router = self.router.clone();
+        let dispatcher = self.dispatcher.clone();
+
         tokio::spawn(async move {
+            let sender_id = sender.sender_id.clone();
+            let sender_name = sender.sender_name.clone();
             let sender_json = serde_json::to_string(&sender).unwrap();
-            if let Err(e) = router
-                .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
+            let thread_key =
+                dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
+            let estimated_tokens =
+                crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json,
+                sender_name,
+                prompt,
+                extra_blocks,
+                trigger_msg,
+                arrived_at: std::time::Instant::now(),
+                estimated_tokens,
+                other_bot_present: other_bot_present_flag,
+            };
+            if let Err(e) = dispatcher
+                .submit(thread_key, thread_channel, adapter, buf_msg)
                 .await
             {
-                error!("handle_message error: {e}");
+                error!("dispatcher submit error: {e}");
             }
         });
     }
@@ -667,6 +687,8 @@ impl EventHandler for Handler {
                 .description("Select the agent mode for this session"),
             CreateCommand::new("cancel")
                 .description("Cancel the current operation"),
+            CreateCommand::new("cancel-all")
+                .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset")
                 .description("Reset the conversation session"),
         ];
@@ -702,6 +724,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "cancel" => {
                 self.handle_cancel_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "cancel-all" => {
+                self.handle_cancel_all_command(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
@@ -865,16 +890,59 @@ impl Handler {
         }
     }
 
+    async fn handle_cancel_all_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        // /cancel-all is the nuclear escape hatch: stop the in-flight turn AND clear
+        // every lane's buffer in this thread, so a human can intervene from a clean slate.
+        let session_key = format!("discord:{}", cmd.channel_id.get());
+        let dropped = self
+            .dispatcher
+            .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
+
+        let cancel_result = self.router.pool().cancel_session(&session_key).await;
+
+        // Buffer count is approximate (sweep races with new arrivals) so we surface
+        // a binary "cleared / nothing" signal rather than a misleading exact number.
+        let msg = match (cancel_result, dropped) {
+            (Ok(()), 0) => "🛑 Cancel signal sent.".to_string(),
+            (Ok(()), _) => "🛑 Cancel signal sent. Buffered messages cleared.".to_string(),
+            (Err(_), 0) => "⚠️ Nothing to cancel — no active session and no buffered messages.".to_string(),
+            (Err(_), _) => "🛑 Buffered messages cleared. No active session to cancel.".to_string(),
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /cancel-all command");
+        }
+    }
+
     async fn handle_reset_command(
         &self,
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        let thread_key = format!("discord:{}", cmd.channel_id.get());
-        let result = self.router.pool().reset_session(&thread_key).await;
+        // /reset clears every lane's buffer in this thread and tears down the shared
+        // ACP session — the next message in the thread starts a fresh conversation.
+        let session_key = format!("discord:{}", cmd.channel_id.get());
+        let dropped = self
+            .dispatcher
+            .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
+
+        let result = self.router.pool().reset_session(&session_key).await;
 
         let msg = match result {
+            Ok(()) if dropped > 0 => {
+                format!("🔄 Session reset. Dropped {dropped} buffered message(s). Start a new conversation!")
+            }
             Ok(()) => "🔄 Session reset. Start a new conversation!".to_string(),
+            Err(_) if dropped > 0 => {
+                format!("🔄 Dropped {dropped} buffered message(s). No active session to reset.")
+            }
             Err(_) => "⚠️ No active session to reset. Start a conversation first by @mentioning the bot.".to_string(),
         };
 
@@ -1113,6 +1181,7 @@ fn build_sender_context(
     msg_channel_id: &str,
     thread_parent_id: Option<&str>,
     is_bot: bool,
+    timestamp: &str,
 ) -> SenderContext {
     SenderContext {
         schema: "openab.sender.v1".into(),
@@ -1123,6 +1192,7 @@ fn build_sender_context(
         channel_id: thread_parent_id.unwrap_or(msg_channel_id).to_string(),
         thread_id: thread_parent_id.map(|_| msg_channel_id.to_string()),
         is_bot,
+        timestamp: Some(timestamp.to_string()),
     }
 }
 
@@ -1447,7 +1517,7 @@ mod tests {
     /// In-thread message: channel_id = parent, thread_id = thread channel ID.
     #[test]
     fn build_sender_context_in_thread() {
-        let ctx = build_sender_context("user1", "alice", "Alice", "thread_ch", Some("parent_ch"), false);
+        let ctx = build_sender_context("user1", "alice", "Alice", "thread_ch", Some("parent_ch"), false, "2026-05-01T00:00:00Z");
         assert_eq!(ctx.channel_id, "parent_ch");
         assert_eq!(ctx.thread_id, Some("thread_ch".to_string()));
         assert_eq!(ctx.channel, "discord");
@@ -1458,7 +1528,7 @@ mod tests {
     /// Non-thread message: channel_id = message channel, thread_id = None.
     #[test]
     fn build_sender_context_not_in_thread() {
-        let ctx = build_sender_context("user1", "alice", "Alice", "main_ch", None, false);
+        let ctx = build_sender_context("user1", "alice", "Alice", "main_ch", None, false, "2026-05-01T00:00:00Z");
         assert_eq!(ctx.channel_id, "main_ch");
         assert_eq!(ctx.thread_id, None);
     }
@@ -1466,7 +1536,7 @@ mod tests {
     /// Bot sender: is_bot flag propagated correctly.
     #[test]
     fn build_sender_context_bot_sender() {
-        let ctx = build_sender_context("bot1", "mybot", "MyBot", "ch", Some("parent"), true);
+        let ctx = build_sender_context("bot1", "mybot", "MyBot", "ch", Some("parent"), true, "2026-05-01T00:00:00Z");
         assert!(ctx.is_bot);
         assert_eq!(ctx.channel_id, "parent");
         assert_eq!(ctx.thread_id, Some("ch".to_string()));
