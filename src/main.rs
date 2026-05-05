@@ -146,6 +146,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Dispatcher handles tracked here so SIGTERM cleanup can call shutdown() on each (ADR §6.8).
     // Also shared with the cleanup task for periodic stale-entry sweeping.
+    // Arc<Mutex<Vec<…>>> because: outer Arc shared with cleanup task + shutdown,
+    // Mutex guards startup-time pushes, inner Arc<Dispatcher> shared with each adapter.
+    // All pushes happen at startup; runtime access is read-only (lock is uncontended).
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Spawn cleanup task
