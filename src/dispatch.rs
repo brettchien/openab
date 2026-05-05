@@ -1,6 +1,6 @@
 //! Turn-boundary message batching dispatcher.
 //!
-//! See ADR: turn-boundary-batching-adr.md for full design rationale.
+//! See ADR: docs/adr/turn-boundary-batching.md for full design rationale.
 //!
 //! # Invariants
 //! - I1: First message after idle has zero added latency.
@@ -184,6 +184,23 @@ pub const DEFAULT_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// from one-shot thread keys (Little's Law: steady-state idle count = arrival rate
 /// × idle window).
 pub const PER_MESSAGE_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve `(cap, grouping, idle_timeout)` for a given processing mode.
+///
+/// Per-message mode forces cap=1 + Thread grouping + the short per-message idle
+/// (one-shot threads shouldn't pin a consumer for 5 min); Thread / Lane modes
+/// use the configured `max_buffered` and the default idle window.
+pub fn dispatch_params(
+    mode: &crate::config::MessageProcessingMode,
+    max_buffered: usize,
+) -> (usize, BatchGrouping, Duration) {
+    use crate::config::MessageProcessingMode;
+    match mode {
+        MessageProcessingMode::Message => (1, BatchGrouping::Thread, PER_MESSAGE_CONSUMER_IDLE_TIMEOUT),
+        MessageProcessingMode::Thread => (max_buffered, BatchGrouping::Thread, DEFAULT_CONSUMER_IDLE_TIMEOUT),
+        MessageProcessingMode::Lane => (max_buffered, BatchGrouping::Lane, DEFAULT_CONSUMER_IDLE_TIMEOUT),
+    }
+}
 
 /// Per-thread message dispatcher for batched mode.
 ///
@@ -671,16 +688,22 @@ async fn dispatch_batch(
 // Token estimation
 // ---------------------------------------------------------------------------
 
+/// Rough char-to-token ratio for English-ish text. Coarse on purpose — the goal
+/// is a guard rail for `max_batch_tokens`, not an exact pre-flight.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+/// Conservative per-image token budget. Larger than typical Claude image cost
+/// so the cap trips before we hand the model an oversized batch.
+const TOKENS_PER_IMAGE_ESTIMATE: usize = 512;
+
 /// Rough token estimate for a buffered message (used for `max_batch_tokens` cap).
 /// Intentionally coarse — the goal is a guard rail, not an exact pre-flight.
 pub fn estimate_tokens(prompt: &str, extra_blocks: &[ContentBlock]) -> usize {
-    // ~4 chars per token for text; fixed 512 per image block (conservative).
-    let text_tokens = prompt.len() / 4 + 1;
+    let text_tokens = prompt.len() / CHARS_PER_TOKEN_ESTIMATE + 1;
     let block_tokens: usize = extra_blocks
         .iter()
         .map(|b| match b {
-            ContentBlock::Text { text } => text.len() / 4 + 1,
-            ContentBlock::Image { .. } => 512,
+            ContentBlock::Text { text } => text.len() / CHARS_PER_TOKEN_ESTIMATE + 1,
+            ContentBlock::Image { .. } => TOKENS_PER_IMAGE_ESTIMATE,
         })
         .sum();
     text_tokens + block_tokens
