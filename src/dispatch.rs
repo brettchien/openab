@@ -568,14 +568,13 @@ async fn dispatch_batch(
     let session_key = Dispatcher::session_key(thread_channel);
 
     // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
-    // Parallelized so first-token latency isn't paid for N serial reaction RPCs.
+    // Sequential — batches are typically small (≤ low single digits) so the
+    // serialization cost is sub-second and not user-visible; sequential keeps the
+    // dispatch path free of `futures_util::join_all` and easier to reason about.
     let queued_emoji = &target.reactions_config().emojis.queued;
-    futures_util::future::join_all(
-        batch
-            .iter()
-            .map(|msg| adapter.add_reaction(&msg.trigger_msg, queued_emoji)),
-    )
-    .await;
+    for msg in batch.iter() {
+        let _ = adapter.add_reaction(&msg.trigger_msg, queued_emoji).await;
+    }
 
     // Collect per-event observability data (before consuming the batch).
     let tokens_per_event: Vec<usize> = batch.iter().map(|m| m.estimated_tokens).collect();
