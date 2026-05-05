@@ -6,7 +6,7 @@ OpenAB supports three message dispatch modes that control how incoming messages 
 
 ### `per-message` (default)
 
-Each message triggers its own ACP turn. This is the v0.8.2 behavior — simple, predictable, no batching.
+Each message triggers its own ACP turn. This is the default behavior — simple, predictable, no batching. Existing deployments use this mode automatically without any configuration change.
 
 **Use when:**
 - Single-user threads (most common case)
