@@ -489,11 +489,11 @@ pub async fn run_gateway_adapter(
                                         thread_id: event.channel.thread_id.clone(),
                                         is_bot: event.sender.is_bot,
                                         // Gateway: use event timestamp if available, else broker receive time
-                                        timestamp: if event.timestamp.is_empty() {
+                                        timestamp: Some(if event.timestamp.is_empty() {
                                             crate::timestamp::now_iso8601()
                                         } else {
                                             event.timestamp.clone()
-                                        },
+                                        }),
                                     };
                                     let sender_json = serde_json::to_string(&sender_ctx)
                                         .unwrap_or_default();

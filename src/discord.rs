@@ -1181,7 +1181,7 @@ fn build_sender_context(
         channel_id: thread_parent_id.unwrap_or(msg_channel_id).to_string(),
         thread_id: thread_parent_id.map(|_| msg_channel_id.to_string()),
         is_bot,
-        timestamp: timestamp.to_string(),
+        timestamp: Some(timestamp.to_string()),
     }
 }
 

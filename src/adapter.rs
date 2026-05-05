@@ -87,10 +87,11 @@ pub struct SenderContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub is_bot: bool,
-    /// Platform message creation time (ISO 8601 UTC).
+    /// Platform message creation time (ISO 8601 UTC), if available.
     /// Discord/Slack: platform timestamp. Gateway: broker receive time (best-effort).
-    /// Additive field — schema stays openab.sender.v1.
-    pub timestamp: String,
+    /// Additive optional field — schema stays openab.sender.v1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
 // --- ChatAdapter trait ---
