@@ -571,6 +571,7 @@ impl AcpConnection {
         };
         let req = json!({
             "jsonrpc": "2.0",
+            "id": self.next_id(),
             "method": "session/cancel",
             "params": {"sessionId": session_id},
         });

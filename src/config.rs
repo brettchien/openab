@@ -317,6 +317,9 @@ pub struct PoolConfig {
     /// abandons the in-flight request, sends `session/cancel` to the agent,
     /// and clears the pending entry so late responses cannot leak into the
     /// next prompt's subscriber.
+    ///
+    /// Precision: checked every `liveness_check_secs`, so actual cutoff is
+    /// ±`liveness_check_secs` from this value.
     #[serde(default = "default_prompt_hard_timeout_secs")]
     pub prompt_hard_timeout_secs: u64,
     /// Polling cadence (seconds) for the recv-loop liveness check (#732).
