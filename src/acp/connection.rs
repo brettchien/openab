@@ -321,7 +321,10 @@ impl AcpConnection {
                         }
                         // Stale id (#732): pending was already abandoned. Falls through
                         // to subscriber forwarding; the adapter recv loop filters by
-                        // request_id so it can't leak into the next prompt.
+                        // request_id so it can't leak into the next prompt. No automated
+                        // test seam — the path only triggers when a real subprocess
+                        // delivers a late response after abandon_request, which is
+                        // covered by manual repro against a live agent.
                         trace!(request_id = id, "stale id-bearing message after abandon");
                     }
 

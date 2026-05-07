@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
 use crate::config::{ReactionsConfig, ToolDisplay};
@@ -172,6 +172,15 @@ impl AdapterRouter {
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
     ) -> Self {
+        if liveness_check_secs >= prompt_hard_timeout_secs {
+            warn!(
+                liveness_check_secs,
+                prompt_hard_timeout_secs,
+                "pool.liveness_check_secs >= pool.prompt_hard_timeout_secs; \
+                 the hard ceiling will only fire after the next liveness tick \
+                 and may be effectively bypassed. Lower liveness_check_secs."
+            );
+        }
         Self {
             pool,
             reactions_config,
@@ -409,7 +418,7 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
-                    let prompt_start = std::time::Instant::now();
+                    let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
@@ -437,6 +446,10 @@ impl AdapterRouter {
                         if let Some(notification_id) = notification.id {
                             if notification_id != request_id {
                                 // Stale response from a previously-abandoned prompt.
+                                // No automated test seam: this path only triggers when a
+                                // real subprocess emits a late response after the broker
+                                // already called abandon_request — covered by manual
+                                // repro against a live agent (see #732 PR description).
                                 continue;
                             }
                             if let Some(ref err) = notification.error {
