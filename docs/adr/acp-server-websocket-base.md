@@ -137,9 +137,16 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   server maps it to `ReplyChunk::Update` and emits it as a `session/update`; arriving at all
   resets the idle timer. Other platforms never receive these commands (core gates on
   `platform == "acp"`; several gateway adapters would post an unknown command as text).
-- **Residual:** a turn that produces neither text nor tool events for longer than the
-  timeout (e.g. a very long single generation) still times out; raise the env value for
-  such workloads.
+- **Open-tool grace.** A single long tool (a build, a test run) is silent between its
+  `tool_call` and its completion. While any announced tool call is still open, the wait
+  stretches to `ACP_OPEN_TOOL_IDLE_GRACE_SECS` (32 min — core's default 30 min prompt hard
+  timeout + 2 min hung grace), so the gateway does not give up on a running tool before
+  core does; once every tool has completed/failed, the normal idle timeout applies again.
+  Same idea as OpenClaw deferring its no-output watchdog while a tool is active, and Hermes
+  heartbeating a running tool.
+- **Residual:** a turn that produces neither text nor tool events and has no open tool
+  for longer than the timeout (e.g. a very long single generation) still times out; raise
+  the env value for such workloads.
 
 ### Concurrency, caps & reply fencing
 

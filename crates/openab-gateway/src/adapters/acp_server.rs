@@ -57,6 +57,29 @@ const MAX_INFLIGHT_ESTABLISHES: usize = 64;
 /// value is [`prompt_idle_timeout_secs`].
 pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 
+/// How long a turn may stay silent while a tool call it announced is still open.
+///
+/// Matches core's default per-turn ceiling (`prompt_hard_timeout_secs` 30 min + `hung_grace_secs`
+/// 2 min), so with defaults the gateway never gives up on a running tool before core does — core's
+/// own timeout ends the turn and its reply arrives here. Still bounded, so a vanished backend cannot
+/// hold a prompt open forever. The configured idle timeout wins if it is larger.
+pub const ACP_OPEN_TOOL_IDLE_GRACE_SECS: u64 = 32 * 60;
+
+/// Update the set of open tool calls from one forwarded `tool_call` / `tool_call_update`.
+fn track_open_tool(open: &mut std::collections::HashSet<String>, update: &Value) {
+    let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+        return;
+    };
+    match update.get("status").and_then(Value::as_str) {
+        Some("completed" | "failed") => {
+            open.remove(id);
+        }
+        _ => {
+            open.insert(id.to_string());
+        }
+    }
+}
+
 /// Env override for [`ACP_PROMPT_IDLE_TIMEOUT_SECS`].
 pub const ACP_PROMPT_IDLE_TIMEOUT_ENV: &str = "OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS";
 
@@ -2430,12 +2453,19 @@ async fn handle_session_prompt(
 
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
-    let timeout = tokio::time::Duration::from_secs(prompt_idle_timeout_secs());
+    let idle_timeout = tokio::time::Duration::from_secs(prompt_idle_timeout_secs());
+    let open_tool_timeout = idle_timeout
+        .max(tokio::time::Duration::from_secs(ACP_OPEN_TOOL_IDLE_GRACE_SECS));
+    // Tool calls announced but not yet completed/failed. A single long tool (a build, a test
+    // run) is silent between its start and end, so while one is open the wait stretches to
+    // the open-tool grace instead of failing a turn that is visibly still working.
+    let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Typed StopReason (T2.1) so the final PromptResponse is constructed from acp_schema.
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
 
     loop {
+        let timeout = if open_tools.is_empty() { idle_timeout } else { open_tool_timeout };
         tokio::select! {
             // session/cancel fired — stop gracefully.
             _ = cancel.notified() => {
@@ -2468,6 +2498,7 @@ async fn handle_session_prompt(
                     }
                     Ok(Some(ReplyChunk::Update(update))) => {
                         // Tool progress. Arriving at all is what resets the idle timer.
+                        track_open_tool(&mut open_tools, &update);
                         let notification = JsonRpcNotification {
                             jsonrpc: "2.0",
                             method: "session/update".into(),
@@ -4455,6 +4486,59 @@ mod acp_review_fixes {
         assert_eq!(updates[3]["content"]["text"], json!("done"));
         let cancels = drain_events(&mut h.event_rx).into_iter().filter(|e| e.content.text == "/cancel").count();
         assert_eq!(cancels, 0, "a completed turn must not cancel the backend");
+    }
+
+    // A single long tool (a build, a test run) is silent between its start and its end. While a
+    // tool call is open the turn waits past the idle timeout instead of failing.
+    #[tokio::test(start_paused = true)]
+    async fn one_long_silent_tool_outlasts_the_idle_timeout() {
+        let mut h = start_prompt(json!(24)).await;
+        let start = r#"{"toolCallId":"build","title":"cargo build","status":"in_progress"}"#;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, start, Some("tool_call")), &h.registry).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS * 3)).await;
+        let done = r#"{"toolCallId":"build","status":"completed"}"#;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, done, Some("tool_call_update")), &h.registry).await;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, "built", None), &h.registry).await;
+        h.handle.await.unwrap();
+        let mut stop = None;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v.get("id") == Some(&json!(24)) {
+                stop = Some(v);
+            }
+        }
+        assert_eq!(stop.expect("final response")["result"]["stopReason"], json!("end_turn"));
+    }
+
+    // The open-tool wait is still bounded, and once every tool has finished the normal idle
+    // timeout applies again.
+    #[tokio::test(start_paused = true)]
+    async fn open_tool_grace_is_bounded_and_ends_when_the_tool_does() {
+        // Never-finishing tool → times out at the grace, not before.
+        let h = start_prompt(json!(25)).await;
+        let t0 = tokio::time::Instant::now();
+        let start = r#"{"toolCallId":"hang","title":"stuck","status":"in_progress"}"#;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, start, Some("tool_call")), &h.registry).await;
+        h.handle.await.unwrap();
+        let waited = t0.elapsed().as_secs();
+        assert!(
+            (ACP_OPEN_TOOL_IDLE_GRACE_SECS..ACP_OPEN_TOOL_IDLE_GRACE_SECS + 5).contains(&waited),
+            "an open tool waits the grace, then times out (waited {waited}s)"
+        );
+
+        // Finished tool → back to the plain idle timeout.
+        let h = start_prompt(json!(26)).await;
+        let t0 = tokio::time::Instant::now();
+        let start = r#"{"toolCallId":"t","title":"quick","status":"in_progress"}"#;
+        let done = r#"{"toolCallId":"t","status":"failed"}"#;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, start, Some("tool_call")), &h.registry).await;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, done, Some("tool_call_update")), &h.registry).await;
+        h.handle.await.unwrap();
+        let waited = t0.elapsed().as_secs();
+        assert!(
+            (ACP_PROMPT_IDLE_TIMEOUT_SECS..ACP_PROMPT_IDLE_TIMEOUT_SECS + 5).contains(&waited),
+            "no open tool → plain idle timeout (waited {waited}s)"
+        );
     }
 
     // P0 — on idle timeout the gateway used to answer -32603 and walk away while core kept running
