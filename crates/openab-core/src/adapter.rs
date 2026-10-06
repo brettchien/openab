@@ -488,6 +488,14 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Signal that the turn is still running while the agent is silent. Only called for the
+    /// `acp` platform, on each liveness tick after `conn.alive()` passed: it lets the ACP
+    /// gateway's idle timer mean "core/agent is gone" rather than "no output for a while", so
+    /// a long tool or a long generation is not cut off. Carries no content. Default: no-op.
+    async fn send_keepalive(&self, _channel: &ChannelRef) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether this platform renders Markdown tables natively. When `true`, the
     /// router skips the `convert_tables` pre-pass (which rewrites tables into
     /// code blocks / bullet lists for platforms that cannot render them) and
@@ -980,6 +988,13 @@ impl AdapterRouter {
                                     ));
                                     conn.abandon_request(request_id).await;
                                     break;
+                                }
+                                // Agent alive but silent (a long tool, a long generation):
+                                // tell the ACP gateway the turn is still running.
+                                if platform_is_acp {
+                                    if let Err(e) = adapter.send_keepalive(&thread_channel).await {
+                                        tracing::debug!(error = %e, "keepalive delivery failed");
+                                    }
                                 }
                                 continue;
                             }
@@ -2731,6 +2746,7 @@ mod tool_progress_tests {
     struct RecordingAdapter {
         progress: StdMutex<Vec<ToolCallProgress>>,
         sent: StdMutex<Vec<String>>,
+        keepalives: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -2766,6 +2782,11 @@ mod tool_progress_tests {
             self.progress.lock().unwrap().push(p.clone());
             Ok(())
         }
+        async fn send_keepalive(&self, _: &ChannelRef) -> Result<()> {
+            self.keepalives
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
         fn use_streaming(&self, _: bool) -> bool {
             false
         }
@@ -2773,7 +2794,8 @@ mod tool_progress_tests {
 
     /// A minimal ACP agent on stdio: answers `initialize` / `session/new`, and on
     /// `session/prompt` announces one tool (`pending`, the way claude-agent-acp opens a call
-    /// before its input streams in), refines its title, completes it, then answers.
+    /// before its input streams in), refines its title, goes silent for 3s (a long tool),
+    /// completes it, then answers.
     const FAKE_TOOL_AGENT: &str = r#"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
@@ -2785,6 +2807,7 @@ while IFS= read -r line; do
     *'"method":"session/prompt"'*)
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Terminal","status":"pending"}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"cargo test","status":"in_progress"}}}'
+      sleep 3
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the answer"}}}}'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
@@ -2819,7 +2842,7 @@ done
             },
             TableMode::Off,
             crate::config::default_prompt_hard_timeout_secs(),
-            crate::config::default_liveness_check_secs(),
+            1, // liveness tick every 1s, so the 3s silent tool spans several ticks
             std::collections::HashMap::new(),
             std::path::PathBuf::from("/tmp"),
         );
@@ -2881,6 +2904,10 @@ done
             !sent[0].contains("cargo test"),
             "ACP text must not carry tool lines: {sent:?}"
         );
+        assert!(
+            rec.keepalives.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "liveness ticks during the silent tool must send keepalives"
+        );
     }
 
     // Every other platform keeps its existing tool display and never sees tool_call commands —
@@ -2889,6 +2916,7 @@ done
     async fn non_acp_turn_sends_no_tool_progress() {
         let rec = run_turn("telegram").await;
         assert!(rec.progress.lock().unwrap().is_empty());
+        assert_eq!(rec.keepalives.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
             !rec.sent.lock().unwrap().is_empty(),
             "the turn still answers"

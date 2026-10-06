@@ -137,16 +137,16 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   server maps it to `ReplyChunk::Update` and emits it as a `session/update`; arriving at all
   resets the idle timer. Other platforms never receive these commands (core gates on
   `platform == "acp"`; several gateway adapters would post an unknown command as text).
-- **Open-tool grace.** A single long tool (a build, a test run) is silent between its
-  `tool_call` and its completion. While any announced tool call is still open, the wait
-  stretches to `ACP_OPEN_TOOL_IDLE_GRACE_SECS` (32 min — core's default 30 min prompt hard
-  timeout + 2 min hung grace), so the gateway does not give up on a running tool before
-  core does; once every tool has completed/failed, the normal idle timeout applies again.
-  Same idea as OpenClaw deferring its no-output watchdog while a tool is active, and Hermes
-  heartbeating a running tool.
-- **Residual:** a turn that produces neither text nor tool events and has no open tool
-  for longer than the timeout (e.g. a very long single generation) still times out; raise
-  the env value for such workloads.
+- **Keepalive.** A single long tool (a build, a test run) or a long generation is silent
+  between agent events. Core's turn loop already wakes on every liveness tick
+  (`[pool] liveness_check_secs`, 30s) to check `conn.alive()`; for `acp` it now also sends
+  a `GatewayReply` with `command = "keepalive"` (no content). The ACP server maps it to
+  `ReplyChunk::Keepalive`, which restarts the idle wait and is **not** forwarded to the
+  client. So the idle timeout effectively detects "core or its connection is gone", and a
+  stuck-but-alive agent is bounded by core's own `prompt_hard_timeout_secs` (30 min) —
+  the same bound every other platform has. `liveness_check_secs` must stay beneath the
+  idle timeout. (Same idea as Hermes heartbeating a running tool; OpenClaw instead defers
+  its watchdog while a tool is active.)
 
 ### Concurrency, caps & reply fencing
 

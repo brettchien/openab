@@ -255,6 +255,12 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    async fn send_keepalive(&self, channel: &ChannelRef) -> Result<()> {
+        let reply = self.build_reply(channel, "", Some("keepalive"), None);
+        let _ = self.dispatch_reply(&reply).await?;
+        Ok(())
+    }
+
     async fn send_message_with_reply(
         &self,
         channel: &ChannelRef,

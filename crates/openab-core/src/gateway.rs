@@ -682,6 +682,28 @@ impl ChatAdapter for GatewayAdapter {
         Ok(())
     }
 
+    async fn send_keepalive(&self, channel: &ChannelRef) -> Result<()> {
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
+            platform: channel.platform.clone(),
+            channel: ReplyChannel {
+                id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+            },
+            content: ReplyContent {
+                content_type: "text".into(),
+                text: String::new(),
+            },
+            command: Some("keepalive".into()),
+            request_id: None,
+            quote_message_id: None,
+        };
+        let json = serde_json::to_string(&reply)?;
+        self.ws_tx.lock().await.send(Message::Text(json)).await?;
+        Ok(())
+    }
+
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
         // Use a short request/response cycle so we can react to platform-level
         // edit failures (e.g. Feishu's 20-edits-per-message cap, errcode 230072).
