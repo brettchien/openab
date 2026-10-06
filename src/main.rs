@@ -493,8 +493,6 @@ async fn main() -> anyhow::Result<()> {
     // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
     // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
     #[cfg(feature = "acp")]
-    openab_gateway::adapters::acp_server::warn_if_liveness_tick_too_slow(cfg.pool.liveness_check_secs);
-    #[cfg(feature = "acp")]
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
     #[cfg(feature = "acp")]
     let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> = Arc::new(
@@ -1464,6 +1462,11 @@ async fn main() -> anyhow::Result<()> {
                 ) {
                     Ok(()) => {
                         info!("unified: ACP server endpoint enabled at /acp");
+                        // Only where /acp is actually served: a deploy without ACP has no
+                        // idle timeout for the liveness tick to undercut.
+                        openab_gateway::adapters::acp_server::warn_if_liveness_tick_too_slow(
+                            cfg.pool.liveness_check_secs,
+                        );
                         app = app.route(
                             "/acp",
                             axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
