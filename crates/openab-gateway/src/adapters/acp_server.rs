@@ -44,16 +44,50 @@ const MAX_INFLIGHT_PROMPTS: usize = 32;
 /// client had not reached, for work it had not asked for. `MAX_ACP_SERVERS_PER_SESSION` bounds one
 /// session's declarations; this bounds every session's establishes on a connection at once.
 const MAX_INFLIGHT_ESTABLISHES: usize = 64;
-/// Per-chunk idle timeout for a prompt turn, in `handle_session_prompt`.
+/// Default per-chunk idle timeout for a prompt turn, in `handle_session_prompt`.
 ///
 /// Named rather than left inline because it is the effective ceiling on anything a turn waits for:
 /// the tunnel's own timeout has to stay strictly beneath it, and `[mcp] tunnel_timeout_seconds`
 /// documents itself against this value. As a bare literal in the middle of a loop it was invisible
 /// to exactly the person who needed it — the operator raising the tunnel timeout into it.
 ///
-/// Not operator-configurable today. Anything set above it is silently capped here, which is why the
-/// config path warns rather than letting a larger value look effective.
+/// "Idle" means no chunk of any kind: core sends the answer text once at turn end, but forwards
+/// tool progress (`tool_call` / `tool_call_update`) as it happens, so a turn that keeps running
+/// tools keeps resetting this. Override with `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS`; the effective
+/// value is [`prompt_idle_timeout_secs`].
 pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
+
+/// Env override for [`ACP_PROMPT_IDLE_TIMEOUT_SECS`].
+pub const ACP_PROMPT_IDLE_TIMEOUT_ENV: &str = "OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS";
+
+/// Parse an idle-timeout override. Unset, unparsable, or `0` (which would time out every turn
+/// before its first chunk) falls back to the default; the `Err` carries the rejected value so the
+/// caller can warn once.
+fn parse_prompt_idle_timeout(raw: Option<&str>) -> Result<u64, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(ACP_PROMPT_IDLE_TIMEOUT_SECS),
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(v.to_string()),
+        },
+    }
+}
+
+/// Effective per-chunk idle timeout, resolved once from [`ACP_PROMPT_IDLE_TIMEOUT_ENV`].
+pub fn prompt_idle_timeout_secs() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var(ACP_PROMPT_IDLE_TIMEOUT_ENV).ok();
+        parse_prompt_idle_timeout(raw.as_deref()).unwrap_or_else(|bad| {
+            warn!(
+                value = %bad,
+                default = ACP_PROMPT_IDLE_TIMEOUT_SECS,
+                "{ACP_PROMPT_IDLE_TIMEOUT_ENV} must be a positive integer of seconds; using the default"
+            );
+            ACP_PROMPT_IDLE_TIMEOUT_SECS
+        })
+    })
+}
 
 /// Whether a configured tunnel timeout is overtaken by the idle timeout, and so cannot decide the
 /// outcome.
@@ -62,7 +96,7 @@ pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 /// interesting part is one comparison, and an inverted `>=` would be silent in exactly the case it
 /// exists to report.
 pub fn tunnel_timeout_is_ineffective(configured_secs: u64) -> bool {
-    configured_secs >= ACP_PROMPT_IDLE_TIMEOUT_SECS
+    configured_secs >= prompt_idle_timeout_secs()
 }
 
 /// Warn when a configured tunnel timeout cannot take effect because the idle timeout above overtakes
@@ -78,9 +112,10 @@ pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
     if tunnel_timeout_is_ineffective(configured_secs) {
         warn!(
             configured = configured_secs,
-            effective_ceiling = ACP_PROMPT_IDLE_TIMEOUT_SECS,
-            "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout, which is not \
-             configurable — the turn ends there first, so this value cannot take effect"
+            effective_ceiling = prompt_idle_timeout_secs(),
+            "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout \
+             ({ACP_PROMPT_IDLE_TIMEOUT_ENV}) — the turn ends there first, so this value cannot \
+             take effect"
         );
     }
 }
@@ -396,6 +431,9 @@ fn accept_acp_servers(servers: Vec<AcpMcpServer>) -> Result<Vec<AcpMcpServer>, S
 pub enum ReplyChunk {
     /// Incremental text snapshot (full text so far)
     Text(String),
+    /// A complete ACP `session/update` body (`tool_call` / `tool_call_update`) to forward
+    /// as-is. Carries no answer text, so it never moves the text delta cursor.
+    Update(Value),
     /// Agent finished responding
     Done,
 }
@@ -2234,6 +2272,46 @@ async fn release_prompt(
     }
 }
 
+/// Build the event that asks core to cancel the turn running on `channel_id`.
+///
+/// Reuses core's existing `/cancel` slash command rather than a new event type: core intercepts it
+/// before dispatch (so it reaches a busy session mid-turn), runs it through the same ingress gate as
+/// the prompt it cancels, and resolves the same `acp:<channel_id>` session key. Core answers with a
+/// short status message; that reply carries this event's own id as `reply_to`, which matches no
+/// live sink, so the fence in [`handle_reply`] drops it and the client never sees it.
+fn backend_cancel_event(channel_id: &str) -> GatewayEvent {
+    GatewayEvent::new(
+        "acp",
+        ChannelInfo {
+            id: channel_id.to_string(),
+            channel_type: "dm".into(),
+            thread_id: None,
+        },
+        SenderInfo {
+            id: "acp_client".into(),
+            name: "acp_client".into(),
+            display_name: "ACP Client".into(),
+            is_bot: false,
+        },
+        "/cancel",
+        &format!("acpmsg_{}", Uuid::new_v4()),
+        Vec::new(),
+    )
+}
+
+/// Propagate a gateway-side timeout or `session/cancel` to core. Best-effort: with no agent
+/// connected there is nothing running to cancel.
+fn cancel_backend_turn(state: &crate::AppState, channel_id: &str) {
+    match serde_json::to_string(&backend_cancel_event(channel_id)) {
+        Ok(json) => {
+            if state.event_tx.send(json).is_err() {
+                debug!(channel = %redact_id(channel_id), "ACP: no agent connected to cancel");
+            }
+        }
+        Err(e) => warn!("ACP: failed to serialize cancel event: {e}"),
+    }
+}
+
 // 8 args: the connection id is threaded in so the reply sink records which connection installed
 // it. Bundling these into a struct would hide that relationship at the call site.
 #[allow(clippy::too_many_arguments)]
@@ -2352,7 +2430,7 @@ async fn handle_session_prompt(
 
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
-    let timeout = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS);
+    let timeout = tokio::time::Duration::from_secs(prompt_idle_timeout_secs());
     // Typed StopReason (T2.1) so the final PromptResponse is constructed from acp_schema.
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
@@ -2388,6 +2466,18 @@ async fn handle_session_prompt(
                         };
                         let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
                     }
+                    Ok(Some(ReplyChunk::Update(update))) => {
+                        // Tool progress. Arriving at all is what resets the idle timer.
+                        let notification = JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".into(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": update,
+                            }),
+                        };
+                        let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+                    }
                     Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
                     Err(_) => {
                         warn!(session = %redact_id(&session_id), "ACP: prompt timed out waiting for reply");
@@ -2397,6 +2487,13 @@ async fn handle_session_prompt(
                 }
             }
         }
+    }
+
+    // A timed-out or cancelled turn is still running in core. Stop it there too, or it keeps the
+    // agent busy and its late reply is only discarded by the fence. Sent BEFORE `busy` is released
+    // below, so the next prompt on this session cannot be dispatched ahead of the cancel.
+    if timed_out || stop_reason == crate::adapters::acp_schema::StopReason::Cancelled {
+        cancel_backend_turn(state, &channel_id);
     }
 
     // Cleanup: remove from registry, release busy flag, clear cancel signal.
@@ -2548,11 +2645,51 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             let _ = tx.send(ReplyChunk::Done);
             registry.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
         }
+        Some(kind @ ("tool_call" | "tool_call_update")) => {
+            // Mid-turn tool progress. The sink stays registered: the answer is still to come.
+            match tool_progress_update(kind, &full_text) {
+                Some(update) => {
+                    if tx.send(ReplyChunk::Update(update)).is_err() {
+                        debug!(
+                            channel = key,
+                            "ACP tool progress send failed (client likely disconnected)"
+                        );
+                    }
+                }
+                None => debug!(
+                    channel = key,
+                    command = kind,
+                    "ACP dropping malformed tool progress"
+                ),
+            }
+        }
         Some("add_reaction") | Some("remove_reaction") => {
             // Reactions are agent state indicators — could map to notifications later
         }
         _ => {}
     }
+}
+
+/// Turn a core tool-progress payload (`{toolCallId, title?, status}`, the ACP update body minus
+/// its discriminator) into a `session/update` `update` object. Only the fields this server vouches
+/// for are copied, so the emitted shape is exactly what the conformance tests pin. `None` when the
+/// payload is not an object with a string `toolCallId`, or a `tool_call` lacks its required
+/// `title`.
+fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
+    let p: Value = serde_json::from_str(payload).ok()?;
+    let tool_call_id = p.get("toolCallId")?.as_str()?;
+    let mut update = json!({ "sessionUpdate": kind, "toolCallId": tool_call_id });
+    match p.get("title").and_then(Value::as_str) {
+        Some(title) => update["title"] = json!(title),
+        None if kind == "tool_call" => return None,
+        None => {}
+    }
+    if let Some(status) = p.get("status").and_then(Value::as_str) {
+        if matches!(status, "pending" | "in_progress" | "completed" | "failed") {
+            update["status"] = json!(status);
+        }
+    }
+    Some(update)
 }
 
 // ---------------------------------------------------------------------------
@@ -2634,6 +2771,23 @@ mod acp_conformance {
                 "content": { "type": "text", "text": "PONG 你好 (๑•̀ㅂ•́)و" }
             }
         }));
+    }
+
+    #[test]
+    fn tool_call_session_updates() {
+        // mirror of the prompt loop's ReplyChunk::Update arm, fed by tool_progress_update
+        for (kind, payload) in [
+            ("tool_call", r#"{"toolCallId":"t1","title":"Terminal","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","title":"cargo test","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","status":"completed"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","status":"failed"}"#),
+        ] {
+            let update = super::tool_progress_update(kind, payload).expect("valid progress");
+            conforms::<sc::SessionNotification>(json!({
+                "sessionId": "sess_00000000-0000-0000-0000-000000000000",
+                "update": update,
+            }));
+        }
     }
 
     // --- inbound requests (params clients send) ---
@@ -4194,6 +4348,215 @@ mod acp_review_fixes {
         assert_eq!(chunks.len(), 1, "Phase-1 must stream exactly one terminal chunk, got {chunks:?}");
         assert_eq!(chunks[0], "hello world");
         assert_eq!(final_stop.as_deref(), Some("end_turn"), "a completed turn ends end_turn");
+    }
+
+    /// Prompt-loop harness: one reserved session, the handler spawned, and its reply sink's
+    /// turn id once registered.
+    struct PromptHarness {
+        registry: AcpReplyRegistry,
+        channel_id: String,
+        sid: String,
+        cancel: Arc<tokio::sync::Notify>,
+        sessions: Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
+        event_rx: tokio::sync::broadcast::Receiver<String>,
+        out_rx: mpsc::UnboundedReceiver<String>,
+        handle: tokio::task::JoinHandle<()>,
+        turn_id: String,
+    }
+
+    async fn start_prompt(request_id: Value) -> PromptHarness {
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let registry = new_reply_registry();
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(registry.clone());
+        let state = Arc::new(st);
+
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let channel_id = format!("acp_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()) },
+        );
+
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+        let (st2, sessions2, sid2, cancel2) = (state.clone(), sessions.clone(), sid.clone(), cancel.clone());
+        let handle = tokio::spawn(async move {
+            let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
+            handle_session_prompt(&st2, &sessions2, request_id, Some(&params), &out_tx, sid2.clone(), cancel2, "conn-test", 0)
+                .await;
+        });
+
+        let mut turn_id = None;
+        for _ in 0..10_000 {
+            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+                turn_id = Some(t);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let turn_id = turn_id.expect("handler must register a reply sink");
+        PromptHarness { registry, channel_id, sid, cancel, sessions, event_rx, out_rx, handle, turn_id }
+    }
+
+    fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<GatewayEvent> {
+        let mut v = Vec::new();
+        while let Ok(s) = rx.try_recv() {
+            v.push(serde_json::from_str(&s).unwrap());
+        }
+        v
+    }
+
+    // P0 — over ACP the answer is send-once, so a long tool-heavy turn used to send nothing for
+    // longer than the idle timeout and die with -32603. Tool progress now arrives mid-turn and
+    // resets the timer: a turn spanning several idle windows completes, the client sees each tool
+    // event in order, and the answer is still exactly one terminal `agent_message_chunk` — which is
+    // all a client that ignores tool updates (katashiro, Studio) needs.
+    #[tokio::test(start_paused = true)]
+    async fn tool_progress_keeps_a_long_turn_alive_and_the_answer_stays_one_chunk() {
+        let mut h = start_prompt(json!(21)).await;
+        let step = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS * 2 / 3);
+        let progress = [
+            ("tool_call", r#"{"toolCallId":"t1","title":"Terminal","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","title":"cargo test","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","status":"completed"}"#),
+        ];
+        for (cmd, payload) in progress {
+            tokio::time::sleep(step).await;
+            handle_reply(&reply(&h.channel_id, &h.turn_id, payload, Some(cmd)), &h.registry).await;
+        }
+        tokio::time::sleep(step).await;
+        // 4 × (2/3 idle window) — well past one idle timeout in total.
+        handle_reply(&reply(&h.channel_id, &h.turn_id, "done", None), &h.registry).await;
+        h.handle.await.unwrap();
+
+        let mut updates = Vec::new();
+        let mut final_resp = None;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["method"] == json!("session/update") {
+                updates.push(v["params"]["update"].clone());
+            }
+            if v.get("id") == Some(&json!(21)) {
+                final_resp = Some(v);
+            }
+        }
+        let resp = final_resp.expect("prompt must produce a final response");
+        assert_eq!(resp["result"]["stopReason"], json!("end_turn"), "must not time out: {resp}");
+        let kinds: Vec<&str> = updates.iter().map(|u| u["sessionUpdate"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["tool_call", "tool_call_update", "tool_call_update", "agent_message_chunk"],
+            "tool progress first, in order, then the answer once"
+        );
+        assert_eq!(updates[0], json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"Terminal","status":"in_progress"}));
+        assert_eq!(updates[2], json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}));
+        assert_eq!(updates[3]["content"]["text"], json!("done"));
+        let cancels = drain_events(&mut h.event_rx).into_iter().filter(|e| e.content.text == "/cancel").count();
+        assert_eq!(cancels, 0, "a completed turn must not cancel the backend");
+    }
+
+    // P0 — on idle timeout the gateway used to answer -32603 and walk away while core kept running
+    // the turn. It now also asks core to cancel it, on the turn's own channel, before the session
+    // is released.
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_cancels_the_backend_turn() {
+        let mut h = start_prompt(json!(22)).await;
+        h.handle.await.unwrap();
+
+        let mut final_resp = None;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v.get("id") == Some(&json!(22)) {
+                final_resp = Some(v);
+            }
+        }
+        assert_eq!(final_resp.expect("final response")["error"]["code"], json!(-32603));
+        let events = drain_events(&mut h.event_rx);
+        assert_eq!(events.len(), 2, "the prompt, then the cancel: {events:?}");
+        assert_eq!(events[1].content.text, "/cancel");
+        assert_eq!(events[1].platform, "acp");
+        assert_eq!(events[1].channel.id, h.channel_id, "must cancel this turn's session");
+        assert_ne!(events[1].event_id, h.turn_id, "the cancel is its own event");
+        let g = h.sessions.lock().await;
+        assert!(!g.get(&h.sid).unwrap().busy, "the session is released after the cancel");
+    }
+
+    // A client `session/cancel` likewise stops the backend turn, not just the gateway stream.
+    #[tokio::test]
+    async fn client_cancel_cancels_the_backend_turn() {
+        let mut h = start_prompt(json!(23)).await;
+        h.cancel.notify_one();
+        h.handle.await.unwrap();
+        let events = drain_events(&mut h.event_rx);
+        assert_eq!(events.last().map(|e| e.content.text.as_str()), Some("/cancel"));
+        assert_eq!(events.last().unwrap().channel.id, h.channel_id);
+    }
+
+    // Core's answer to the `/cancel` (its status line) carries the cancel event's own id as
+    // `reply_to`. It must not leak into a turn started on the same session afterwards.
+    #[tokio::test]
+    async fn the_cancel_status_reply_does_not_reach_the_next_turn() {
+        let registry = new_reply_registry();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink { turn_id: "evt_next".into(), tx, owner: "conn-test".into(), generation: 0 },
+        );
+        let cancel_id = backend_cancel_event("acp_chan").event_id;
+        handle_reply(&reply("acp_chan", &cancel_id, "🛑 Cancel signal sent.", None), &registry).await;
+        assert!(rx.try_recv().is_err(), "the cancel's status reply must be fenced");
+    }
+
+    // Tool progress must leave the sink in place (the answer is still coming) and must not end
+    // the turn.
+    #[tokio::test]
+    async fn tool_progress_keeps_the_reply_sink() {
+        let registry = new_reply_registry();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink { turn_id: "evt_t".into(), tx, owner: "conn-test".into(), generation: 0 },
+        );
+        let payload = r#"{"toolCallId":"t1","title":"Read","status":"in_progress"}"#;
+        handle_reply(&reply("acp_chan", "evt_t", payload, Some("tool_call")), &registry).await;
+        assert!(matches!(rx.try_recv(), Ok(ReplyChunk::Update(_))));
+        assert!(rx.try_recv().is_err(), "no Done after tool progress");
+        assert!(registry.lock().unwrap().contains_key("acp_chan"), "sink must stay registered");
+        // Malformed progress is dropped, not forwarded and not fatal.
+        handle_reply(&reply("acp_chan", "evt_t", "not json", Some("tool_call")), &registry).await;
+        assert!(rx.try_recv().is_err());
+        assert!(registry.lock().unwrap().contains_key("acp_chan"));
+    }
+
+    #[test]
+    fn tool_progress_update_shapes() {
+        // tool_call needs a title.
+        assert_eq!(tool_progress_update("tool_call", r#"{"toolCallId":"a","status":"in_progress"}"#), None);
+        // An update may omit it.
+        assert_eq!(
+            tool_progress_update("tool_call_update", r#"{"toolCallId":"a","status":"failed"}"#),
+            Some(json!({"sessionUpdate":"tool_call_update","toolCallId":"a","status":"failed"}))
+        );
+        // Unknown fields are not forwarded; an unknown status is dropped rather than emitted.
+        assert_eq!(
+            tool_progress_update("tool_call", r#"{"toolCallId":"a","title":"T","status":"weird","x":1}"#),
+            Some(json!({"sessionUpdate":"tool_call","toolCallId":"a","title":"T"}))
+        );
+        assert_eq!(tool_progress_update("tool_call", r#"{"title":"T"}"#), None, "toolCallId is required");
+        assert_eq!(tool_progress_update("tool_call", "[1]"), None);
+    }
+
+    #[test]
+    fn prompt_idle_timeout_override_parsing() {
+        assert_eq!(parse_prompt_idle_timeout(None), Ok(ACP_PROMPT_IDLE_TIMEOUT_SECS));
+        assert_eq!(parse_prompt_idle_timeout(Some("  ")), Ok(ACP_PROMPT_IDLE_TIMEOUT_SECS));
+        assert_eq!(parse_prompt_idle_timeout(Some("900")), Ok(900));
+        assert_eq!(parse_prompt_idle_timeout(Some(" 600 ")), Ok(600));
+        assert!(parse_prompt_idle_timeout(Some("0")).is_err(), "0 would time out every turn");
+        assert!(parse_prompt_idle_timeout(Some("-5")).is_err());
+        assert!(parse_prompt_idle_timeout(Some("3m")).is_err());
     }
 
     // R17-F3c — a request-shaped `session/cancel` (id present) must NOT be acknowledged with

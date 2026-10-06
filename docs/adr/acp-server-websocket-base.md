@@ -114,10 +114,32 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   over once rather than incrementally. Progressive multi-chunk streaming is Phase-2 (§6).
   The delta is still sliced char-boundary-safe (`str::get`, never byte-index) so CJK /
   顏文字 / emoji cannot panic the stream if/when multiple chunks arrive.
+- `session/update` with `update.sessionUpdate = "tool_call"` / `"tool_call_update"`
+  (`toolCallId`, `title`, `status` ∈ `in_progress` / `completed` / `failed`) — tool
+  activity, emitted **mid-turn** as the agent reports it, separately from the reply text
+  (which stays send-once). Clients that only render `agent_message_chunk` ignore these and
+  still receive the complete answer. See *Idle timeout* below for why they exist.
 - Turn completion is the `session/prompt` **response** (`{ stopReason }`, correlated
   to the request id), not a separate notification. `stopReason` ∈ `end_turn` /
   `cancelled`. A backend timeout has no ACP stopReason, so it returns a JSON-RPC
   error (`-32603`) instead.
+
+### Idle timeout & tool progress
+
+- `session/prompt` waits for the backend with a **per-chunk idle timeout**
+  (default 180s, `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS`): any chunk resets it. Because the
+  reply text is send-once, a turn that runs tools for longer than the timeout used to send
+  nothing at all and was failed with `-32603`, even though the agent was working.
+- Core therefore forwards tool progress for the `acp` platform as it happens: on
+  `AcpEvent::ToolStart` / `ToolDone` it calls `ChatAdapter::send_tool_progress`, which sends a
+  `GatewayReply` with `command = "tool_call"` (first event for an id) or `"tool_call_update"`
+  and the ACP update body (`{toolCallId, title?, status}`) as JSON in `content.text`. The ACP
+  server maps it to `ReplyChunk::Update` and emits it as a `session/update`; arriving at all
+  resets the idle timer. Other platforms never receive these commands (core gates on
+  `platform == "acp"`; several gateway adapters would post an unknown command as text).
+- **Residual:** a turn that produces neither text nor tool events for longer than the
+  timeout (e.g. a very long single generation) still times out; raise the env value for
+  such workloads.
 
 ### Concurrency, caps & reply fencing
 
@@ -132,12 +154,14 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   `GatewayReply.reply_to`); `handle_reply` drops a reply whose `reply_to` no longer
   matches the active turn, so a late reply from the superseded turn cannot leak into the
   new prompt's stream.
-- **Backend work is not yet cancelled** — the inflight cap counts *gateway* stream tasks,
-  not downstream agent work. A timed-out / cancelled turn keeps running on the backend
-  until it finishes on its own; a `prompt → cancel` loop can therefore queue backend work
-  beyond the 32 cap. Bounding this needs true agent→core cancel propagation — tracked as a
-  follow-up, not addressed in the base (the fence above still prevents its late output from
-  corrupting a later turn).
+- **Backend cancel propagation** — when a prompt times out or the client sends
+  `session/cancel`, the server also emits a `/cancel` `GatewayEvent` on the turn's channel
+  (core's existing slash command: intercepted before dispatch, so it reaches a busy
+  session, and gated like the prompt itself). It is sent before the session's `busy` flag
+  is released, so the next prompt cannot be dispatched ahead of it. Core's status reply to
+  it carries the cancel event's own id and is dropped by the fence above. The inflight cap
+  still counts *gateway* stream tasks; cancellation is best-effort (an agent that ignores
+  `session/cancel` keeps running until core's own hard timeout).
 
 ### Session ↔ core mapping
 
@@ -237,17 +261,11 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
   against real traffic first).
 
 ### Optional (as-needed, off the critical path)
-- **`tool_call` / `tool_call_update` display** — a client-facing tool-activity display
-  (e.g. a distinct "tool chip" per call with running/done/failed state). *State today:* the
-  downstream tool events reach the ACP client only **merged into the text** — `openab-core`
-  parses them into `AcpEvent::ToolStart` / `ToolDone`, then `compose_display` prepends
-  "🔧 …" lines onto the reply text buffer that streams as `agent_message_chunk`; there is
-  no structured separation over `/acp`. *Recommended approach:* for the `acp` platform, tap
-  the `AcpEvent::ToolStart` / `ToolDone` stream **before** the `compose_display` merge and
-  emit structured `session/update` `tool_call` / `tool_call_update` notifications (with
-  `toolCallId` / `title` / `status`) separately from the text — this is the ACP-native path
-  (standard clients like Zed render it too), avoids brittle client-side text parsing, and
-  cleanly separates tool activity from the answer. Client (extension) then renders chips.
+- **`tool_call` / `tool_call_update` display** — *server side done* (see *Idle timeout &
+  tool progress*): the server emits structured `tool_call` / `tool_call_update` updates
+  with `toolCallId` / `title` / `status`. Remaining: client-side rendering (e.g. a "tool
+  chip" per call), and richer fields (`kind`, `locations`, `content`, `rawInput`) which
+  core does not yet carry past `AcpEvent`.
 - **Progressive `agent_message_chunk` streaming (Phase-2)** — Phase-1 emits the whole reply
   as one terminal chunk because the ACP `ChatAdapter` reports `streaming=false`, so the
   backend hands the reply over once. True incremental delivery — flip the adapter to

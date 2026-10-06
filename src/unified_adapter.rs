@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use openab_core::adapter::{ChannelRef, ChatAdapter, MessageRef};
+use openab_core::adapter::{ChannelRef, ChatAdapter, MessageRef, ToolCallProgress};
 use openab_gateway::schema::{Content, GatewayReply, ReplyChannel};
 use openab_gateway::AppState;
 use std::collections::HashMap;
@@ -235,6 +235,22 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         let mut reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
         // Use the actual platform message_id (e.g. "draft" for streaming, or numeric for edits)
         reply.reply_to = msg.message_id.clone();
+        let _ = self.dispatch_reply(&reply).await?;
+        Ok(())
+    }
+
+    async fn send_tool_progress(
+        &self,
+        channel: &ChannelRef,
+        progress: &ToolCallProgress,
+    ) -> Result<()> {
+        let mut reply = self.build_reply(
+            channel,
+            &progress.payload().to_string(),
+            Some(progress.command()),
+            None,
+        );
+        reply.content.content_type = "json".into();
         let _ = self.dispatch_reply(&reply).await?;
         Ok(())
     }

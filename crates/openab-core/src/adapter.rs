@@ -329,6 +329,48 @@ pub struct SenderContext {
     pub receiver_id: Option<String>,
 }
 
+/// Structured tool-call progress for one tool invocation, delivered mid-turn to
+/// platforms that render tool activity natively (ACP `session/update`
+/// `tool_call` / `tool_call_update`). Text is NOT carried here — the answer
+/// still arrives through the normal send path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallProgress {
+    /// Agent-assigned `toolCallId`, stable across the call's lifetime.
+    pub tool_call_id: String,
+    /// Human-readable title. May be empty on an update that only changes status.
+    pub title: String,
+    /// ACP `ToolCallStatus`: `in_progress` / `completed` / `failed`.
+    pub status: &'static str,
+    /// `true` for the first event of this id this turn (ACP `tool_call`),
+    /// `false` for a refinement of an already-announced call (`tool_call_update`).
+    pub is_new: bool,
+}
+
+impl ToolCallProgress {
+    /// Gateway command name for this event, mirroring the ACP `sessionUpdate` kind.
+    pub fn command(&self) -> &'static str {
+        if self.is_new {
+            "tool_call"
+        } else {
+            "tool_call_update"
+        }
+    }
+
+    /// JSON payload carried in `GatewayReply.content.text`: the ACP update body
+    /// without `sessionUpdate` (the gateway adds it from the command). `title`
+    /// is required on `tool_call` and omitted from an update when empty.
+    pub fn payload(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "toolCallId": self.tool_call_id,
+            "status": self.status,
+        });
+        if self.is_new || !self.title.is_empty() {
+            v["title"] = serde_json::Value::String(self.title.clone());
+        }
+        v
+    }
+}
+
 // --- ChatAdapter trait ---
 
 #[async_trait]
@@ -431,6 +473,18 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Set an ephemeral status line (e.g. "Thinking…", "Using <tool>…").
     /// Empty string clears it. Default: no-op (platforms without a status API).
     async fn set_status(&self, _channel: &ChannelRef, _status: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Deliver structured tool-call progress mid-turn. Only called for the `acp`
+    /// platform, whose reply text is send-once: without these events the ACP
+    /// gateway sees nothing until the turn ends and its idle timer expires on
+    /// long tool-heavy turns. Default: no-op.
+    async fn send_tool_progress(
+        &self,
+        _channel: &ChannelRef,
+        _progress: &ToolCallProgress,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -1012,6 +1066,20 @@ impl AdapterRouter {
                                     // assistant_mode the status line is transient and cleared before
                                     // the reply, so without this the message would retain no record
                                     // of which tools ran.
+                                    let is_new = !tool_lines.iter().any(|e| e.id == id);
+                                    if platform_is_acp {
+                                        send_tool_progress_best_effort(
+                                            adapter.as_ref(),
+                                            &thread_channel,
+                                            ToolCallProgress {
+                                                tool_call_id: id.clone(),
+                                                title: title.clone(),
+                                                status: "in_progress",
+                                                is_new,
+                                            },
+                                        )
+                                        .await;
+                                    }
                                     let title = sanitize_title(&title);
                                     if let Some(slot) =
                                         tool_lines.iter_mut().find(|e| e.id == id)
@@ -1058,6 +1126,26 @@ impl AdapterRouter {
                                     } else {
                                         ToolState::Failed
                                     };
+                                    let known = tool_lines.iter().any(|e| e.id == id);
+                                    // An unknown id with no title has nothing to announce
+                                    // (mirrors the tool_lines rule below).
+                                    if platform_is_acp && (known || !title.is_empty()) {
+                                        send_tool_progress_best_effort(
+                                            adapter.as_ref(),
+                                            &thread_channel,
+                                            ToolCallProgress {
+                                                tool_call_id: id.clone(),
+                                                title: title.clone(),
+                                                status: if new_state == ToolState::Completed {
+                                                    "completed"
+                                                } else {
+                                                    "failed"
+                                                },
+                                                is_new: !known,
+                                            },
+                                        )
+                                        .await;
+                                    }
                                     if let Some(slot) =
                                         tool_lines.iter_mut().find(|e| e.id == id)
                                     {
@@ -1411,6 +1499,18 @@ fn contains_bot_mention(content: &str) -> bool {
 }
 
 /// Flatten a tool-call title into a single line safe for inline-code spans.
+/// Tool progress is advisory: a delivery failure must not abort the turn, whose
+/// answer still arrives through the send-once path.
+async fn send_tool_progress_best_effort(
+    adapter: &dyn ChatAdapter,
+    channel: &ChannelRef,
+    progress: ToolCallProgress,
+) {
+    if let Err(e) = adapter.send_tool_progress(channel, &progress).await {
+        tracing::debug!(error = %e, command = progress.command(), "tool progress delivery failed");
+    }
+}
+
 fn sanitize_title(title: &str) -> String {
     title
         .replace('\r', "")
@@ -2585,5 +2685,213 @@ mod directive_tests {
         };
         let result = classify_empty_turn(None, &tr);
         assert_eq!(result, "_(no response)_");
+    }
+}
+
+#[cfg(test)]
+mod tool_progress_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn tool_call_progress_wire_shape() {
+        let start = ToolCallProgress {
+            tool_call_id: "t1".into(),
+            title: "Terminal".into(),
+            status: "in_progress",
+            is_new: true,
+        };
+        assert_eq!(start.command(), "tool_call");
+        assert_eq!(
+            start.payload(),
+            serde_json::json!({"toolCallId": "t1", "title": "Terminal", "status": "in_progress"})
+        );
+        // A status-only update omits the title rather than blanking it on the client.
+        let done = ToolCallProgress {
+            tool_call_id: "t1".into(),
+            title: String::new(),
+            status: "completed",
+            is_new: false,
+        };
+        assert_eq!(done.command(), "tool_call_update");
+        assert_eq!(
+            done.payload(),
+            serde_json::json!({"toolCallId": "t1", "status": "completed"})
+        );
+        // ACP requires `title` on tool_call, so a new call keeps it even when empty.
+        let untitled = ToolCallProgress {
+            is_new: true,
+            ..done
+        };
+        assert_eq!(untitled.payload()["title"], serde_json::json!(""));
+    }
+
+    /// Records what the turn loop hands the adapter.
+    #[derive(Default)]
+    struct RecordingAdapter {
+        progress: StdMutex<Vec<ToolCallProgress>>,
+        sent: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "unified"
+        }
+        fn message_limit(&self) -> usize {
+            4096
+        }
+        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+            self.sent.lock().unwrap().push(content.to_string());
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "m".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            c: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            Ok(c.clone())
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn send_tool_progress(&self, _: &ChannelRef, p: &ToolCallProgress) -> Result<()> {
+            self.progress.lock().unwrap().push(p.clone());
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    /// A minimal ACP agent on stdio: answers `initialize` / `session/new`, and on
+    /// `session/prompt` announces one tool (`pending`, the way claude-agent-acp opens a call
+    /// before its input streams in), refines its title, completes it, then answers.
+    const FAKE_TOOL_AGENT: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Terminal","status":"pending"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"cargo test","status":"in_progress"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the answer"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+    *) [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    async fn run_turn(platform: &str) -> Arc<RecordingAdapter> {
+        let agent_cfg = crate::config::AgentConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), FAKE_TOOL_AGENT.into()],
+            working_dir: "/tmp".into(),
+            env: [("PATH".to_string(), "/usr/bin:/bin".to_string())]
+                .into_iter()
+                .collect(),
+            inherit_env: vec![],
+            command_explicit: true,
+        };
+        let pool = Arc::new(SessionPool::new(
+            agent_cfg,
+            1,
+            crate::config::default_prompt_hard_timeout_secs()
+                .saturating_add(crate::config::default_hung_grace_secs()),
+            std::collections::HashMap::new(),
+        ));
+        let router = AdapterRouter::new(
+            pool,
+            ReactionsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            TableMode::Off,
+            crate::config::default_prompt_hard_timeout_secs(),
+            crate::config::default_liveness_check_secs(),
+            std::collections::HashMap::new(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        let recorder = Arc::new(RecordingAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+        let channel = ChannelRef {
+            platform: platform.into(),
+            channel_id: format!("{platform}_chan"),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_turn".into()),
+        };
+        let ctx = MessageContext {
+            thread_channel: channel.clone(),
+            sender_json: "{}".into(),
+            prompt: "run the tests".into(),
+            extra_blocks: vec![],
+            trigger_msg: MessageRef {
+                channel,
+                message_id: "trigger".into(),
+            },
+            other_bot_present: false,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            router.handle_message(&adapter, ctx),
+        )
+        .await
+        .expect("turn must finish")
+        .expect("turn must succeed");
+        recorder
+    }
+
+    // P0 — over ACP the answer is send-once; tool progress is what keeps the gateway's idle
+    // timer alive. Each agent tool event must reach the adapter mid-turn, in order, as
+    // tool_call then tool_call_update, while the answer is still delivered once.
+    #[tokio::test]
+    async fn acp_turn_forwards_tool_progress_and_sends_the_answer_once() {
+        let rec = run_turn("acp").await;
+        let progress = rec.progress.lock().unwrap().clone();
+        let p = |title: &str, status: &'static str, is_new: bool| ToolCallProgress {
+            tool_call_id: "t1".into(),
+            title: title.into(),
+            status,
+            is_new,
+        };
+        assert_eq!(
+            progress,
+            vec![
+                p("Terminal", "in_progress", true),
+                p("cargo test", "in_progress", false),
+                p("", "completed", false),
+            ]
+        );
+        let sent = rec.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "send-once: one answer message, got {sent:?}");
+        assert!(sent[0].contains("the answer"), "{sent:?}");
+        assert!(
+            !sent[0].contains("cargo test"),
+            "ACP text must not carry tool lines: {sent:?}"
+        );
+    }
+
+    // Every other platform keeps its existing tool display and never sees tool_call commands —
+    // several gateway adapters would post an unknown command as a plain message.
+    #[tokio::test]
+    async fn non_acp_turn_sends_no_tool_progress() {
+        let rec = run_turn("telegram").await;
+        assert!(rec.progress.lock().unwrap().is_empty());
+        assert!(
+            !rec.sent.lock().unwrap().is_empty(),
+            "the turn still answers"
+        );
     }
 }
