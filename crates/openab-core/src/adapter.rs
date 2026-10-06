@@ -365,11 +365,24 @@ impl ToolCallProgress {
             "status": self.status,
         });
         if self.is_new || !self.title.is_empty() {
-            v["title"] = serde_json::Value::String(self.title.clone());
+            v["title"] = serde_json::Value::String(Self::capped_title(&self.title));
         }
         v
     }
+
+    /// The raw title, before `sanitize_title`, cut to [`MAX_TOOL_TITLE_CHARS`] on a char
+    /// boundary. Agents put whole commands in it (claude-agent-acp titles a Bash call with the
+    /// full command line), which would otherwise go to the client unbounded.
+    fn capped_title(title: &str) -> String {
+        match title.char_indices().nth(MAX_TOOL_TITLE_CHARS) {
+            Some((cut, _)) => format!("{}…", &title[..cut]),
+            None => title.to_string(),
+        }
+    }
 }
+
+/// Longest tool title, in chars, forwarded to an ACP client as tool progress.
+pub const MAX_TOOL_TITLE_CHARS: usize = 256;
 
 // --- ChatAdapter trait ---
 
@@ -945,6 +958,14 @@ impl AdapterRouter {
                     let mut response_error: Option<String> = None;
                     let mut turn_result = TurnResult::default();
                     let prompt_start = tokio::time::Instant::now();
+                    // One interval for the whole turn, not a `sleep` per iteration: a per-iteration
+                    // sleep is re-armed by every notification, so an agent that keeps emitting
+                    // chunks never lets it fire — starving the liveness check, the hard timeout,
+                    // and the ACP keepalive alike. The first tick completes immediately; consume
+                    // it so the first check lands one interval in.
+                    let mut liveness_tick = tokio::time::interval(liveness_check_interval);
+                    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    liveness_tick.tick().await;
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
@@ -975,7 +996,7 @@ impl AdapterRouter {
                                     break;
                                 }
                             },
-                            _ = tokio::time::sleep(liveness_check_interval) => {
+                            _ = liveness_tick.tick() => {
                                 if !conn.alive() {
                                     response_error = Some("Agent process died".into());
                                     conn.abandon_request(request_id).await;
@@ -989,8 +1010,9 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
-                                // Agent alive but silent (a long tool, a long generation):
-                                // tell the ACP gateway the turn is still running.
+                                // Agent alive: tell the ACP gateway the turn is still running.
+                                // Over ACP the answer text is withheld until turn end, so neither
+                                // a long tool nor a long generation reaches the gateway on its own.
                                 if platform_is_acp {
                                     if let Err(e) = adapter.send_keepalive(&thread_channel).await {
                                         tracing::debug!(error = %e, "keepalive delivery failed");
@@ -2741,6 +2763,24 @@ mod tool_progress_tests {
         assert_eq!(untitled.payload()["title"], serde_json::json!(""));
     }
 
+    #[test]
+    fn tool_progress_title_is_capped_on_a_char_boundary() {
+        let p = |title: String| ToolCallProgress {
+            tool_call_id: "t1".into(),
+            title,
+            status: "in_progress",
+            is_new: true,
+        };
+        let exact = "x".repeat(MAX_TOOL_TITLE_CHARS);
+        assert_eq!(p(exact.clone()).payload()["title"], serde_json::json!(exact));
+        // Multi-byte chars: the cut counts chars, never splits one.
+        let long = "測".repeat(MAX_TOOL_TITLE_CHARS + 10);
+        let title = p(long).payload()["title"].as_str().unwrap().to_string();
+        assert_eq!(title.chars().count(), MAX_TOOL_TITLE_CHARS + 1);
+        assert!(title.ends_with('…'));
+        assert!(title.starts_with("測測"));
+    }
+
     /// Records what the turn loop hands the adapter.
     #[derive(Default)]
     struct RecordingAdapter {
@@ -2816,13 +2856,54 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// Like [`FAKE_TOOL_AGENT`] but never silent: on `session/prompt` it streams an
+    /// `agent_message_chunk` every 0.3s for `$CHAT_SECS` seconds, then answers. A per-iteration
+    /// `sleep` in the turn loop is re-armed by every chunk, so with a 1s tick it never fired here.
+    const FAKE_CHATTY_AGENT: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      n=$((CHAT_SECS * 10 / 3)); i=0
+      while [ "$i" -lt "$n" ]; do
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"."}}}}'
+        sleep 0.3; i=$((i + 1))
+      done
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the answer"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+    *) [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
     async fn run_turn(platform: &str) -> Arc<RecordingAdapter> {
+        run_turn_with(
+            platform,
+            FAKE_TOOL_AGENT,
+            &[],
+            crate::config::default_prompt_hard_timeout_secs(),
+        )
+        .await
+    }
+
+    async fn run_turn_with(
+        platform: &str,
+        script: &str,
+        env: &[(&str, &str)],
+        prompt_hard_timeout_secs: u64,
+    ) -> Arc<RecordingAdapter> {
         let agent_cfg = crate::config::AgentConfig {
             command: "/bin/sh".into(),
-            args: vec!["-c".into(), FAKE_TOOL_AGENT.into()],
+            args: vec!["-c".into(), script.into()],
             working_dir: "/tmp".into(),
-            env: [("PATH".to_string(), "/usr/bin:/bin".to_string())]
-                .into_iter()
+            env: [("PATH", "/usr/bin:/bin")]
+                .iter()
+                .chain(env)
+                .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             inherit_env: vec![],
             command_explicit: true,
@@ -2841,7 +2922,7 @@ done
                 ..Default::default()
             },
             TableMode::Off,
-            crate::config::default_prompt_hard_timeout_secs(),
+            prompt_hard_timeout_secs,
             1, // liveness tick every 1s, so the 3s silent tool spans several ticks
             std::collections::HashMap::new(),
             std::path::PathBuf::from("/tmp"),
@@ -2908,6 +2989,36 @@ done
             rec.keepalives.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "liveness ticks during the silent tool must send keepalives"
         );
+    }
+
+    // An agent that never goes quiet (a long generation, withheld over ACP until turn end) must
+    // still get keepalives: the liveness tick runs on its own schedule, not after silence.
+    #[tokio::test]
+    async fn acp_turn_sends_keepalives_while_the_agent_keeps_streaming() {
+        let rec = run_turn_with(
+            "acp",
+            FAKE_CHATTY_AGENT,
+            &[("CHAT_SECS", "3")],
+            crate::config::default_prompt_hard_timeout_secs(),
+        )
+        .await;
+        assert!(
+            rec.keepalives.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a 1s tick must fire during 3s of continuous chunks"
+        );
+        let sent = rec.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "send-once: {sent:?}");
+        assert!(sent[0].contains("the answer"), "{sent:?}");
+    }
+
+    // The same starvation hid the hard timeout: a continuously streaming agent ran past it until
+    // the pool's hung-eviction sweep killed it. It now ends in the turn loop, with an error.
+    #[tokio::test]
+    async fn hard_timeout_applies_to_an_agent_that_keeps_streaming() {
+        let rec = run_turn_with("telegram", FAKE_CHATTY_AGENT, &[("CHAT_SECS", "10")], 2).await;
+        let sent = rec.sent.lock().unwrap().join("\n");
+        assert!(sent.contains("hard timeout"), "{sent}");
+        assert!(!sent.contains("the answer"), "the turn must end before the agent does: {sent}");
     }
 
     // Every other platform keeps its existing tool display and never sees tool_call commands —

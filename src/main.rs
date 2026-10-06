@@ -513,6 +513,12 @@ async fn main() -> anyhow::Result<()> {
             },
         ),
     );
+    // Same split: the ACP keepalive rides core's liveness tick, which must stay well inside the
+    // gateway's idle timeout.
+    #[cfg(feature = "acp")]
+    openab_gateway::adapters::acp_server::warn_if_liveness_tick_is_too_slow(
+        cfg.pool.liveness_check_secs,
+    );
 
     // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
     // serve the loopback Streamable HTTP MCP server in-process so any coding
