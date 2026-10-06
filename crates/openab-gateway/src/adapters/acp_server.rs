@@ -121,6 +121,30 @@ pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
         );
     }
 }
+
+/// Whether core's liveness tick is too slow to keep an idle-but-alive ACP turn open.
+///
+/// Keepalives ride `[pool] liveness_check_secs`, and each one has to land inside the idle window.
+/// Merely "beneath" leaves no room for a single late tick, so this asks for less than half.
+pub fn liveness_tick_too_slow_for_idle_timeout(liveness_check_secs: u64) -> bool {
+    liveness_check_secs.saturating_mul(2) >= prompt_idle_timeout_secs()
+}
+
+/// Warn when `[pool] liveness_check_secs` leaves keepalives too little margin under the ACP idle
+/// timeout. Same split as [`warn_if_tunnel_timeout_is_ineffective`]: the comparison lives beside
+/// the timeout, the binary only hands over the configured value.
+pub fn warn_if_liveness_tick_too_slow(liveness_check_secs: u64) {
+    if liveness_tick_too_slow_for_idle_timeout(liveness_check_secs) {
+        warn!(
+            liveness_check_secs,
+            idle_timeout_secs = prompt_idle_timeout_secs(),
+            "[pool] liveness_check_secs is at or above half the ACP prompt idle timeout \
+             ({ACP_PROMPT_IDLE_TIMEOUT_ENV}) — keepalives may arrive too late and silent ACP \
+             turns can time out"
+        );
+    }
+}
+
 /// Cap on `type:acp` servers a single session may declare (review R3-F1).
 ///
 /// Every declaration costs a spawned task, a pending `mcp/connect` holding a 30s timeout, and an
@@ -2277,46 +2301,6 @@ async fn release_prompt(
     }
 }
 
-/// Build the event that asks core to cancel the turn running on `channel_id`.
-///
-/// Reuses core's existing `/cancel` slash command rather than a new event type: core intercepts it
-/// before dispatch (so it reaches a busy session mid-turn), runs it through the same ingress gate as
-/// the prompt it cancels, and resolves the same `acp:<channel_id>` session key. Core answers with a
-/// short status message; that reply carries this event's own id as `reply_to`, which matches no
-/// live sink, so the fence in [`handle_reply`] drops it and the client never sees it.
-fn backend_cancel_event(channel_id: &str) -> GatewayEvent {
-    GatewayEvent::new(
-        "acp",
-        ChannelInfo {
-            id: channel_id.to_string(),
-            channel_type: "dm".into(),
-            thread_id: None,
-        },
-        SenderInfo {
-            id: "acp_client".into(),
-            name: "acp_client".into(),
-            display_name: "ACP Client".into(),
-            is_bot: false,
-        },
-        "/cancel",
-        &format!("acpmsg_{}", Uuid::new_v4()),
-        Vec::new(),
-    )
-}
-
-/// Propagate a gateway-side timeout or `session/cancel` to core. Best-effort: with no agent
-/// connected there is nothing running to cancel.
-fn cancel_backend_turn(state: &crate::AppState, channel_id: &str) {
-    match serde_json::to_string(&backend_cancel_event(channel_id)) {
-        Ok(json) => {
-            if state.event_tx.send(json).is_err() {
-                debug!(channel = %redact_id(channel_id), "ACP: no agent connected to cancel");
-            }
-        }
-        Err(e) => warn!("ACP: failed to serialize cancel event: {e}"),
-    }
-}
-
 // 8 args: the connection id is threaded in so the reply sink records which connection installed
 // it. Bundling these into a struct would hide that relationship at the call site.
 #[allow(clippy::too_many_arguments)]
@@ -2497,13 +2481,6 @@ async fn handle_session_prompt(
         }
     }
 
-    // A timed-out or cancelled turn is still running in core. Stop it there too, or it keeps the
-    // agent busy and its late reply is only discarded by the fence. Sent BEFORE `busy` is released
-    // below, so the next prompt on this session cannot be dispatched ahead of the cancel.
-    if timed_out || stop_reason == crate::adapters::acp_schema::StopReason::Cancelled {
-        cancel_backend_turn(state, &channel_id);
-    }
-
     // Cleanup: remove from registry, release busy flag, clear cancel signal.
     // Turn-scoped removal (F4): only remove the sink if THIS turn still owns it. A newer connection
     // resuming the same session (or a reconnect) can have taken over the channel key between this
@@ -2681,6 +2658,17 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
     }
 }
 
+/// Longest tool title forwarded to a client, in chars. Agents may put a whole shell command (or
+/// heredoc) in the title; a client renders it as a one-line chip, so the tail is noise.
+const MAX_TOOL_TITLE_CHARS: usize = 200;
+
+fn cap_tool_title(title: &str) -> String {
+    match title.char_indices().nth(MAX_TOOL_TITLE_CHARS) {
+        Some((cut, _)) => format!("{}…", &title[..cut]),
+        None => title.to_string(),
+    }
+}
+
 /// Turn a core tool-progress payload (`{toolCallId, title?, status}`, the ACP update body minus
 /// its discriminator) into a `session/update` `update` object. Only the fields this server vouches
 /// for are copied, so the emitted shape is exactly what the conformance tests pin. `None` when the
@@ -2691,7 +2679,7 @@ fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
     let tool_call_id = p.get("toolCallId")?.as_str()?;
     let mut update = json!({ "sessionUpdate": kind, "toolCallId": tool_call_id });
     match p.get("title").and_then(Value::as_str) {
-        Some(title) => update["title"] = json!(title),
+        Some(title) => update["title"] = json!(cap_tool_title(title)),
         None if kind == "tool_call" => return None,
         None => {}
     }
@@ -4366,10 +4354,8 @@ mod acp_review_fixes {
     struct PromptHarness {
         registry: AcpReplyRegistry,
         channel_id: String,
-        sid: String,
-        cancel: Arc<tokio::sync::Notify>,
-        sessions: Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
-        event_rx: tokio::sync::broadcast::Receiver<String>,
+        // Held so the prompt's own event has a receiver to be dispatched to.
+        _event_rx: tokio::sync::broadcast::Receiver<String>,
         out_rx: mpsc::UnboundedReceiver<String>,
         handle: tokio::task::JoinHandle<()>,
         turn_id: String,
@@ -4392,10 +4378,10 @@ mod acp_review_fixes {
         );
 
         let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
-        let (st2, sessions2, sid2, cancel2) = (state.clone(), sessions.clone(), sid.clone(), cancel.clone());
+        let (st2, sessions2, sid2) = (state.clone(), sessions.clone(), sid.clone());
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, request_id, Some(&params), &out_tx, sid2.clone(), cancel2, "conn-test", 0)
+            handle_session_prompt(&st2, &sessions2, request_id, Some(&params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
                 .await;
         });
 
@@ -4408,15 +4394,7 @@ mod acp_review_fixes {
             tokio::task::yield_now().await;
         }
         let turn_id = turn_id.expect("handler must register a reply sink");
-        PromptHarness { registry, channel_id, sid, cancel, sessions, event_rx, out_rx, handle, turn_id }
-    }
-
-    fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<GatewayEvent> {
-        let mut v = Vec::new();
-        while let Ok(s) = rx.try_recv() {
-            v.push(serde_json::from_str(&s).unwrap());
-        }
-        v
+        PromptHarness { registry, channel_id, _event_rx: event_rx, out_rx, handle, turn_id }
     }
 
     // P0 — over ACP the answer is send-once, so a long tool-heavy turn used to send nothing for
@@ -4464,8 +4442,6 @@ mod acp_review_fixes {
         assert_eq!(updates[0], json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"Terminal","status":"in_progress"}));
         assert_eq!(updates[2], json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}));
         assert_eq!(updates[3]["content"]["text"], json!("done"));
-        let cancels = drain_events(&mut h.event_rx).into_iter().filter(|e| e.content.text == "/cancel").count();
-        assert_eq!(cancels, 0, "a completed turn must not cancel the backend");
     }
 
     // A single long tool (a build, a test run) — or a long generation — is silent from the
@@ -4512,58 +4488,6 @@ mod acp_review_fixes {
         );
     }
 
-    // P0 — on idle timeout the gateway used to answer -32603 and walk away while core kept running
-    // the turn. It now also asks core to cancel it, on the turn's own channel, before the session
-    // is released.
-    #[tokio::test(start_paused = true)]
-    async fn idle_timeout_cancels_the_backend_turn() {
-        let mut h = start_prompt(json!(22)).await;
-        h.handle.await.unwrap();
-
-        let mut final_resp = None;
-        while let Ok(s) = h.out_rx.try_recv() {
-            let v: Value = serde_json::from_str(&s).unwrap();
-            if v.get("id") == Some(&json!(22)) {
-                final_resp = Some(v);
-            }
-        }
-        assert_eq!(final_resp.expect("final response")["error"]["code"], json!(-32603));
-        let events = drain_events(&mut h.event_rx);
-        assert_eq!(events.len(), 2, "the prompt, then the cancel: {events:?}");
-        assert_eq!(events[1].content.text, "/cancel");
-        assert_eq!(events[1].platform, "acp");
-        assert_eq!(events[1].channel.id, h.channel_id, "must cancel this turn's session");
-        assert_ne!(events[1].event_id, h.turn_id, "the cancel is its own event");
-        let g = h.sessions.lock().await;
-        assert!(!g.get(&h.sid).unwrap().busy, "the session is released after the cancel");
-    }
-
-    // A client `session/cancel` likewise stops the backend turn, not just the gateway stream.
-    #[tokio::test]
-    async fn client_cancel_cancels_the_backend_turn() {
-        let mut h = start_prompt(json!(23)).await;
-        h.cancel.notify_one();
-        h.handle.await.unwrap();
-        let events = drain_events(&mut h.event_rx);
-        assert_eq!(events.last().map(|e| e.content.text.as_str()), Some("/cancel"));
-        assert_eq!(events.last().unwrap().channel.id, h.channel_id);
-    }
-
-    // Core's answer to the `/cancel` (its status line) carries the cancel event's own id as
-    // `reply_to`. It must not leak into a turn started on the same session afterwards.
-    #[tokio::test]
-    async fn the_cancel_status_reply_does_not_reach_the_next_turn() {
-        let registry = new_reply_registry();
-        let (tx, mut rx) = mpsc::unbounded_channel::<ReplyChunk>();
-        registry.lock().unwrap().insert(
-            "acp_chan".into(),
-            ReplySink { turn_id: "evt_next".into(), tx, owner: "conn-test".into(), generation: 0 },
-        );
-        let cancel_id = backend_cancel_event("acp_chan").event_id;
-        handle_reply(&reply("acp_chan", &cancel_id, "🛑 Cancel signal sent.", None), &registry).await;
-        assert!(rx.try_recv().is_err(), "the cancel's status reply must be fenced");
-    }
-
     // Tool progress must leave the sink in place (the answer is still coming) and must not end
     // the turn.
     #[tokio::test]
@@ -4601,6 +4525,22 @@ mod acp_review_fixes {
         );
         assert_eq!(tool_progress_update("tool_call", r#"{"title":"T"}"#), None, "toolCallId is required");
         assert_eq!(tool_progress_update("tool_call", "[1]"), None);
+        // A long title is capped on a char boundary.
+        let long = "é".repeat(MAX_TOOL_TITLE_CHARS + 50);
+        let payload = json!({"toolCallId": "a", "title": long}).to_string();
+        let title = tool_progress_update("tool_call", &payload).unwrap()["title"].as_str().unwrap().to_string();
+        assert_eq!(title.chars().count(), MAX_TOOL_TITLE_CHARS + 1);
+        assert!(title.ends_with('…'));
+        let exact = "x".repeat(MAX_TOOL_TITLE_CHARS);
+        assert_eq!(cap_tool_title(&exact), exact, "at the limit nothing is cut");
+    }
+
+    #[test]
+    fn liveness_tick_margin() {
+        let idle = prompt_idle_timeout_secs();
+        assert!(!liveness_tick_too_slow_for_idle_timeout(idle / 2 - 1));
+        assert!(liveness_tick_too_slow_for_idle_timeout(idle / 2));
+        assert!(liveness_tick_too_slow_for_idle_timeout(idle));
     }
 
     #[test]

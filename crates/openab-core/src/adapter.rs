@@ -945,6 +945,15 @@ impl AdapterRouter {
                     let mut response_error: Option<String> = None;
                     let mut turn_result = TurnResult::default();
                     let prompt_start = tokio::time::Instant::now();
+                    // One interval for the whole turn, not a sleep re-armed per message: a re-armed
+                    // sleep never fires while the agent keeps emitting, so a chatty agent escaped
+                    // the death check, the hard timeout, and (over ACP, where text is send-once)
+                    // the keepalive the gateway's idle timer depends on.
+                    let mut liveness_tick = tokio::time::interval_at(
+                        prompt_start + liveness_check_interval,
+                        liveness_check_interval,
+                    );
+                    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
@@ -975,7 +984,7 @@ impl AdapterRouter {
                                     break;
                                 }
                             },
-                            _ = tokio::time::sleep(liveness_check_interval) => {
+                            _ = liveness_tick.tick() => {
                                 if !conn.alive() {
                                     response_error = Some("Agent process died".into());
                                     conn.abandon_request(request_id).await;
@@ -989,8 +998,9 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
-                                // Agent alive but silent (a long tool, a long generation):
-                                // tell the ACP gateway the turn is still running.
+                                // Agent alive: tell the ACP gateway the turn is still running.
+                                // Sent on every tick, not only when the agent is silent — text
+                                // it streams is held until turn end, so the gateway sees none.
                                 if platform_is_acp {
                                     if let Err(e) = adapter.send_keepalive(&thread_channel).await {
                                         tracing::debug!(error = %e, "keepalive delivery failed");
@@ -2793,10 +2803,9 @@ mod tool_progress_tests {
     }
 
     /// A minimal ACP agent on stdio: answers `initialize` / `session/new`, and on
-    /// `session/prompt` announces one tool (`pending`, the way claude-agent-acp opens a call
-    /// before its input streams in), refines its title, goes silent for 3s (a long tool),
-    /// completes it, then answers.
-    const FAKE_TOOL_AGENT: &str = r#"
+    /// `session/prompt` runs `prompt_body` (which must end by answering `$id`).
+    fn fake_agent(prompt_body: &str) -> String {
+        r#"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
@@ -2805,25 +2814,57 @@ while IFS= read -r line; do
     *'"method":"session/new"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
     *'"method":"session/prompt"'*)
+__PROMPT_BODY__ ;;
+    *) [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__PROMPT_BODY__", prompt_body)
+    }
+
+    /// Announces one tool (`pending`, the way claude-agent-acp opens a call before its input
+    /// streams in), refines its title, goes silent for 3s (a long tool), completes it, then
+    /// answers.
+    const TOOL_TURN: &str = r#"
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Terminal","status":"pending"}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"cargo test","status":"in_progress"}}}'
       sleep 3
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the answer"}}}}'
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
-    *) [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-  esac
-done
-"#;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
+
+    /// Streams a text chunk every 0.3s for `$CHUNKS` chunks — never silent for a whole liveness
+    /// tick — then answers.
+    const CHATTY_TURN: &str = r#"
+      i=0
+      while [ "$i" -lt "$CHUNKS" ]; do
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"."}}}}'
+        sleep 0.3
+        i=$((i+1))
+      done
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
 
     async fn run_turn(platform: &str) -> Arc<RecordingAdapter> {
+        run_turn_with(platform, TOOL_TURN, 10, crate::config::default_prompt_hard_timeout_secs()).await
+    }
+
+    /// One turn against `fake_agent(prompt_body)`, with the liveness tick at 1s.
+    async fn run_turn_with(
+        platform: &str,
+        prompt_body: &str,
+        chunks: u32,
+        prompt_hard_timeout_secs: u64,
+    ) -> Arc<RecordingAdapter> {
         let agent_cfg = crate::config::AgentConfig {
             command: "/bin/sh".into(),
-            args: vec!["-c".into(), FAKE_TOOL_AGENT.into()],
+            args: vec!["-c".into(), fake_agent(prompt_body)],
             working_dir: "/tmp".into(),
-            env: [("PATH".to_string(), "/usr/bin:/bin".to_string())]
-                .into_iter()
-                .collect(),
+            env: [
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("CHUNKS".to_string(), chunks.to_string()),
+            ]
+            .into_iter()
+            .collect(),
             inherit_env: vec![],
             command_explicit: true,
         };
@@ -2841,7 +2882,7 @@ done
                 ..Default::default()
             },
             TableMode::Off,
-            crate::config::default_prompt_hard_timeout_secs(),
+            prompt_hard_timeout_secs,
             1, // liveness tick every 1s, so the 3s silent tool spans several ticks
             std::collections::HashMap::new(),
             std::path::PathBuf::from("/tmp"),
@@ -2921,5 +2962,31 @@ done
             !rec.sent.lock().unwrap().is_empty(),
             "the turn still answers"
         );
+    }
+
+    // An agent that keeps streaming text is never silent for a whole tick. Over ACP that text is
+    // held until turn end, so the keepalive is all the gateway hears — it must still be sent.
+    #[tokio::test]
+    async fn keepalive_is_sent_while_the_agent_keeps_streaming() {
+        let rec = run_turn_with("acp", CHATTY_TURN, 10, crate::config::default_prompt_hard_timeout_secs()).await;
+        assert!(
+            rec.keepalives.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "3s of streaming at 0.3s intervals spans several 1s ticks"
+        );
+        let sent = rec.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "send-once: {sent:?}");
+    }
+
+    // The hard timeout is checked on the same tick, so a chatty agent no longer escapes it.
+    #[tokio::test]
+    async fn hard_timeout_applies_to_an_agent_that_keeps_streaming() {
+        let started = std::time::Instant::now();
+        let rec = run_turn_with("telegram", CHATTY_TURN, 100, 2).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "must not wait for the agent's 30s of output"
+        );
+        let sent = rec.sent.lock().unwrap().join("\n");
+        assert!(sent.contains("hard timeout"), "{sent}");
     }
 }

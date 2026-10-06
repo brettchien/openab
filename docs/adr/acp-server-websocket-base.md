@@ -143,10 +143,12 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   a `GatewayReply` with `command = "keepalive"` (no content). The ACP server maps it to
   `ReplyChunk::Keepalive`, which restarts the idle wait and is **not** forwarded to the
   client. So the idle timeout effectively detects "core or its connection is gone", and a
-  stuck-but-alive agent is bounded by core's own `prompt_hard_timeout_secs` (30 min) —
-  the same bound every other platform has. `liveness_check_secs` must stay beneath the
-  idle timeout. (Same idea as Hermes heartbeating a running tool; OpenClaw instead defers
-  its watchdog while a tool is active.)
+  stuck-but-alive agent is bounded by core's own `prompt_hard_timeout_secs` (default 30 min) —
+  the same bound every other platform has. `liveness_check_secs` must stay below half the
+  idle timeout (startup warns otherwise). The tick is one interval for the whole turn, so it
+  also fires while the agent streams text, which over ACP the gateway does not see. (Same
+  idea as Hermes heartbeating a running tool; OpenClaw instead defers its watchdog while a
+  tool is active.)
 
 ### Concurrency, caps & reply fencing
 
@@ -161,14 +163,14 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   `GatewayReply.reply_to`); `handle_reply` drops a reply whose `reply_to` no longer
   matches the active turn, so a late reply from the superseded turn cannot leak into the
   new prompt's stream.
-- **Backend cancel propagation** — when a prompt times out or the client sends
-  `session/cancel`, the server also emits a `/cancel` `GatewayEvent` on the turn's channel
-  (core's existing slash command: intercepted before dispatch, so it reaches a busy
-  session, and gated like the prompt itself). It is sent before the session's `busy` flag
-  is released, so the next prompt cannot be dispatched ahead of it. Core's status reply to
-  it carries the cancel event's own id and is dropped by the fence above. The inflight cap
-  still counts *gateway* stream tasks; cancellation is best-effort (an agent that ignores
-  `session/cancel` keeps running until core's own hard timeout).
+- **Backend work is not yet cancelled on client cancel** — the inflight cap counts
+  *gateway* stream tasks, not downstream agent work. A client `session/cancel` ends the
+  gateway stream, but the turn keeps running in core until it finishes or hits core's hard
+  timeout; a `prompt → cancel` loop can therefore queue backend work beyond the 32 cap.
+  Bounding this needs turn-scoped agent→core cancel propagation (brettchien/openab#4 — a
+  thread-scoped `/cancel` can race the next prompt in unified mode). An idle timeout needs
+  no cancel: with the keepalive below it only fires when core or its connection is gone.
+  The fence above still prevents late output from corrupting a later turn.
 
 ### Session ↔ core mapping
 
