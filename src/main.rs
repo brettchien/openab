@@ -1462,6 +1462,11 @@ async fn main() -> anyhow::Result<()> {
                 ) {
                     Ok(()) => {
                         info!("unified: ACP server endpoint enabled at /acp");
+                        // Only where /acp is actually served: a deploy without ACP has no
+                        // idle timeout for the liveness tick to undercut.
+                        openab_gateway::adapters::acp_server::warn_if_liveness_tick_too_slow(
+                            cfg.pool.liveness_check_secs,
+                        );
                         app = app.route(
                             "/acp",
                             axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
@@ -1863,6 +1868,12 @@ mod tests {
         assert!(
             !openab_gateway::adapters::acp_server::tunnel_timeout_is_ineffective(default),
             "the shipped default must not be a value the startup warning fires on"
+        );
+        assert!(
+            !openab_gateway::adapters::acp_server::liveness_tick_too_slow_for_idle_timeout(
+                openab_core::config::PoolConfig::default().liveness_check_secs
+            ),
+            "the shipped liveness tick must leave keepalives margin under the ACP idle timeout"
         );
     }
 

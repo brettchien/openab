@@ -104,10 +104,11 @@ pub struct McpFacadeConfig {
     /// wins the turn simply ends, which leaves exactly the stranded work on the extension that
     /// cancellation exists to prevent.
     ///
-    /// **180s is therefore the effective ceiling.** A larger value here is not an error and is not
-    /// clamped, but it cannot take effect: the idle timeout is not operator-configurable, so the turn
-    /// ends there first and this setting stops mattering. Startup warns when it is set that high
-    /// rather than letting the number look effective.
+    /// **The idle timeout (180s by default) is therefore the effective ceiling.** A larger value
+    /// here is not an error and is not clamped, but it cannot take effect: the turn ends there
+    /// first and this setting stops mattering. Raise the idle timeout itself with
+    /// `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS` to go higher. Startup warns when this is set at or
+    /// above it rather than letting the number look effective.
     ///
     /// The check lives in the gateway, beside the constant, as
     /// `warn_if_tunnel_timeout_is_ineffective`; the binary only hands it this value. That keeps the
@@ -115,8 +116,8 @@ pub struct McpFacadeConfig {
     /// single edit. It does not remove coupling: this crate cannot see the constant, since
     /// `openab-gateway` does not depend on `openab-core`, and the gateway never sees this value. The
     /// binary is the only place both are visible, and it already depends on the gateway. Moving the
-    /// constant into this crate would ADD a dependency edge to save nothing. Earlier wording said to "raise both, in that
-    /// order" — there is no second knob to raise, so that instruction could not be followed.
+    /// constant into this crate would ADD a dependency edge to save nothing. To raise both, raise
+    /// the idle timeout first, then this value, keeping it strictly beneath.
     #[serde(default = "default_tunnel_timeout_seconds")]
     pub tunnel_timeout_seconds: u64,
 }

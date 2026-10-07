@@ -44,16 +44,84 @@ const MAX_INFLIGHT_PROMPTS: usize = 32;
 /// client had not reached, for work it had not asked for. `MAX_ACP_SERVERS_PER_SESSION` bounds one
 /// session's declarations; this bounds every session's establishes on a connection at once.
 const MAX_INFLIGHT_ESTABLISHES: usize = 64;
-/// Per-chunk idle timeout for a prompt turn, in `handle_session_prompt`.
+/// Default per-chunk idle timeout for a prompt turn, in `handle_session_prompt`.
 ///
 /// Named rather than left inline because it is the effective ceiling on anything a turn waits for:
 /// the tunnel's own timeout has to stay strictly beneath it, and `[mcp] tunnel_timeout_seconds`
 /// documents itself against this value. As a bare literal in the middle of a loop it was invisible
 /// to exactly the person who needed it — the operator raising the tunnel timeout into it.
 ///
-/// Not operator-configurable today. Anything set above it is silently capped here, which is why the
-/// config path warns rather than letting a larger value look effective.
+/// "Idle" means no chunk of any kind: core sends the answer text once at turn end, but forwards
+/// tool progress (`tool_call` / `tool_call_update`) as it happens, and while the agent is alive
+/// but silent it sends a `keepalive` on every liveness tick (`[pool] liveness_check_secs`, 30s by
+/// default — keep it beneath this value). So in practice this fires when core or its connection
+/// is gone; a stuck-but-alive agent is bounded by core's own `prompt_hard_timeout_secs`. Override with `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS`; the effective
+/// value is [`prompt_idle_timeout_secs`].
 pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
+
+/// Env override for [`ACP_PROMPT_IDLE_TIMEOUT_SECS`].
+pub const ACP_PROMPT_IDLE_TIMEOUT_ENV: &str = "OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS";
+
+/// Parse an idle-timeout override. Unset, unparsable, or `0` (which would time out every turn
+/// before its first chunk) falls back to the default; the `Err` carries the rejected value so the
+/// caller can warn once.
+fn parse_prompt_idle_timeout(raw: Option<&str>) -> Result<u64, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(ACP_PROMPT_IDLE_TIMEOUT_SECS),
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(v.to_string()),
+        },
+    }
+}
+
+/// Effective per-chunk idle timeout, resolved once from [`ACP_PROMPT_IDLE_TIMEOUT_ENV`].
+pub fn prompt_idle_timeout_secs() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var(ACP_PROMPT_IDLE_TIMEOUT_ENV).ok();
+        parse_prompt_idle_timeout(raw.as_deref()).unwrap_or_else(|bad| {
+            warn!(
+                value = %bad,
+                default = ACP_PROMPT_IDLE_TIMEOUT_SECS,
+                "{ACP_PROMPT_IDLE_TIMEOUT_ENV} must be a positive integer of seconds; using the default"
+            );
+            ACP_PROMPT_IDLE_TIMEOUT_SECS
+        })
+    })
+}
+
+/// Default interval, in seconds, between the server's own WebSocket pings.
+///
+/// Edge proxies cut a WebSocket that carries no frame for a while — Cloudflare at about 100s (E2E
+/// T7: a client that sent no pings was dropped ~126s after the last frame, mid-turn). Keepalives
+/// stop at the gateway and are never forwarded, a browser cannot send a WS ping, and a client may
+/// pause its own heartbeat during a turn, so a long silent tool left the socket idle end to end.
+/// A server ping is transport-level traffic every client already answers (browsers send the pong
+/// themselves), so it needs no protocol change. 30s leaves room for a late tick under 100s.
+pub const ACP_WS_PING_SECS: u64 = 30;
+
+/// Env override for [`ACP_WS_PING_SECS`]. `0` turns server pings off.
+pub const ACP_WS_PING_ENV: &str = "OPENAB_ACP_WS_PING_SECS";
+
+/// Parse a ping-interval override. Unset or empty falls back to the default; `0` is valid and
+/// means off. The `Err` carries the rejected value so the caller can warn once.
+fn parse_ws_ping_secs(raw: Option<&str>) -> Result<u64, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(ACP_WS_PING_SECS),
+        Some(v) => v.parse::<u64>().map_err(|_| v.to_string()),
+    }
+}
+
+/// Resolves when the next server ping is due; never, when pings are off.
+async fn next_ws_ping(ping: &mut Option<tokio::time::Interval>) {
+    match ping {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
 
 /// Whether a configured tunnel timeout is overtaken by the idle timeout, and so cannot decide the
 /// outcome.
@@ -62,7 +130,7 @@ pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 /// interesting part is one comparison, and an inverted `>=` would be silent in exactly the case it
 /// exists to report.
 pub fn tunnel_timeout_is_ineffective(configured_secs: u64) -> bool {
-    configured_secs >= ACP_PROMPT_IDLE_TIMEOUT_SECS
+    configured_secs >= prompt_idle_timeout_secs()
 }
 
 /// Warn when a configured tunnel timeout cannot take effect because the idle timeout above overtakes
@@ -78,12 +146,37 @@ pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
     if tunnel_timeout_is_ineffective(configured_secs) {
         warn!(
             configured = configured_secs,
-            effective_ceiling = ACP_PROMPT_IDLE_TIMEOUT_SECS,
-            "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout, which is not \
-             configurable — the turn ends there first, so this value cannot take effect"
+            effective_ceiling = prompt_idle_timeout_secs(),
+            "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout \
+             ({ACP_PROMPT_IDLE_TIMEOUT_ENV}) — the turn ends there first, so this value cannot \
+             take effect"
         );
     }
 }
+
+/// Whether core's liveness tick is too slow to keep an idle-but-alive ACP turn open.
+///
+/// Keepalives ride `[pool] liveness_check_secs`, and each one has to land inside the idle window.
+/// Merely "beneath" leaves no room for a single late tick, so this asks for less than half.
+pub fn liveness_tick_too_slow_for_idle_timeout(liveness_check_secs: u64) -> bool {
+    liveness_check_secs.saturating_mul(2) >= prompt_idle_timeout_secs()
+}
+
+/// Warn when `[pool] liveness_check_secs` leaves keepalives too little margin under the ACP idle
+/// timeout. Same split as [`warn_if_tunnel_timeout_is_ineffective`]: the comparison lives beside
+/// the timeout, the binary only hands over the configured value.
+pub fn warn_if_liveness_tick_too_slow(liveness_check_secs: u64) {
+    if liveness_tick_too_slow_for_idle_timeout(liveness_check_secs) {
+        warn!(
+            liveness_check_secs,
+            idle_timeout_secs = prompt_idle_timeout_secs(),
+            "[pool] liveness_check_secs is at or above half the ACP prompt idle timeout \
+             ({ACP_PROMPT_IDLE_TIMEOUT_ENV}) — keepalives may arrive too late and silent ACP \
+             turns can time out"
+        );
+    }
+}
+
 /// Cap on `type:acp` servers a single session may declare (review R3-F1).
 ///
 /// Every declaration costs a spawned task, a pending `mcp/connect` holding a 30s timeout, and an
@@ -168,6 +261,8 @@ pub struct AcpConfig {
     /// `OPENAB_ACP_ALLOWED_ORIGINS`, comma-separated). Empty by default → every
     /// browser-set `Origin` is rejected; non-browser clients (no `Origin`) are unaffected.
     pub allowed_origins: Vec<String>,
+    /// Seconds between server WebSocket pings (`OPENAB_ACP_WS_PING_SECS`); `0` = off.
+    pub ws_ping_secs: u64,
 }
 
 impl AcpConfig {
@@ -209,9 +304,19 @@ impl AcpConfig {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let ws_ping_secs = parse_ws_ping_secs(std::env::var(ACP_WS_PING_ENV).ok().as_deref())
+            .unwrap_or_else(|bad| {
+                warn!(
+                    value = %bad,
+                    default = ACP_WS_PING_SECS,
+                    "{ACP_WS_PING_ENV} must be a whole number of seconds (0 = off); using the default"
+                );
+                ACP_WS_PING_SECS
+            });
         Some(Self {
             auth_key,
             allowed_origins,
+            ws_ping_secs,
         })
     }
 }
@@ -396,6 +501,12 @@ fn accept_acp_servers(servers: Vec<AcpMcpServer>) -> Result<Vec<AcpMcpServer>, S
 pub enum ReplyChunk {
     /// Incremental text snapshot (full text so far)
     Text(String),
+    /// A complete ACP `session/update` body (`tool_call` / `tool_call_update`) to forward
+    /// as-is. Carries no answer text, so it never moves the text delta cursor.
+    Update(Value),
+    /// Core's liveness tick: the turn is still running (agent alive but silent). Resets the
+    /// idle timer; never forwarded to the client.
+    Keepalive,
     /// Agent finished responding
     Done,
 }
@@ -1343,6 +1454,34 @@ fn spawn_acp_tunnels(
     }
 }
 
+/// Why a connection's read loop ended, logged once at disconnect. Without it every teardown read
+/// the same "ACP client disconnected", and a drop with no close frame could not be told apart
+/// from the gateway hanging up, a reset, or a proxy in front of us timing the connection out.
+#[derive(Debug, PartialEq)]
+enum ReadLoopExit {
+    /// The client sent a Close frame (its code, if it gave one).
+    ClientClose(Option<u16>),
+    /// The stream ended without a Close frame: the transport, or a proxy on the path, went away.
+    StreamEnded,
+    /// The WebSocket layer reported an error (connection reset, protocol violation).
+    ReadError(String),
+    /// Server-initiated: an inbound frame exceeded [`MAX_FRAME_BYTES`]. The only exit where the
+    /// gateway hangs up, so the only one that owes the client a Close frame.
+    FrameTooLarge,
+}
+
+impl std::fmt::Display for ReadLoopExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientClose(Some(code)) => write!(f, "client close frame (code {code})"),
+            Self::ClientClose(None) => write!(f, "client close frame (no code)"),
+            Self::StreamEnded => write!(f, "stream ended without a close frame"),
+            Self::ReadError(e) => write!(f, "read error: {e}"),
+            Self::FrameTooLarge => write!(f, "inbound frame too large (closed by gateway)"),
+        }
+    }
+}
+
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
@@ -1381,24 +1520,89 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // Channel for sending messages back to the client
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
+    // `close_rx` lets teardown hand the writer a Close frame for a gateway-initiated hang-up.
+    let (close_tx, mut close_rx) = oneshot::channel::<axum::extract::ws::CloseFrame>();
+
     // Forward outbound messages to WebSocket. Single choke point for every outbound
     // frame, so trace here rather than at each send site.
     let send_conn = connection_id.clone();
+    // Milliseconds since `connected_at` of the last frame the writer delivered, for the
+    // disconnect log. Shared with the writer task, so an atomic rather than an `Instant`.
+    let connected_at = std::time::Instant::now();
+    let last_outbound_ms = Arc::new(AtomicU64::new(0));
+    let send_last_outbound = last_outbound_ms.clone();
+    // Server pings keep an edge proxy from cutting a socket that is quiet in both directions
+    // (see `ACP_WS_PING_SECS`). They are not counted in `last_outbound_ms`, which stays "last data
+    // frame" so the disconnect log still shows how long the client had heard nothing real.
+    let ping_secs = state
+        .acp
+        .as_ref()
+        .map_or(ACP_WS_PING_SECS, |c| c.ws_ping_secs);
+    let mut ping = (ping_secs > 0).then(|| {
+        let period = std::time::Duration::from_secs(ping_secs);
+        let mut i = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        i
+    });
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if trace {
-                debug!(connection = %send_conn, dir = "out", frame = %trace_frame(&msg), "ACP frame");
-            }
-            if ws_tx.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        // A oneshot must not be polled again once resolved; teardown dropping `close_tx` resolves it.
+        let mut close_pending = true;
+        loop {
+            tokio::select! {
+                _ = next_ws_ping(&mut ping) => {
+                    if let Err(e) = ws_tx.send(Message::Ping(Default::default())).await {
+                        warn!(connection = %send_conn, error = %e, "ACP outbound ping failed; writer stopped");
+                        break;
+                    }
+                }
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if trace {
+                        debug!(connection = %send_conn, dir = "out", frame = %trace_frame(&msg), "ACP frame");
+                    }
+                    if let Err(e) = ws_tx.send(Message::Text(msg.into())).await {
+                        // The read loop keeps running after this, so outbound frames from here on
+                        // are lost without trace unless it is said here.
+                        warn!(connection = %send_conn, error = %e, "ACP outbound send failed; writer stopped");
+                        break;
+                    }
+                    send_last_outbound
+                        .store(connected_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+                }
+                close = &mut close_rx, if close_pending => {
+                    close_pending = false;
+                    if let Ok(frame) = close {
+                        let _ = ws_tx.send(Message::Close(Some(frame))).await;
+                        break;
+                    }
+                }
             }
         }
     });
 
+    // Liveness bookkeeping for the disconnect log: when the last frame of any kind arrived, and
+    // whether the client's WS pings were still reaching us.
+    let mut last_inbound = std::time::Instant::now();
+    let mut last_ping: Option<std::time::Instant> = None;
+    let mut pings: u64 = 0;
+
     // Process incoming messages
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let Message::Text(text) = msg else {
-            continue;
+    let exit = loop {
+        let msg = match ws_rx.next().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => break ReadLoopExit::ReadError(e.to_string()),
+            None => break ReadLoopExit::StreamEnded,
+        };
+        last_inbound = std::time::Instant::now();
+        let text = match msg {
+            Message::Text(text) => text,
+            Message::Ping(_) => {
+                pings += 1;
+                last_ping = Some(last_inbound);
+                continue;
+            }
+            Message::Close(frame) => break ReadLoopExit::ClientClose(frame.map(|f| f.code)),
+            _ => continue,
         };
 
         // Bound inbound frame size before parsing. An oversized frame can't be parsed,
@@ -1412,7 +1616,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 max = MAX_FRAME_BYTES,
                 "ACP frame too large; closing connection"
             );
-            break;
+            break ReadLoopExit::FrameTooLarge;
         }
 
         if trace {
@@ -1855,7 +2059,25 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         // Clean up finished tasks (both sets)
         prompt_tasks.retain(|h| !h.is_finished());
         establish_tasks.retain(|h| !h.is_finished());
-    }
+    };
+
+    // One line that says why the connection ended and how quiet it had been. `idle_secs` against
+    // the edge proxy's idle limit, and `last_ping_secs` against the client's ping interval, are what
+    // separate a proxy timeout from a client that stopped pinging from the gateway hanging up.
+    // `out_idle_secs` is the same for the writer: how long since a frame last went out.
+    prompt_tasks.retain(|h| !h.is_finished());
+    let out_idle_ms = (connected_at.elapsed().as_millis() as u64)
+        .saturating_sub(last_outbound_ms.load(Ordering::Relaxed));
+    info!(
+        connection = %connection_id,
+        reason = %exit,
+        idle_secs = last_inbound.elapsed().as_secs(),
+        out_idle_secs = out_idle_ms / 1000,
+        last_ping_secs = ?last_ping.map(|t| t.elapsed().as_secs()),
+        pings,
+        inflight_prompts = prompt_tasks.len(),
+        "ACP read loop ended"
+    );
 
     // Drain any in-flight server-initiated requests: dropping each oneshot sender makes the
     // corresponding `send_request` awaiter resolve to "connection closed before response"
@@ -1903,7 +2125,23 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         "ACP connection cleanup complete"
     );
 
-    send_task.abort();
+    if exit == ReadLoopExit::FrameTooLarge {
+        // The gateway is the one hanging up, so say so (1009 Message Too Big) instead of
+        // dropping the socket — a bare drop is indistinguishable from a network cut client-side.
+        let _ = close_tx.send(axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::SIZE,
+            reason: "frame too large".into(),
+        });
+        let mut send_task = send_task;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut send_task)
+            .await
+            .is_err()
+        {
+            send_task.abort();
+        }
+    } else {
+        send_task.abort();
+    }
     info!(connection = %connection_id, "ACP client disconnected");
 }
 
@@ -2352,7 +2590,7 @@ async fn handle_session_prompt(
 
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
-    let timeout = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS);
+    let timeout = tokio::time::Duration::from_secs(prompt_idle_timeout_secs());
     // Typed StopReason (T2.1) so the final PromptResponse is constructed from acp_schema.
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
@@ -2388,6 +2626,21 @@ async fn handle_session_prompt(
                         };
                         let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
                     }
+                    Ok(Some(ReplyChunk::Update(update))) => {
+                        // Tool progress. Arriving at all is what resets the idle timer.
+                        let notification = JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".into(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": update,
+                            }),
+                        };
+                        let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+                    }
+                    // Core is alive and the turn is still running; nothing to tell the client.
+                    // Receiving it already restarted the idle wait.
+                    Ok(Some(ReplyChunk::Keepalive)) => {}
                     Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
                     Err(_) => {
                         warn!(session = %redact_id(&session_id), "ACP: prompt timed out waiting for reply");
@@ -2526,6 +2779,20 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             Some(sink) if reply.reply_to.is_empty() || reply.reply_to == sink.turn_id => {
                 sink.tx.clone()
             }
+            // Keepalives pass the fence. After a cancel the superseded turn can still be running in
+            // core, and the next prompt is queued behind it; that turn's keepalives are the only
+            // sign core is alive, and dropping them timed the queued prompt out at one idle window
+            // (E2E T4). A keepalive has no content, so nothing from the old turn reaches the client;
+            // the fence still drops its text and tool progress below.
+            Some(sink) if reply.command.as_deref() == Some("keepalive") => {
+                debug!(
+                    channel = key,
+                    from_turn = %reply.reply_to,
+                    active_turn = %sink.turn_id,
+                    "ACP keepalive from a superseded turn; core still busy, active prompt is queued behind it"
+                );
+                sink.tx.clone()
+            }
             Some(_) => {
                 debug!(channel = key, "ACP dropping stale reply from a superseded turn");
                 return;
@@ -2548,11 +2815,65 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             let _ = tx.send(ReplyChunk::Done);
             registry.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
         }
+        Some(kind @ ("tool_call" | "tool_call_update")) => {
+            // Mid-turn tool progress. The sink stays registered: the answer is still to come.
+            match tool_progress_update(kind, &full_text) {
+                Some(update) => {
+                    if tx.send(ReplyChunk::Update(update)).is_err() {
+                        debug!(
+                            channel = key,
+                            "ACP tool progress send failed (client likely disconnected)"
+                        );
+                    }
+                }
+                None => debug!(
+                    channel = key,
+                    command = kind,
+                    "ACP dropping malformed tool progress"
+                ),
+            }
+        }
+        Some("keepalive") => {
+            let _ = tx.send(ReplyChunk::Keepalive);
+        }
         Some("add_reaction") | Some("remove_reaction") => {
             // Reactions are agent state indicators — could map to notifications later
         }
         _ => {}
     }
+}
+
+/// Longest tool title forwarded to a client, in chars. Agents may put a whole shell command (or
+/// heredoc) in the title; a client renders it as a one-line chip, so the tail is noise.
+const MAX_TOOL_TITLE_CHARS: usize = 200;
+
+fn cap_tool_title(title: &str) -> String {
+    match title.char_indices().nth(MAX_TOOL_TITLE_CHARS) {
+        Some((cut, _)) => format!("{}…", &title[..cut]),
+        None => title.to_string(),
+    }
+}
+
+/// Turn a core tool-progress payload (`{toolCallId, title?, status}`, the ACP update body minus
+/// its discriminator) into a `session/update` `update` object. Only the fields this server vouches
+/// for are copied, so the emitted shape is exactly what the conformance tests pin. `None` when the
+/// payload is not an object with a string `toolCallId`, or a `tool_call` lacks its required
+/// `title`.
+fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
+    let p: Value = serde_json::from_str(payload).ok()?;
+    let tool_call_id = p.get("toolCallId")?.as_str()?;
+    let mut update = json!({ "sessionUpdate": kind, "toolCallId": tool_call_id });
+    match p.get("title").and_then(Value::as_str) {
+        Some(title) => update["title"] = json!(cap_tool_title(title)),
+        None if kind == "tool_call" => return None,
+        None => {}
+    }
+    if let Some(status) = p.get("status").and_then(Value::as_str) {
+        if matches!(status, "pending" | "in_progress" | "completed" | "failed") {
+            update["status"] = json!(status);
+        }
+    }
+    Some(update)
 }
 
 // ---------------------------------------------------------------------------
@@ -2634,6 +2955,23 @@ mod acp_conformance {
                 "content": { "type": "text", "text": "PONG 你好 (๑•̀ㅂ•́)و" }
             }
         }));
+    }
+
+    #[test]
+    fn tool_call_session_updates() {
+        // mirror of the prompt loop's ReplyChunk::Update arm, fed by tool_progress_update
+        for (kind, payload) in [
+            ("tool_call", r#"{"toolCallId":"t1","title":"Terminal","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","title":"cargo test","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","status":"completed"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","status":"failed"}"#),
+        ] {
+            let update = super::tool_progress_update(kind, payload).expect("valid progress");
+            conforms::<sc::SessionNotification>(json!({
+                "sessionId": "sess_00000000-0000-0000-0000-000000000000",
+                "update": update,
+            }));
+        }
     }
 
     // --- inbound requests (params clients send) ---
@@ -4196,6 +4534,267 @@ mod acp_review_fixes {
         assert_eq!(final_stop.as_deref(), Some("end_turn"), "a completed turn ends end_turn");
     }
 
+    /// Prompt-loop harness: one reserved session, the handler spawned, and its reply sink's
+    /// turn id once registered.
+    struct PromptHarness {
+        registry: AcpReplyRegistry,
+        channel_id: String,
+        // Held so the prompt's own event has a receiver to be dispatched to.
+        _event_rx: tokio::sync::broadcast::Receiver<String>,
+        out_rx: mpsc::UnboundedReceiver<String>,
+        handle: tokio::task::JoinHandle<()>,
+        turn_id: String,
+    }
+
+    async fn start_prompt(request_id: Value) -> PromptHarness {
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let registry = new_reply_registry();
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(registry.clone());
+        let state = Arc::new(st);
+
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let channel_id = format!("acp_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()) },
+        );
+
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+        let (st2, sessions2, sid2) = (state.clone(), sessions.clone(), sid.clone());
+        let handle = tokio::spawn(async move {
+            let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
+            handle_session_prompt(&st2, &sessions2, request_id, Some(&params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
+                .await;
+        });
+
+        let mut turn_id = None;
+        for _ in 0..10_000 {
+            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+                turn_id = Some(t);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let turn_id = turn_id.expect("handler must register a reply sink");
+        PromptHarness { registry, channel_id, _event_rx: event_rx, out_rx, handle, turn_id }
+    }
+
+    // P0 — over ACP the answer is send-once, so a long tool-heavy turn used to send nothing for
+    // longer than the idle timeout and die with -32603. Tool progress now arrives mid-turn and
+    // resets the timer: a turn spanning several idle windows completes, the client sees each tool
+    // event in order, and the answer is still exactly one terminal `agent_message_chunk` — which is
+    // all a client that ignores tool updates (katashiro, Studio) needs.
+    #[tokio::test(start_paused = true)]
+    async fn tool_progress_keeps_a_long_turn_alive_and_the_answer_stays_one_chunk() {
+        let mut h = start_prompt(json!(21)).await;
+        let step = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS * 2 / 3);
+        let progress = [
+            ("tool_call", r#"{"toolCallId":"t1","title":"Terminal","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","title":"cargo test","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","status":"completed"}"#),
+        ];
+        for (cmd, payload) in progress {
+            tokio::time::sleep(step).await;
+            handle_reply(&reply(&h.channel_id, &h.turn_id, payload, Some(cmd)), &h.registry).await;
+        }
+        tokio::time::sleep(step).await;
+        // 4 × (2/3 idle window) — well past one idle timeout in total.
+        handle_reply(&reply(&h.channel_id, &h.turn_id, "done", None), &h.registry).await;
+        h.handle.await.unwrap();
+
+        let mut updates = Vec::new();
+        let mut final_resp = None;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["method"] == json!("session/update") {
+                updates.push(v["params"]["update"].clone());
+            }
+            if v.get("id") == Some(&json!(21)) {
+                final_resp = Some(v);
+            }
+        }
+        let resp = final_resp.expect("prompt must produce a final response");
+        assert_eq!(resp["result"]["stopReason"], json!("end_turn"), "must not time out: {resp}");
+        let kinds: Vec<&str> = updates.iter().map(|u| u["sessionUpdate"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["tool_call", "tool_call_update", "tool_call_update", "agent_message_chunk"],
+            "tool progress first, in order, then the answer once"
+        );
+        assert_eq!(updates[0], json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"Terminal","status":"in_progress"}));
+        assert_eq!(updates[2], json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}));
+        assert_eq!(updates[3]["content"]["text"], json!("done"));
+    }
+
+    // A single long tool (a build, a test run) — or a long generation — is silent from the
+    // agent's side. Core's liveness tick sends `keepalive` while the agent is alive; that keeps
+    // the turn going past many idle windows and is never forwarded to the client.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_carries_a_silent_turn_and_is_not_forwarded() {
+        let mut h = start_prompt(json!(24)).await;
+        let tick = tokio::time::Duration::from_secs(30);
+        let ticks = ACP_PROMPT_IDLE_TIMEOUT_SECS * 3 / 30; // 3 idle windows of silence
+        for _ in 0..ticks {
+            tokio::time::sleep(tick).await;
+            handle_reply(&reply(&h.channel_id, &h.turn_id, "", Some("keepalive")), &h.registry).await;
+        }
+        handle_reply(&reply(&h.channel_id, &h.turn_id, "built", None), &h.registry).await;
+        h.handle.await.unwrap();
+        let mut updates = Vec::new();
+        let mut stop = None;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["method"] == json!("session/update") {
+                updates.push(v["params"]["update"]["sessionUpdate"].clone());
+            }
+            if v.get("id") == Some(&json!(24)) {
+                stop = Some(v);
+            }
+        }
+        assert_eq!(stop.expect("final response")["result"]["stopReason"], json!("end_turn"));
+        assert_eq!(updates, vec![json!("agent_message_chunk")], "keepalives must not reach the client");
+    }
+
+    // When keepalives stop (core gone), the plain idle timeout applies from the last one.
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_counts_from_the_last_keepalive() {
+        let h = start_prompt(json!(25)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(100)).await;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, "", Some("keepalive")), &h.registry).await;
+        let last = tokio::time::Instant::now();
+        h.handle.await.unwrap();
+        let waited = last.elapsed().as_secs();
+        assert!(
+            (ACP_PROMPT_IDLE_TIMEOUT_SECS..ACP_PROMPT_IDLE_TIMEOUT_SECS + 5).contains(&waited),
+            "times out one idle window after the last keepalive (waited {waited}s)"
+        );
+    }
+
+    // E2E T4: after a cancel the old turn keeps running in core and the next prompt queues behind
+    // it. The old turn's keepalives carry its own origin id; they must still hold the queued
+    // prompt open, while its text stays fenced out.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_from_a_superseded_turn_carries_the_queued_prompt() {
+        let mut h = start_prompt(json!(26)).await;
+        let old_turn = "evt_superseded";
+        let tick = tokio::time::Duration::from_secs(30);
+        for _ in 0..(ACP_PROMPT_IDLE_TIMEOUT_SECS * 3 / 30) {
+            tokio::time::sleep(tick).await;
+            handle_reply(
+                &reply(&h.channel_id, old_turn, "", Some("keepalive")),
+                &h.registry,
+            )
+            .await;
+        }
+        // The old turn finishes: its answer is fenced, then the queued prompt runs and answers.
+        handle_reply(
+            &reply(&h.channel_id, old_turn, "stale answer", None),
+            &h.registry,
+        )
+        .await;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, "HI", None), &h.registry).await;
+        h.handle.await.unwrap();
+        let mut texts = Vec::new();
+        let mut stop = None;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["method"] == json!("session/update") {
+                texts.push(v["params"]["update"]["content"]["text"].clone());
+            }
+            if v.get("id") == Some(&json!(26)) {
+                stop = Some(v);
+            }
+        }
+        assert_eq!(
+            stop.expect("final response")["result"]["stopReason"],
+            json!("end_turn")
+        );
+        assert_eq!(
+            texts,
+            vec![json!("HI")],
+            "only the active turn's answer reaches the client"
+        );
+    }
+
+    #[test]
+    fn ws_ping_interval_parses_zero_as_off_and_rejects_junk() {
+        assert_eq!(parse_ws_ping_secs(None), Ok(ACP_WS_PING_SECS));
+        assert_eq!(parse_ws_ping_secs(Some(" ")), Ok(ACP_WS_PING_SECS));
+        assert_eq!(parse_ws_ping_secs(Some("0")), Ok(0));
+        assert_eq!(parse_ws_ping_secs(Some(" 15 ")), Ok(15));
+        assert_eq!(parse_ws_ping_secs(Some("-1")), Err("-1".into()));
+        assert_eq!(parse_ws_ping_secs(Some("30s")), Err("30s".into()));
+    }
+
+    // Tool progress must leave the sink in place (the answer is still coming) and must not end
+    // the turn.
+    #[tokio::test]
+    async fn tool_progress_keeps_the_reply_sink() {
+        let registry = new_reply_registry();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink { turn_id: "evt_t".into(), tx, owner: "conn-test".into(), generation: 0 },
+        );
+        let payload = r#"{"toolCallId":"t1","title":"Read","status":"in_progress"}"#;
+        handle_reply(&reply("acp_chan", "evt_t", payload, Some("tool_call")), &registry).await;
+        assert!(matches!(rx.try_recv(), Ok(ReplyChunk::Update(_))));
+        assert!(rx.try_recv().is_err(), "no Done after tool progress");
+        assert!(registry.lock().unwrap().contains_key("acp_chan"), "sink must stay registered");
+        // Malformed progress is dropped, not forwarded and not fatal.
+        handle_reply(&reply("acp_chan", "evt_t", "not json", Some("tool_call")), &registry).await;
+        assert!(rx.try_recv().is_err());
+        assert!(registry.lock().unwrap().contains_key("acp_chan"));
+    }
+
+    #[test]
+    fn tool_progress_update_shapes() {
+        // tool_call needs a title.
+        assert_eq!(tool_progress_update("tool_call", r#"{"toolCallId":"a","status":"in_progress"}"#), None);
+        // An update may omit it.
+        assert_eq!(
+            tool_progress_update("tool_call_update", r#"{"toolCallId":"a","status":"failed"}"#),
+            Some(json!({"sessionUpdate":"tool_call_update","toolCallId":"a","status":"failed"}))
+        );
+        // Unknown fields are not forwarded; an unknown status is dropped rather than emitted.
+        assert_eq!(
+            tool_progress_update("tool_call", r#"{"toolCallId":"a","title":"T","status":"weird","x":1}"#),
+            Some(json!({"sessionUpdate":"tool_call","toolCallId":"a","title":"T"}))
+        );
+        assert_eq!(tool_progress_update("tool_call", r#"{"title":"T"}"#), None, "toolCallId is required");
+        assert_eq!(tool_progress_update("tool_call", "[1]"), None);
+        // A long title is capped on a char boundary.
+        let long = "é".repeat(MAX_TOOL_TITLE_CHARS + 50);
+        let payload = json!({"toolCallId": "a", "title": long}).to_string();
+        let title = tool_progress_update("tool_call", &payload).unwrap()["title"].as_str().unwrap().to_string();
+        assert_eq!(title.chars().count(), MAX_TOOL_TITLE_CHARS + 1);
+        assert!(title.ends_with('…'));
+        let exact = "x".repeat(MAX_TOOL_TITLE_CHARS);
+        assert_eq!(cap_tool_title(&exact), exact, "at the limit nothing is cut");
+    }
+
+    #[test]
+    fn liveness_tick_margin() {
+        let idle = prompt_idle_timeout_secs();
+        assert!(!liveness_tick_too_slow_for_idle_timeout(idle / 2 - 1));
+        assert!(liveness_tick_too_slow_for_idle_timeout(idle / 2));
+        assert!(liveness_tick_too_slow_for_idle_timeout(idle));
+    }
+
+    #[test]
+    fn prompt_idle_timeout_override_parsing() {
+        assert_eq!(parse_prompt_idle_timeout(None), Ok(ACP_PROMPT_IDLE_TIMEOUT_SECS));
+        assert_eq!(parse_prompt_idle_timeout(Some("  ")), Ok(ACP_PROMPT_IDLE_TIMEOUT_SECS));
+        assert_eq!(parse_prompt_idle_timeout(Some("900")), Ok(900));
+        assert_eq!(parse_prompt_idle_timeout(Some(" 600 ")), Ok(600));
+        assert!(parse_prompt_idle_timeout(Some("0")).is_err(), "0 would time out every turn");
+        assert!(parse_prompt_idle_timeout(Some("-5")).is_err());
+        assert!(parse_prompt_idle_timeout(Some("3m")).is_err());
+    }
+
     // R17-F3c — a request-shaped `session/cancel` (id present) must NOT be acknowledged with
     // an empty success frame. ACP defines cancel as notification-only, so a request form is a
     // protocol violation → -32600 invalid request, and the cancel signal is not fired.
@@ -4259,6 +4858,10 @@ mod acp_ws_integration {
     /// Serve `/acp` on an ephemeral loopback port. Returns the URL and the tunnel registry, so a
     /// test can drive the server side the way core does.
     async fn serve() -> (String, AcpTunnelRegistry) {
+        serve_with_ping(ACP_WS_PING_SECS).await
+    }
+
+    async fn serve_with_ping(ws_ping_secs: u64) -> (String, AcpTunnelRegistry) {
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let mut state = crate::AppState::test_default(tx);
         state.acp = Some(AcpConfig {
@@ -4266,6 +4869,7 @@ mod acp_ws_integration {
             // what a non-browser client (this test, and the real extension's native host) is.
             auth_key: None,
             allowed_origins: vec![],
+            ws_ping_secs,
         });
         state.acp_reply_registry = Some(new_reply_registry());
         let registry = new_tunnel_registry();
@@ -4417,6 +5021,39 @@ mod acp_ws_integration {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// A client that sends nothing still sees server traffic, so an edge proxy's idle cut (E2E T7)
+    /// never fires on a quiet turn. Read raw frames: `recv` skips pings by design.
+    #[tokio::test]
+    async fn server_pings_a_client_that_sends_nothing() {
+        let (url, _registry) = serve_with_ping(1).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let mut pings = 0;
+        let read = async {
+            while pings < 2 {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Ping(_))) => pings += 1,
+                    Some(Ok(_)) => {}
+                    other => panic!("socket ended before two server pings: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .expect("server must ping an idle client");
+    }
+
+    /// `0` turns server pings off.
+    #[tokio::test]
+    async fn server_pings_can_be_turned_off() {
+        let (url, _registry) = serve_with_ping(0).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_millis(2500), ws.next()).await;
+        assert!(
+            got.is_err(),
+            "no frame expected with pings off, got {got:?}"
+        );
     }
 
     /// The tunnel is not usable until the inner MCP lifecycle has completed.
@@ -5947,22 +6584,20 @@ mod acp_ws_integration {
         send(&mut ws, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "pad": oversized}))
             .await;
 
-        // The connection must go away rather than answer. Bounded so a regression that keeps it
-        // open fails here instead of hanging.
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match ws.next().await {
-                    None => return true,
-                    Some(Err(_)) => return true,
-                    Some(Ok(_)) => return false,
-                }
+        // The connection must go away rather than answer, and with a 1009 Close frame: a bare
+        // drop looks the same client-side as a proxy or network cut. Bounded so a regression that
+        // keeps it open fails here instead of hanging.
+        let close_code = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            match ws.next().await {
+                Some(Ok(WsMessage::Close(frame))) => Ok(frame.map(|f| u16::from(f.code))),
+                other => Err(format!("{other:?}")),
             }
         })
         .await;
         assert_eq!(
-            closed,
-            Ok(true),
-            "a frame over the transport ceiling must close the connection, not answer it"
+            close_code,
+            Ok(Ok(Some(1009))),
+            "a frame over the transport ceiling must close the connection with 1009, not answer it"
         );
     }
 
