@@ -1482,6 +1482,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // Forward outbound messages to WebSocket. Single choke point for every outbound
     // frame, so trace here rather than at each send site.
     let send_conn = connection_id.clone();
+    // Milliseconds since `connected_at` of the last frame the writer delivered, for the
+    // disconnect log. Shared with the writer task, so an atomic rather than an `Instant`.
+    let connected_at = std::time::Instant::now();
+    let last_outbound_ms = Arc::new(AtomicU64::new(0));
+    let send_last_outbound = last_outbound_ms.clone();
     let send_task = tokio::spawn(async move {
         // A oneshot must not be polled again once resolved; teardown dropping `close_tx` resolves it.
         let mut close_pending = true;
@@ -1498,6 +1503,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         warn!(connection = %send_conn, error = %e, "ACP outbound send failed; writer stopped");
                         break;
                     }
+                    send_last_outbound
+                        .store(connected_at.elapsed().as_millis() as u64, Ordering::Relaxed);
                 }
                 close = &mut close_rx, if close_pending => {
                     close_pending = false;
@@ -1994,11 +2001,15 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // One line that says why the connection ended and how quiet it had been. `idle_secs` against
     // the edge proxy's idle limit, and `last_ping_secs` against the client's ping interval, are what
     // separate a proxy timeout from a client that stopped pinging from the gateway hanging up.
+    // `out_idle_secs` is the same for the writer: how long since a frame last went out.
     prompt_tasks.retain(|h| !h.is_finished());
+    let out_idle_ms = (connected_at.elapsed().as_millis() as u64)
+        .saturating_sub(last_outbound_ms.load(Ordering::Relaxed));
     info!(
         connection = %connection_id,
         reason = %exit,
         idle_secs = last_inbound.elapsed().as_secs(),
+        out_idle_secs = out_idle_ms / 1000,
         last_ping_secs = ?last_ping.map(|t| t.elapsed().as_secs()),
         pings,
         inflight_prompts = prompt_tasks.len(),
