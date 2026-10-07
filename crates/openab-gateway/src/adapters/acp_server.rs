@@ -1410,6 +1410,34 @@ fn spawn_acp_tunnels(
     }
 }
 
+/// Why a connection's read loop ended, logged once at disconnect. Without it every teardown read
+/// the same "ACP client disconnected", and a drop with no close frame could not be told apart
+/// from the gateway hanging up, a reset, or a proxy in front of us timing the connection out.
+#[derive(Debug, PartialEq)]
+enum ReadLoopExit {
+    /// The client sent a Close frame (its code, if it gave one).
+    ClientClose(Option<u16>),
+    /// The stream ended without a Close frame: the transport, or a proxy on the path, went away.
+    StreamEnded,
+    /// The WebSocket layer reported an error (connection reset, protocol violation).
+    ReadError(String),
+    /// Server-initiated: an inbound frame exceeded [`MAX_FRAME_BYTES`]. The only exit where the
+    /// gateway hangs up, so the only one that owes the client a Close frame.
+    FrameTooLarge,
+}
+
+impl std::fmt::Display for ReadLoopExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientClose(Some(code)) => write!(f, "client close frame (code {code})"),
+            Self::ClientClose(None) => write!(f, "client close frame (no code)"),
+            Self::StreamEnded => write!(f, "stream ended without a close frame"),
+            Self::ReadError(e) => write!(f, "read error: {e}"),
+            Self::FrameTooLarge => write!(f, "inbound frame too large (closed by gateway)"),
+        }
+    }
+}
+
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
@@ -1448,24 +1476,63 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // Channel for sending messages back to the client
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
+    // `close_rx` lets teardown hand the writer a Close frame for a gateway-initiated hang-up.
+    let (close_tx, mut close_rx) = oneshot::channel::<axum::extract::ws::CloseFrame>();
+
     // Forward outbound messages to WebSocket. Single choke point for every outbound
     // frame, so trace here rather than at each send site.
     let send_conn = connection_id.clone();
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if trace {
-                debug!(connection = %send_conn, dir = "out", frame = %trace_frame(&msg), "ACP frame");
-            }
-            if ws_tx.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        // A oneshot must not be polled again once resolved; teardown dropping `close_tx` resolves it.
+        let mut close_pending = true;
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if trace {
+                        debug!(connection = %send_conn, dir = "out", frame = %trace_frame(&msg), "ACP frame");
+                    }
+                    if let Err(e) = ws_tx.send(Message::Text(msg.into())).await {
+                        // The read loop keeps running after this, so outbound frames from here on
+                        // are lost without trace unless it is said here.
+                        warn!(connection = %send_conn, error = %e, "ACP outbound send failed; writer stopped");
+                        break;
+                    }
+                }
+                close = &mut close_rx, if close_pending => {
+                    close_pending = false;
+                    if let Ok(frame) = close {
+                        let _ = ws_tx.send(Message::Close(Some(frame))).await;
+                        break;
+                    }
+                }
             }
         }
     });
 
+    // Liveness bookkeeping for the disconnect log: when the last frame of any kind arrived, and
+    // whether the client's WS pings were still reaching us.
+    let mut last_inbound = std::time::Instant::now();
+    let mut last_ping: Option<std::time::Instant> = None;
+    let mut pings: u64 = 0;
+
     // Process incoming messages
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let Message::Text(text) = msg else {
-            continue;
+    let exit = loop {
+        let msg = match ws_rx.next().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => break ReadLoopExit::ReadError(e.to_string()),
+            None => break ReadLoopExit::StreamEnded,
+        };
+        last_inbound = std::time::Instant::now();
+        let text = match msg {
+            Message::Text(text) => text,
+            Message::Ping(_) => {
+                pings += 1;
+                last_ping = Some(last_inbound);
+                continue;
+            }
+            Message::Close(frame) => break ReadLoopExit::ClientClose(frame.map(|f| f.code)),
+            _ => continue,
         };
 
         // Bound inbound frame size before parsing. An oversized frame can't be parsed,
@@ -1479,7 +1546,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 max = MAX_FRAME_BYTES,
                 "ACP frame too large; closing connection"
             );
-            break;
+            break ReadLoopExit::FrameTooLarge;
         }
 
         if trace {
@@ -1922,7 +1989,21 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         // Clean up finished tasks (both sets)
         prompt_tasks.retain(|h| !h.is_finished());
         establish_tasks.retain(|h| !h.is_finished());
-    }
+    };
+
+    // One line that says why the connection ended and how quiet it had been. `idle_secs` against
+    // the edge proxy's idle limit, and `last_ping_secs` against the client's ping interval, are what
+    // separate a proxy timeout from a client that stopped pinging from the gateway hanging up.
+    prompt_tasks.retain(|h| !h.is_finished());
+    info!(
+        connection = %connection_id,
+        reason = %exit,
+        idle_secs = last_inbound.elapsed().as_secs(),
+        last_ping_secs = ?last_ping.map(|t| t.elapsed().as_secs()),
+        pings,
+        inflight_prompts = prompt_tasks.len(),
+        "ACP read loop ended"
+    );
 
     // Drain any in-flight server-initiated requests: dropping each oneshot sender makes the
     // corresponding `send_request` awaiter resolve to "connection closed before response"
@@ -1970,7 +2051,23 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         "ACP connection cleanup complete"
     );
 
-    send_task.abort();
+    if exit == ReadLoopExit::FrameTooLarge {
+        // The gateway is the one hanging up, so say so (1009 Message Too Big) instead of
+        // dropping the socket — a bare drop is indistinguishable from a network cut client-side.
+        let _ = close_tx.send(axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::SIZE,
+            reason: "frame too large".into(),
+        });
+        let mut send_task = send_task;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut send_task)
+            .await
+            .is_err()
+        {
+            send_task.abort();
+        }
+    } else {
+        send_task.abort();
+    }
     info!(connection = %connection_id, "ACP client disconnected");
 }
 
@@ -6305,22 +6402,20 @@ mod acp_ws_integration {
         send(&mut ws, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "pad": oversized}))
             .await;
 
-        // The connection must go away rather than answer. Bounded so a regression that keeps it
-        // open fails here instead of hanging.
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match ws.next().await {
-                    None => return true,
-                    Some(Err(_)) => return true,
-                    Some(Ok(_)) => return false,
-                }
+        // The connection must go away rather than answer, and with a 1009 Close frame: a bare
+        // drop looks the same client-side as a proxy or network cut. Bounded so a regression that
+        // keeps it open fails here instead of hanging.
+        let close_code = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            match ws.next().await {
+                Some(Ok(WsMessage::Close(frame))) => Ok(frame.map(|f| u16::from(f.code))),
+                other => Err(format!("{other:?}")),
             }
         })
         .await;
         assert_eq!(
-            closed,
-            Ok(true),
-            "a frame over the transport ceiling must close the connection, not answer it"
+            close_code,
+            Ok(Ok(Some(1009))),
+            "a frame over the transport ceiling must close the connection with 1009, not answer it"
         );
     }
 
