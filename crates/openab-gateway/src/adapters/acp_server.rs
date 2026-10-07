@@ -18,11 +18,13 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
+use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -2854,9 +2856,149 @@ fn cap_tool_title(title: &str) -> String {
     }
 }
 
+/// What a redacted secret is replaced with. A redacted title is itself a fixed point of
+/// [`redact_tool_title`] (re-redacting changes nothing).
+const REDACTED: &str = "***";
+
+/// A secret value after a context prefix (`pre`): double-quoted, single-quoted, or a bare shell
+/// word. The bare form stops at quotes, backslashes, and shell/JSON punctuation so the rest of the
+/// command stays readable.
+macro_rules! secret_value {
+    () => {
+        r#"(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<uq>[^\s"'`\\;&|<>(),}]+))"#
+    };
+}
+
+/// Self-identifying token formats, replaced wholesale. Only the vendor prefix (and, for Discord
+/// bot tokens, the first segment — the base64 bot user id, which is public) survives.
+static TOKEN_RULES: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(token_rules);
+
+fn token_rules() -> Vec<(Regex, &'static str)> {
+    [
+        // PEM private key block (e.g. a heredoc); an unterminated block is redacted to the end.
+        (
+            r"-----BEGIN (?P<k>[A-Z ]*)PRIVATE KEY-----(?s:.*?)(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
+            "-----BEGIN ${k}PRIVATE KEY-----***-----END ${k}PRIVATE KEY-----",
+        ),
+        // GitHub: classic PAT / OAuth / user-to-server / server-to-server / refresh, fine-grained PAT.
+        (r"\b(?P<p>gh[pousr]_)[A-Za-z0-9]{20,}", "${p}***"),
+        (r"\bgithub_pat_[A-Za-z0-9_]{20,}", "github_pat_***"),
+        // Slack bot / user / app / legacy tokens, app-level tokens.
+        (r"\b(?P<p>xox[abposr]-)[A-Za-z0-9-]{10,}", "${p}***"),
+        (r"\bxapp-[A-Za-z0-9-]{10,}", "xapp-***"),
+        // Anthropic (`sk-ant-…`) / OpenAI (`sk-…`, `sk-proj-…`) API keys.
+        (r"\b(?P<p>sk-(?:ant-|proj-)?)[A-Za-z0-9_-]{20,}", "${p}***"),
+        // AWS access key ids (long-term / STS).
+        (r"\b(?P<p>AKIA|ASIA)[0-9A-Z]{16}\b", "${p}***"),
+        // Google API keys.
+        (r"\bAIza[0-9A-Za-z_-]{35}", "AIza***"),
+        // JWTs (header and payload are base64url JSON, so both start with `eyJ`).
+        (r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "eyJ***"),
+        // Discord bot tokens: base64(user id).timestamp.hmac. A snowflake is ASCII digits, so the
+        // first segment starts with M/N/O; the length bounds keep this off ordinary dotted names.
+        (
+            r"\b(?P<id>[MNO][A-Za-z0-9_-]{23,27})\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}",
+            "${id}.***",
+        ),
+    ]
+    .into_iter()
+    .map(|(re, rep)| (Regex::new(re).expect("valid token redaction regex"), rep))
+    .collect()
+}
+
+/// Secrets recognised by their context rather than their shape: the `pre` group is kept, the
+/// value (see [`secret_value!`]) is redacted. The flag says a value that looks like the next CLI
+/// flag (`-…`) is not a value and is kept.
+static VALUE_RULES: LazyLock<Vec<(Regex, bool)>> = LazyLock::new(value_rules);
+
+fn value_rules() -> Vec<(Regex, bool)> {
+    [
+        // URL userinfo: `scheme://user:pass@host` keeps the user.
+        (r"(?i)(?P<pre>\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)(?P<uq>[^/\s@]+)@", false),
+        // HTTP Authorization header, with or without a known scheme.
+        (
+            concat!(
+                r"(?i)(?P<pre>\bauthorization\s*:\s*(?:(?:bearer|bot|basic|token|digest|negotiate)\s+)?)",
+                secret_value!()
+            ),
+            false,
+        ),
+        // Secret-named header / JSON / YAML key: `X-Api-Key: v`, `"password":"v"`, `token: v`.
+        // Requires a quote before or whitespace after the colon, which keeps it off URLs.
+        (
+            concat!(
+                r#"(?i)(?P<pre>\b[\w-]*(?:token|secret|passw(?:or)?d|api[-_]?key|access[-_]?key|private[-_]?key|credentials?)(?:["']\s*:\s*|\s*:\s+))"#,
+                secret_value!()
+            ),
+            false,
+        ),
+        // Secret-named long CLI flag: `--token v`, `--password=v`, `--api-key v`, `--client-secret v`.
+        (
+            concat!(
+                r"(?i)(?P<pre>--[\w-]*?(?:token|secret|password|passwd|api-?key|access-key|private-key|credentials?)(?:=|\s+))",
+                secret_value!()
+            ),
+            true,
+        ),
+        // Secret-named env / query assignment: `GH_TOKEN=v`, `export DB_PASSWORD='v'`, `?access_token=v`.
+        (
+            concat!(
+                r"(?i)(?P<pre>\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api_?key|access_key|private_key|credential)[A-Za-z0-9_]*=)",
+                secret_value!()
+            ),
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(re, flag)| (Regex::new(re).expect("valid value redaction regex"), flag))
+    .collect()
+}
+
+/// Mask credentials in a tool title before it leaves the gateway. With claude-agent-acp the title
+/// is often the literal shell command (`curl -H "Authorization: Bot …"`, `export GH_TOKEN=ghp_…`),
+/// and every ACP client renders it, so the gateway is the one place that can keep secrets off the
+/// wire. Best-effort and pattern-based: it errs on over-redaction of secret-named values, never
+/// panics (all edits are at regex match boundaries, so non-ASCII text is safe), and is idempotent.
+///
+/// A shell `$`-reference (`TOKEN=$(cat f)`, `"Bot $DISCORD_BOT_TOKEN"`) is not a secret and stays
+/// readable; a single-quoted value never expands, so it is always redacted.
+fn redact_tool_title(title: &str) -> String {
+    let mut out = title.to_string();
+    for (re, rep) in TOKEN_RULES.iter() {
+        if let Cow::Owned(s) = re.replace_all(&out, *rep) {
+            out = s;
+        }
+    }
+    for (re, flag_aware) in VALUE_RULES.iter() {
+        let replaced = re.replace_all(&out, |c: &Captures| {
+            let whole = &c[0];
+            let pre = &c["pre"];
+            let (value, quote) = match (c.name("dq"), c.name("sq"), c.name("uq")) {
+                (Some(v), _, _) => (v.as_str(), "\""),
+                (_, Some(v), _) => (v.as_str(), "'"),
+                (_, _, Some(v)) => (v.as_str(), ""),
+                _ => return whole.to_string(),
+            };
+            let is_reference = quote != "'" && value.starts_with('$');
+            let is_next_flag = *flag_aware && quote.is_empty() && value.starts_with('-');
+            if value.is_empty() || is_reference || is_next_flag {
+                return whole.to_string();
+            }
+            // Whatever follows the value inside the match (the URL rule's `@`) is kept.
+            let tail = &whole[pre.len() + quote.len() * 2 + value.len()..];
+            format!("{pre}{quote}{REDACTED}{quote}{tail}")
+        });
+        if let Cow::Owned(s) = replaced {
+            out = s;
+        }
+    }
+    out
+}
+
 /// Turn a core tool-progress payload (`{toolCallId, title?, status}`, the ACP update body minus
 /// its discriminator) into a `session/update` `update` object. Only the fields this server vouches
-/// for are copied, so the emitted shape is exactly what the conformance tests pin. `None` when the
+/// for are copied, so the emitted shape is exactly what the conformance tests pin. The title is
+/// secret-redacted (see [`redact_tool_title`]) before it is capped. `None` when the
 /// payload is not an object with a string `toolCallId`, or a `tool_call` lacks its required
 /// `title`.
 fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
@@ -2864,7 +3006,7 @@ fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
     let tool_call_id = p.get("toolCallId")?.as_str()?;
     let mut update = json!({ "sessionUpdate": kind, "toolCallId": tool_call_id });
     match p.get("title").and_then(Value::as_str) {
-        Some(title) => update["title"] = json!(cap_tool_title(title)),
+        Some(title) => update["title"] = json!(cap_tool_title(&redact_tool_title(title))),
         None if kind == "tool_call" => return None,
         None => {}
     }
@@ -4774,6 +4916,164 @@ mod acp_review_fixes {
         assert!(title.ends_with('…'));
         let exact = "x".repeat(MAX_TOOL_TITLE_CHARS);
         assert_eq!(cap_tool_title(&exact), exact, "at the limit nothing is cut");
+    }
+
+    /// `(input, expected)` pairs for [`redact_tool_title`], one or more per pattern.
+    const REDACTION_CASES: &[(&str, &str)] = &[
+        // Authorization header schemes, case-insensitive.
+        (
+            r#"curl -H "Authorization: Bot MTIzNDU2.abc.def" https://discord.com/api"#,
+            r#"curl -H "Authorization: Bot ***" https://discord.com/api"#,
+        ),
+        ("curl -H 'authorization: bearer abc123' x", "curl -H 'authorization: bearer ***' x"),
+        ("AUTHORIZATION: Basic dXNlcjpwYXNz", "AUTHORIZATION: Basic ***"),
+        ("Authorization: token deadbeef", "Authorization: token ***"),
+        ("Authorization: rawsecret", "Authorization: ***"),
+        // Token prefixes.
+        ("echo ghp_abcdefghijklmnopqrstuvwxyz0123456789", "echo ghp_***"),
+        ("gho_ABCDEFGHIJKLMNOPQRSTUVWX ghu_ABCDEFGHIJKLMNOPQRSTUVWX", "gho_*** ghu_***"),
+        ("ghs_ABCDEFGHIJKLMNOPQRSTUVWX ghr_ABCDEFGHIJKLMNOPQRSTUVWX", "ghs_*** ghr_***"),
+        ("github_pat_11ABCDEFG0123456789_abcdefghijklmnop", "github_pat_***"),
+        ("xoxb-1234567890-0987654321-AbCdEfGh xoxp-1234567890-x", "xoxb-*** xoxp-***"),
+        ("xoxa-2-1234567890ab xapp-1-A0123-4567-abcdef", "xoxa-*** xapp-***"),
+        ("key sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx", "key sk-ant-***"),
+        ("key sk-AbCdEfGhIjKlMnOpQrStUvWx", "key sk-***"),
+        ("AKIAIOSFODNN7EXAMPLE and ASIAIOSFODNN7EXAMPLE", "AKIA*** and ASIA***"),
+        ("?key=AIzaSyA-1234567890abcdefghijklmnopqrstu", "?key=AIza***"),
+        (
+            "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            "jwt eyJ***",
+        ),
+        // Secret-named env assignments: unquoted, double- and single-quoted.
+        ("export GH_TOKEN=abc123 && gh pr list", "export GH_TOKEN=*** && gh pr list"),
+        (r#"DB_PASSWORD="hunter2" ./run"#, r#"DB_PASSWORD="***" ./run"#),
+        ("MY_API_KEY='x y z' AWS_SECRET_ACCESS_KEY=abc", "MY_API_KEY='***' AWS_SECRET_ACCESS_KEY=***"),
+        ("apikey=1 private_key=2 credential=3 passwd=4", "apikey=*** private_key=*** credential=*** passwd=***"),
+        ("curl 'https://x/cb?access_token=abc&state=1'", "curl 'https://x/cb?access_token=***&state=1'"),
+        // Secret-named header / JSON / YAML keys.
+        ("curl -H 'X-Api-Key: abc123' x", "curl -H 'X-Api-Key: ***' x"),
+        (r#"{"password":"hunter2","user":"bob"}"#, r#"{"password":"***","user":"bob"}"#),
+        // Secret-named CLI flags.
+        ("tool --token abc --verbose", "tool --token *** --verbose"),
+        ("tool --password=hunter2 --api-key 'k' --client-secret \"s\"", "tool --password=*** --api-key '***' --client-secret \"***\""),
+        // URL userinfo.
+        ("git clone https://bob:hunter2@github.com/o/r", "git clone https://bob:***@github.com/o/r"),
+        (
+            "git push https://x-access-token:abc@github.com/o/r",
+            "git push https://x-access-token:***@github.com/o/r",
+        ),
+        // PEM private keys.
+        (
+            "cat > k.pem <<EOF\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\nEOF",
+            "cat > k.pem <<EOF\n-----BEGIN RSA PRIVATE KEY-----***-----END RSA PRIVATE KEY-----\nEOF",
+        ),
+        ("-----BEGIN PRIVATE KEY-----\nMIIEow", "-----BEGIN PRIVATE KEY-----***-----END PRIVATE KEY-----"),
+    ];
+
+    /// Readable titles that must pass through untouched: `$`-references, flag-shaped "values",
+    /// and ordinary commands that merely mention secret-ish words.
+    const UNREDACTED_TITLES: &[&str] = &[
+        r#"curl -H "Authorization: Bot $DISCORD_BOT_TOKEN" https://discord.com/api"#,
+        "Authorization: Bearer ${GH_TOKEN}",
+        "export GH_TOKEN=$(cat /run/secrets/gh)",
+        r#"TOKEN="$SLACK_BOT_TOKEN" curl x"#,
+        "SLACK_BOT_TOKEN=$(tr '\\0' '\\n' < /proc/1/environ)",
+        "gh auth login --with-token < token.txt",
+        "tool --token-file ./t --password-stdin",
+        "tool --token --verbose",
+        "Read crates/openab-gateway/src/token.rs",
+        "cargo test -p openab-gateway",
+        "git clone https://github.com/brettchien/openab",
+        "ls ~/.config/gh",
+        "Terminal",
+        "",
+    ];
+
+    #[test]
+    fn redact_tool_title_patterns() {
+        for (input, expected) in REDACTION_CASES {
+            assert_eq!(redact_tool_title(input), *expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn redact_tool_title_discord_bot_token() {
+        // Assembled at runtime so the fixture does not trip push-protection secret scanning.
+        let id = "MTUzMTg0MDQwMzMwMzgyOTU2Ng";
+        let token = [id, "GaBcDe", "abcdefghijklmnopqrstuvwxyz0123456789"].join(".");
+        let out = redact_tool_title(&format!("token {token} x"));
+        assert_eq!(out, format!("token {id}.*** x"));
+        assert_eq!(redact_tool_title(&out), out);
+        // Ordinary dotted names are left alone.
+        let plain = "Read MTUzMTg0MDQwMzMwMzgyOTU2Ng.rs";
+        assert_eq!(redact_tool_title(plain), plain);
+    }
+
+    #[test]
+    fn redact_tool_title_keeps_references_and_plain_titles() {
+        for title in UNREDACTED_TITLES {
+            assert_eq!(redact_tool_title(title), *title);
+        }
+    }
+
+    #[test]
+    fn redact_tool_title_is_idempotent() {
+        let inputs = REDACTION_CASES
+            .iter()
+            .map(|(i, _)| *i)
+            .chain(UNREDACTED_TITLES.iter().copied());
+        for input in inputs {
+            let once = redact_tool_title(input);
+            assert_eq!(redact_tool_title(&once), once, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn redact_tool_title_non_ascii_safe() {
+        assert_eq!(
+            redact_tool_title("密碼 PASSWORD=秘密值 完成"),
+            "密碼 PASSWORD=*** 完成"
+        );
+        assert_eq!(
+            redact_tool_title(
+                "🔑 Authorization: Bearer ťøķęñ✓ — ghp_abcdefghijklmnopqrstuvwxyz 🎉"
+            ),
+            "🔑 Authorization: Bearer *** — ghp_*** 🎉"
+        );
+        assert_eq!(redact_tool_title("é".repeat(500).as_str()), "é".repeat(500));
+        assert_eq!(redact_tool_title("TOKEN=é"), "TOKEN=***");
+    }
+
+    #[test]
+    fn tool_progress_update_redacts_title_before_cap() {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let title = format!(
+            r#"curl -H "Authorization: Bot S3cr3tB0t" -H "X: {secret}" && export GH_TOKEN={secret}"#
+        );
+        let payload =
+            json!({"toolCallId": "a", "title": title, "status": "in_progress"}).to_string();
+        let update = tool_progress_update("tool_call", &payload).unwrap();
+        let out = update["title"].as_str().unwrap();
+        assert!(
+            !out.contains("S3cr3tB0t") && !out.contains(secret),
+            "leaked: {out}"
+        );
+        assert_eq!(
+            out,
+            r#"curl -H "Authorization: Bot ***" -H "X: ghp_***" && export GH_TOKEN=***"#
+        );
+        // A secret straddling the cap is redacted first, so no partial secret survives the cut.
+        let long = format!("{}{secret}", "x ".repeat(MAX_TOOL_TITLE_CHARS / 2 - 5));
+        let payload = json!({"toolCallId": "a", "title": long}).to_string();
+        let out = tool_progress_update("tool_call", &payload).unwrap()["title"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!out.contains("abcdef"), "leaked across cap: {out}");
+        // tool_call_update titles are redacted too.
+        let payload = json!({"toolCallId": "a", "title": "PASSWORD=hunter2 ./x"}).to_string();
+        let update = tool_progress_update("tool_call_update", &payload).unwrap();
+        assert_eq!(update["title"], "PASSWORD=*** ./x");
     }
 
     #[test]
