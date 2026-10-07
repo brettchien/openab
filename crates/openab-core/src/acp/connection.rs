@@ -283,7 +283,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                     .unwrap_or("?");
 
                 let outcome = build_permission_response(msg.params.as_ref());
-                info!(title, %outcome, "auto-respond permission");
+                info!(title = %crate::redact::redact_tool_title(title), %outcome, "auto-respond permission");
                 let reply = JsonRpcResponse::new(agent_request_id, outcome);
                 write_json_rpc_reply(&writer, &reply).await;
                 continue;

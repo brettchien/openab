@@ -2951,6 +2951,36 @@ done
         );
     }
 
+    /// One tool whose title carries a literal credential, the way claude-agent-acp titles a shell
+    /// call with the command itself.
+    const SECRET_TOOL_TURN: &str = r#"
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"export DB_PASSWORD=hunter2 && ./migrate","status":"in_progress"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"migrated"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
+
+    // Tool titles are redacted where core parses the agent event, so neither the ACP tool
+    // progress nor another platform's tool lines carry the credential.
+    #[tokio::test]
+    async fn tool_titles_are_redacted_on_every_platform() {
+        let default_timeout = crate::config::default_prompt_hard_timeout_secs();
+        let rec = run_turn_with("acp", SECRET_TOOL_TURN, 10, default_timeout).await;
+        let progress = rec.progress.lock().unwrap().clone();
+        assert_eq!(progress[0].title, "export DB_PASSWORD=*** && ./migrate");
+        assert!(
+            progress.iter().all(|p| !p.title.contains("hunter2")),
+            "{progress:?}"
+        );
+
+        let rec = run_turn_with("telegram", SECRET_TOOL_TURN, 10, default_timeout).await;
+        let sent = rec.sent.lock().unwrap().join("\n");
+        assert!(
+            sent.contains("DB_PASSWORD=***"),
+            "the tool line is shown, masked: {sent}"
+        );
+        assert!(!sent.contains("hunter2"), "{sent}");
+    }
+
     // Every other platform keeps its existing tool display and never sees tool_call commands —
     // several gateway adapters would post an unknown command as a plain message.
     #[tokio::test]

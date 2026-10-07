@@ -2856,9 +2856,11 @@ fn cap_tool_title(title: &str) -> String {
 
 /// Turn a core tool-progress payload (`{toolCallId, title?, status}`, the ACP update body minus
 /// its discriminator) into a `session/update` `update` object. Only the fields this server vouches
-/// for are copied, so the emitted shape is exactly what the conformance tests pin. `None` when the
-/// payload is not an object with a string `toolCallId`, or a `tool_call` lacks its required
-/// `title`.
+/// for are copied, so the emitted shape is exactly what the conformance tests pin. The title
+/// arrives already credential-redacted (core masks it where it parses the agent event, see
+/// `openab_core::redact::redact_tool_title`), so capping it here cannot cut a secret in half.
+/// `None` when the payload is not an object with a string `toolCallId`, or a `tool_call` lacks
+/// its required `title`.
 fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
     let p: Value = serde_json::from_str(payload).ok()?;
     let tool_call_id = p.get("toolCallId")?.as_str()?;

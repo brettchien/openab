@@ -409,6 +409,17 @@ pub enum AcpEvent {
     Status,
 }
 
+/// A tool event's title, credential-redacted. Titles are often the literal shell command and are
+/// shown on every platform (tool lines, status line, ACP `tool_call`), so they are masked here,
+/// where they enter core, rather than at each display.
+fn tool_title(update: &Value) -> String {
+    update
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(crate::redact::redact_tool_title)
+        .unwrap_or_default()
+}
+
 pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
     let params = msg.params.as_ref()?;
     let update = params.get("update")?;
@@ -434,19 +445,11 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
         }
         "agent_thought_chunk" => Some(AcpEvent::Thinking),
         "tool_call" => {
-            let title = update
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let title = tool_title(update);
             Some(AcpEvent::ToolStart { id: tool_id, title })
         }
         "tool_call_update" => {
-            let title = update
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let title = tool_title(update);
             let status = update
                 .get("status")
                 .and_then(|v| v.as_str())
