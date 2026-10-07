@@ -91,6 +91,38 @@ pub fn prompt_idle_timeout_secs() -> u64 {
     })
 }
 
+/// Default interval, in seconds, between the server's own WebSocket pings.
+///
+/// Edge proxies cut a WebSocket that carries no frame for a while — Cloudflare at about 100s (E2E
+/// T7: a client that sent no pings was dropped ~126s after the last frame, mid-turn). Keepalives
+/// stop at the gateway and are never forwarded, a browser cannot send a WS ping, and a client may
+/// pause its own heartbeat during a turn, so a long silent tool left the socket idle end to end.
+/// A server ping is transport-level traffic every client already answers (browsers send the pong
+/// themselves), so it needs no protocol change. 30s leaves room for a late tick under 100s.
+pub const ACP_WS_PING_SECS: u64 = 30;
+
+/// Env override for [`ACP_WS_PING_SECS`]. `0` turns server pings off.
+pub const ACP_WS_PING_ENV: &str = "OPENAB_ACP_WS_PING_SECS";
+
+/// Parse a ping-interval override. Unset or empty falls back to the default; `0` is valid and
+/// means off. The `Err` carries the rejected value so the caller can warn once.
+fn parse_ws_ping_secs(raw: Option<&str>) -> Result<u64, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(ACP_WS_PING_SECS),
+        Some(v) => v.parse::<u64>().map_err(|_| v.to_string()),
+    }
+}
+
+/// Resolves when the next server ping is due; never, when pings are off.
+async fn next_ws_ping(ping: &mut Option<tokio::time::Interval>) {
+    match ping {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Whether a configured tunnel timeout is overtaken by the idle timeout, and so cannot decide the
 /// outcome.
 ///
@@ -229,6 +261,8 @@ pub struct AcpConfig {
     /// `OPENAB_ACP_ALLOWED_ORIGINS`, comma-separated). Empty by default → every
     /// browser-set `Origin` is rejected; non-browser clients (no `Origin`) are unaffected.
     pub allowed_origins: Vec<String>,
+    /// Seconds between server WebSocket pings (`OPENAB_ACP_WS_PING_SECS`); `0` = off.
+    pub ws_ping_secs: u64,
 }
 
 impl AcpConfig {
@@ -270,9 +304,19 @@ impl AcpConfig {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let ws_ping_secs = parse_ws_ping_secs(std::env::var(ACP_WS_PING_ENV).ok().as_deref())
+            .unwrap_or_else(|bad| {
+                warn!(
+                    value = %bad,
+                    default = ACP_WS_PING_SECS,
+                    "{ACP_WS_PING_ENV} must be a whole number of seconds (0 = off); using the default"
+                );
+                ACP_WS_PING_SECS
+            });
         Some(Self {
             auth_key,
             allowed_origins,
+            ws_ping_secs,
         })
     }
 }
@@ -1487,11 +1531,30 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let connected_at = std::time::Instant::now();
     let last_outbound_ms = Arc::new(AtomicU64::new(0));
     let send_last_outbound = last_outbound_ms.clone();
+    // Server pings keep an edge proxy from cutting a socket that is quiet in both directions
+    // (see `ACP_WS_PING_SECS`). They are not counted in `last_outbound_ms`, which stays "last data
+    // frame" so the disconnect log still shows how long the client had heard nothing real.
+    let ping_secs = state
+        .acp
+        .as_ref()
+        .map_or(ACP_WS_PING_SECS, |c| c.ws_ping_secs);
+    let mut ping = (ping_secs > 0).then(|| {
+        let period = std::time::Duration::from_secs(ping_secs);
+        let mut i = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        i
+    });
     let send_task = tokio::spawn(async move {
         // A oneshot must not be polled again once resolved; teardown dropping `close_tx` resolves it.
         let mut close_pending = true;
         loop {
             tokio::select! {
+                _ = next_ws_ping(&mut ping) => {
+                    if let Err(e) = ws_tx.send(Message::Ping(Default::default())).await {
+                        warn!(connection = %send_conn, error = %e, "ACP outbound ping failed; writer stopped");
+                        break;
+                    }
+                }
                 msg = out_rx.recv() => {
                     let Some(msg) = msg else { break };
                     if trace {
@@ -2714,6 +2777,20 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             // `reply_to`; deliver only when it matches the active turn. Empty `reply_to`
             // (no origin id) fails open so legit traffic is never dropped.
             Some(sink) if reply.reply_to.is_empty() || reply.reply_to == sink.turn_id => {
+                sink.tx.clone()
+            }
+            // Keepalives pass the fence. After a cancel the superseded turn can still be running in
+            // core, and the next prompt is queued behind it; that turn's keepalives are the only
+            // sign core is alive, and dropping them timed the queued prompt out at one idle window
+            // (E2E T4). A keepalive has no content, so nothing from the old turn reaches the client;
+            // the fence still drops its text and tool progress below.
+            Some(sink) if reply.command.as_deref() == Some("keepalive") => {
+                debug!(
+                    channel = key,
+                    from_turn = %reply.reply_to,
+                    active_turn = %sink.turn_id,
+                    "ACP keepalive from a superseded turn; core still busy, active prompt is queued behind it"
+                );
                 sink.tx.clone()
             }
             Some(_) => {
@@ -4596,6 +4673,62 @@ mod acp_review_fixes {
         );
     }
 
+    // E2E T4: after a cancel the old turn keeps running in core and the next prompt queues behind
+    // it. The old turn's keepalives carry its own origin id; they must still hold the queued
+    // prompt open, while its text stays fenced out.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_from_a_superseded_turn_carries_the_queued_prompt() {
+        let mut h = start_prompt(json!(26)).await;
+        let old_turn = "evt_superseded";
+        let tick = tokio::time::Duration::from_secs(30);
+        for _ in 0..(ACP_PROMPT_IDLE_TIMEOUT_SECS * 3 / 30) {
+            tokio::time::sleep(tick).await;
+            handle_reply(
+                &reply(&h.channel_id, old_turn, "", Some("keepalive")),
+                &h.registry,
+            )
+            .await;
+        }
+        // The old turn finishes: its answer is fenced, then the queued prompt runs and answers.
+        handle_reply(
+            &reply(&h.channel_id, old_turn, "stale answer", None),
+            &h.registry,
+        )
+        .await;
+        handle_reply(&reply(&h.channel_id, &h.turn_id, "HI", None), &h.registry).await;
+        h.handle.await.unwrap();
+        let mut texts = Vec::new();
+        let mut stop = None;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["method"] == json!("session/update") {
+                texts.push(v["params"]["update"]["content"]["text"].clone());
+            }
+            if v.get("id") == Some(&json!(26)) {
+                stop = Some(v);
+            }
+        }
+        assert_eq!(
+            stop.expect("final response")["result"]["stopReason"],
+            json!("end_turn")
+        );
+        assert_eq!(
+            texts,
+            vec![json!("HI")],
+            "only the active turn's answer reaches the client"
+        );
+    }
+
+    #[test]
+    fn ws_ping_interval_parses_zero_as_off_and_rejects_junk() {
+        assert_eq!(parse_ws_ping_secs(None), Ok(ACP_WS_PING_SECS));
+        assert_eq!(parse_ws_ping_secs(Some(" ")), Ok(ACP_WS_PING_SECS));
+        assert_eq!(parse_ws_ping_secs(Some("0")), Ok(0));
+        assert_eq!(parse_ws_ping_secs(Some(" 15 ")), Ok(15));
+        assert_eq!(parse_ws_ping_secs(Some("-1")), Err("-1".into()));
+        assert_eq!(parse_ws_ping_secs(Some("30s")), Err("30s".into()));
+    }
+
     // Tool progress must leave the sink in place (the answer is still coming) and must not end
     // the turn.
     #[tokio::test]
@@ -4725,6 +4858,10 @@ mod acp_ws_integration {
     /// Serve `/acp` on an ephemeral loopback port. Returns the URL and the tunnel registry, so a
     /// test can drive the server side the way core does.
     async fn serve() -> (String, AcpTunnelRegistry) {
+        serve_with_ping(ACP_WS_PING_SECS).await
+    }
+
+    async fn serve_with_ping(ws_ping_secs: u64) -> (String, AcpTunnelRegistry) {
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let mut state = crate::AppState::test_default(tx);
         state.acp = Some(AcpConfig {
@@ -4732,6 +4869,7 @@ mod acp_ws_integration {
             // what a non-browser client (this test, and the real extension's native host) is.
             auth_key: None,
             allowed_origins: vec![],
+            ws_ping_secs,
         });
         state.acp_reply_registry = Some(new_reply_registry());
         let registry = new_tunnel_registry();
@@ -4883,6 +5021,39 @@ mod acp_ws_integration {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// A client that sends nothing still sees server traffic, so an edge proxy's idle cut (E2E T7)
+    /// never fires on a quiet turn. Read raw frames: `recv` skips pings by design.
+    #[tokio::test]
+    async fn server_pings_a_client_that_sends_nothing() {
+        let (url, _registry) = serve_with_ping(1).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let mut pings = 0;
+        let read = async {
+            while pings < 2 {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Ping(_))) => pings += 1,
+                    Some(Ok(_)) => {}
+                    other => panic!("socket ended before two server pings: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .expect("server must ping an idle client");
+    }
+
+    /// `0` turns server pings off.
+    #[tokio::test]
+    async fn server_pings_can_be_turned_off() {
+        let (url, _registry) = serve_with_ping(0).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_millis(2500), ws.next()).await;
+        assert!(
+            got.is_err(),
+            "no frame expected with pings off, got {got:?}"
+        );
     }
 
     /// The tunnel is not usable until the inner MCP lifecycle has completed.

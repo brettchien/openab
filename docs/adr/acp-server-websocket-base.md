@@ -148,7 +148,13 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   idle timeout (startup warns otherwise). The tick is one interval for the whole turn, so it
   also fires while the agent streams text, which over ACP the gateway does not see. (Same
   idea as Hermes heartbeating a running tool; OpenClaw instead defers its watchdog while a
-  tool is active.)
+  tool is active.) Keepalives pass the stale-reply fence: after a cancel the superseded turn
+  may still run in core with the next prompt queued behind it, and its keepalives are what
+  keep that queued prompt open. They carry no content, so nothing of the old turn leaks.
+- **Server WS ping.** Keepalives stop at the gateway, so a quiet turn leaves the WebSocket
+  itself silent, and edge proxies cut idle sockets (Cloudflare at ~100s). The writer sends a
+  WS `Ping` every `OPENAB_ACP_WS_PING_SECS` (default 30, `0` = off); clients answer at the
+  transport layer (browsers do it themselves), so no client change is needed.
 
 ### Concurrency, caps & reply fencing
 
