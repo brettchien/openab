@@ -30,8 +30,6 @@ quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 parking_lot = "0.12"
 urlencoding = "2"
-# Tool-title secret redaction in the ACP server (`acp` feature).
-regex = { version = "1", optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -45,5 +43,5 @@ feishu = []
 googlechat = []
 wecom = []
 teams = []
-acp = ["dep:regex"]
+acp = []
 lineworks = []
