@@ -48,13 +48,13 @@ fn hash_tag(uuid: &str) -> String {
 /// [`redact_tool_title`] (re-redacting changes nothing).
 const REDACTED: &str = "***";
 
-/// A secret value after a context prefix (`pre`): bash ANSI-C quoted (`$'…'`, a literal),
-/// double-quoted, single-quoted, or a bare shell word. The bare form stops at quotes, backslashes,
-/// and shell/JSON punctuation so the rest of the command stays readable. Alternation is
-/// leftmost-first, so `$'…'` wins over a bare `$`.
+/// A secret value after a context prefix (`pre`): bash ANSI-C quoted (`$'…'`, a literal), a `${…}`
+/// parameter expansion, double-quoted, single-quoted, or a bare shell word. The bare form stops at
+/// quotes, backslashes, and shell/JSON punctuation so the rest of the command stays readable.
+/// Alternation is leftmost-first, so `$'…'` and `${…}` win over a bare `$`.
 macro_rules! secret_value {
     () => {
-        r#"(?:\$'(?P<ac>[^']*)'|"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<uq>[^\s"'`\\;&|<>(),}]+))"#
+        r#"(?:\$'(?P<ac>[^']*)'|\$\{(?P<pe>[^}]*)\}|"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<uq>[^\s"'`\\;&|<>(),}]+))"#
     };
 }
 
@@ -146,11 +146,14 @@ fn value_rules() -> Vec<(Regex, bool)> {
     .collect()
 }
 
-/// A whole value that is just a shell variable reference: `$VAR`, `${VAR}`, or a bare `${VAR` cut
-/// short by the bare-word stop set. `${VAR:-literal}` and friends are not — the default is a
-/// literal.
+/// A whole value that is just a shell variable reference: `$VAR` or `${VAR}`. `${VAR:-literal}` and
+/// friends are not — the default is a literal.
 static VAR_REFERENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$").expect("valid var regex"));
+
+/// The inside of a `${…}` that is just a variable name.
+static VAR_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid name regex"));
 
 /// Mask credentials in an agent tool title. With claude-agent-acp the title is often the literal
 /// shell command (`curl -H "Authorization: Bot …"`, `export GH_TOKEN=ghp_…`), and it is shown on
@@ -171,18 +174,23 @@ pub fn redact_tool_title(title: &str) -> String {
     for (re, flag_aware) in VALUE_RULES.iter() {
         let replaced = re.replace_all(&out, |c: &Captures| {
             let whole = c.get(0).expect("group 0 always matches");
-            let (value, expands) = match (c.name("ac"), c.name("dq"), c.name("sq"), c.name("uq")) {
-                (Some(v), ..) => (v, false),
-                (_, Some(v), ..) => (v, true),
-                (_, _, Some(v), _) => (v, false),
-                (.., Some(v)) => (v, true),
-                _ => return whole.as_str().to_string(),
+            let is_reference = |v: &str| {
+                // A bare `$` cut short by the stop set is a `$(…)` substitution when `(` follows.
+                VAR_REFERENCE.is_match(v)
+                    || v.starts_with("$(")
+                    || (v == "$" && out[whole.end()..].starts_with('('))
+            };
+            let (value, is_reference) = if let Some(v) = c.name("pe") {
+                // `${…}`: a reference when it holds just a name, else (`${X:-literal}`) a literal.
+                (v, VAR_NAME.is_match(v.as_str()))
+            } else if let Some(v) = c.name("dq").or(c.name("uq")) {
+                (v, is_reference(v.as_str()))
+            } else if let Some(v) = c.name("ac").or(c.name("sq")) {
+                (v, false)
+            } else {
+                return whole.as_str().to_string();
             };
             let v = value.as_str();
-            // A bare `$` cut short by the stop set is a `$(…)` substitution when `(` follows.
-            let is_substitution =
-                v.starts_with("$(") || (v == "$" && out[whole.end()..].starts_with('('));
-            let is_reference = expands && (VAR_REFERENCE.is_match(v) || is_substitution);
             let is_next_flag = *flag_aware && c.name("uq").is_some() && v.starts_with('-');
             if v.is_empty() || is_reference || is_next_flag {
                 return whole.as_str().to_string();
@@ -283,7 +291,8 @@ mod tool_title_tests {
         // `$`-prefixed literals: ANSI-C quoting and parameter-expansion defaults do not reference
         // a secret, they contain one.
         ("export GH_TOKEN=$'realsecret123' && x", "export GH_TOKEN=$'***' && x"),
-        ("TOKEN=${X:-realsecret123} ./run", "TOKEN=***} ./run"),
+        ("TOKEN=${X:-realsecret123} ./run", "TOKEN=${***} ./run"),
+        ("tool --api-key ${KEY:-realsecret123}", "tool --api-key ${***}"),
         (r#"PASSWORD="${X:-realsecret123}" ./run"#, r#"PASSWORD="***" ./run"#),
         ("Authorization: Bearer $'realsecret123'", "Authorization: Bearer $'***'"),
         // Secret-named header / JSON / YAML keys.
