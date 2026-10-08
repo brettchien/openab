@@ -2843,23 +2843,15 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
     }
 }
 
-/// Longest tool title forwarded to a client, in chars. Agents may put a whole shell command (or
-/// heredoc) in the title; a client renders it as a one-line chip, so the tail is noise.
-const MAX_TOOL_TITLE_CHARS: usize = 200;
-
-fn cap_tool_title(title: &str) -> String {
-    match title.char_indices().nth(MAX_TOOL_TITLE_CHARS) {
-        Some((cut, _)) => format!("{}…", &title[..cut]),
-        None => title.to_string(),
-    }
-}
-
 /// Turn a core tool-progress payload (`{toolCallId, title?, status, kind?, name?,
-/// _meta.openab.capability?}`, the ACP update body minus
-/// its discriminator) into a `session/update` `update` object. Only the fields this server vouches
-/// for are copied, so the emitted shape is exactly what the conformance tests pin. The title
-/// arrives already credential-redacted (core masks it where it parses the agent event, see
-/// `openab_core::redact::redact_tool_title`), so capping it here cannot cut a secret in half.
+/// _meta.openab.capability?}`, the ACP update body minus its discriminator) into a
+/// `session/update` `update` object. Only the fields this server vouches for are copied, so the
+/// emitted shape is exactly what the conformance tests pin.
+///
+/// The title must be a tool name too: core titles progress by tool identity (`Bash`,
+/// `katashiro.click`) and never sends the agent's own title, which is usually the literal
+/// command. A title that is not a name (a core that still forwards the command) is replaced by
+/// `tool` on a `tool_call` and dropped from an update, so a command line never leaves this server.
 /// `None` when the payload is not an object with a string `toolCallId`, or a `tool_call` lacks
 /// its required `title`.
 fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
@@ -2867,7 +2859,9 @@ fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
     let tool_call_id = p.get("toolCallId")?.as_str()?;
     let mut update = json!({ "sessionUpdate": kind, "toolCallId": tool_call_id });
     match p.get("title").and_then(Value::as_str) {
-        Some(title) => update["title"] = json!(cap_tool_title(title)),
+        Some(title) if tool_name_ok(title) => update["title"] = json!(title),
+        Some(_) if kind == "tool_call" => update["title"] = json!("tool"),
+        Some(_) => {}
         None if kind == "tool_call" => return None,
         None => {}
     }
@@ -2913,8 +2907,8 @@ const TOOL_KINDS: [&str; 10] = [
 ];
 
 /// A tool / capability name as core emits it: a non-empty `[A-Za-z0-9_.:/-]` identifier of at
-/// most 128 chars. Unlike the title these are not credential-redacted, so this server re-checks
-/// the shape instead of trusting the payload — free text never passes as a name.
+/// most 128 chars. Nothing here is credential-redacted, so this server re-checks the shape of
+/// every title / name / capability instead of trusting the payload — free text never passes.
 fn tool_name_ok(s: &str) -> bool {
     !s.is_empty()
         && s.chars().count() <= 128
@@ -3007,13 +3001,13 @@ mod acp_conformance {
     fn tool_call_session_updates() {
         // mirror of the prompt loop's ReplyChunk::Update arm, fed by tool_progress_update
         for (kind, payload) in [
-            ("tool_call", r#"{"toolCallId":"t1","title":"Terminal","status":"in_progress"}"#),
-            ("tool_call_update", r#"{"toolCallId":"t1","title":"cargo test","status":"in_progress"}"#),
+            ("tool_call", r#"{"toolCallId":"t1","title":"Bash","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","title":"Bash","status":"in_progress"}"#),
             ("tool_call_update", r#"{"toolCallId":"t1","status":"completed"}"#),
             ("tool_call_update", r#"{"toolCallId":"t1","status":"failed"}"#),
             (
                 "tool_call",
-                r#"{"toolCallId":"t2","title":"Terminal","status":"in_progress","kind":"execute","name":"Bash"}"#,
+                r#"{"toolCallId":"t2","title":"Bash","status":"in_progress","kind":"execute","name":"Bash"}"#,
             ),
             (
                 "tool_call_update",
@@ -4647,7 +4641,7 @@ mod acp_review_fixes {
         let step = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS * 2 / 3);
         let progress = [
             ("tool_call", r#"{"toolCallId":"t1","title":"Terminal","status":"in_progress"}"#),
-            ("tool_call_update", r#"{"toolCallId":"t1","title":"cargo test","status":"in_progress"}"#),
+            ("tool_call_update", r#"{"toolCallId":"t1","title":"Bash","status":"in_progress"}"#),
             ("tool_call_update", r#"{"toolCallId":"t1","status":"completed"}"#),
         ];
         for (cmd, payload) in progress {
@@ -4820,14 +4814,18 @@ mod acp_review_fixes {
         );
         assert_eq!(tool_progress_update("tool_call", r#"{"title":"T"}"#), None, "toolCallId is required");
         assert_eq!(tool_progress_update("tool_call", "[1]"), None);
-        // A long title is capped on a char boundary.
-        let long = "é".repeat(MAX_TOOL_TITLE_CHARS + 50);
-        let payload = json!({"toolCallId": "a", "title": long}).to_string();
-        let title = tool_progress_update("tool_call", &payload).unwrap()["title"].as_str().unwrap().to_string();
-        assert_eq!(title.chars().count(), MAX_TOOL_TITLE_CHARS + 1);
-        assert!(title.ends_with('…'));
-        let exact = "x".repeat(MAX_TOOL_TITLE_CHARS);
-        assert_eq!(cap_tool_title(&exact), exact, "at the limit nothing is cut");
+        // A title that is not a tool name (a command line) never leaves: a tool_call gets the
+        // generic `tool`, an update drops it so the client keeps its current title.
+        let cmd = r#"export DB_PASSWORD=hunter2 && ./migrate"#;
+        let payload = json!({"toolCallId": "a", "title": cmd}).to_string();
+        assert_eq!(tool_progress_update("tool_call", &payload).unwrap()["title"], json!("tool"));
+        assert_eq!(tool_progress_update("tool_call_update", &payload).unwrap().get("title"), None);
+        for title in ["é".repeat(10), "x".repeat(129), String::new()] {
+            let payload = json!({"toolCallId": "a", "title": title}).to_string();
+            assert_eq!(tool_progress_update("tool_call", &payload).unwrap()["title"], json!("tool"), "{title}");
+        }
+        let payload = json!({"toolCallId": "a", "title": "katashiro.click"}).to_string();
+        assert_eq!(tool_progress_update("tool_call", &payload).unwrap()["title"], json!("katashiro.click"));
     }
 
     #[test]

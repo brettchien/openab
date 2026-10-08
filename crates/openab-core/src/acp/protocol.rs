@@ -412,7 +412,7 @@ pub enum AcpEvent {
 }
 
 /// A tool event's title, credential-redacted. Titles are often the literal shell command and are
-/// shown on every platform (tool lines, status line, ACP `tool_call`), so they are masked here,
+/// shown on chat platforms (tool lines, status line), so they are masked here,
 /// where they enter core, rather than at each display.
 fn tool_title(update: &Value) -> String {
     update

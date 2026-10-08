@@ -336,12 +336,15 @@ pub struct SenderContext {
 /// platforms that render tool activity natively (ACP `session/update`
 /// `tool_call` / `tool_call_update`). Text is NOT carried here — the answer
 /// still arrives through the normal send path.
+///
+/// Nor is the agent's tool title: it is usually the literal command (`export TOKEN=… && …`), and
+/// leaving it out is the only guarantee that no credential in it reaches an ACP client — pattern
+/// redaction is best effort. The ACP `title` is derived from [`ToolIdentity`] alone (see
+/// [`ToolCallProgress::payload`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallProgress {
     /// Agent-assigned `toolCallId`, stable across the call's lifetime.
     pub tool_call_id: String,
-    /// Human-readable title. May be empty on an update that only changes status.
-    pub title: String,
     /// ACP `ToolCallStatus`: `in_progress` / `completed` / `failed`.
     pub status: &'static str,
     /// `true` for the first event of this id this turn (ACP `tool_call`),
@@ -363,15 +366,23 @@ impl ToolCallProgress {
     }
 
     /// JSON payload carried in `GatewayReply.content.text`: the ACP update body
-    /// without `sessionUpdate` (the gateway adds it from the command). `title`
-    /// is required on `tool_call` and omitted from an update when empty.
+    /// without `sessionUpdate` (the gateway adds it from the command).
+    ///
+    /// `title` is the most specific identity this event has — facade capability, then tool name,
+    /// then kind — never the agent's own title. ACP requires it on `tool_call`, so a new call
+    /// with no identity is titled `tool`; an update with none omits it and the client keeps
+    /// what it has.
     pub fn payload(&self) -> serde_json::Value {
         let mut v = serde_json::json!({
             "toolCallId": self.tool_call_id,
             "status": self.status,
         });
-        if self.is_new || !self.title.is_empty() {
-            v["title"] = serde_json::Value::String(self.title.clone());
+        let id = &self.identity;
+        let title = id.capability.as_deref().or(id.name.as_deref()).or(id.kind);
+        match title {
+            Some(title) => v["title"] = title.into(),
+            None if self.is_new => v["title"] = "tool".into(),
+            None => {}
         }
         if let Some(kind) = self.identity.kind {
             v["kind"] = kind.into();
@@ -1113,7 +1124,6 @@ impl AdapterRouter {
                                             &thread_channel,
                                             ToolCallProgress {
                                                 tool_call_id: id.clone(),
-                                                title: title.clone(),
                                                 status: "in_progress",
                                                 is_new,
                                                 identity,
@@ -1176,7 +1186,6 @@ impl AdapterRouter {
                                             &thread_channel,
                                             ToolCallProgress {
                                                 tool_call_id: id.clone(),
-                                                title: title.clone(),
                                                 status: if new_state == ToolState::Completed {
                                                     "completed"
                                                 } else {
@@ -2737,22 +2746,37 @@ mod tool_progress_tests {
 
     #[test]
     fn tool_call_progress_wire_shape() {
+        let bash = ToolIdentity {
+            kind: Some("execute"),
+            name: Some("Bash".into()),
+            capability: None,
+        };
         let start = ToolCallProgress {
             tool_call_id: "t1".into(),
-            title: "Terminal".into(),
             status: "in_progress",
             is_new: true,
-            identity: ToolIdentity::default(),
+            identity: bash.clone(),
         };
         assert_eq!(start.command(), "tool_call");
         assert_eq!(
             start.payload(),
-            serde_json::json!({"toolCallId": "t1", "title": "Terminal", "status": "in_progress"})
+            serde_json::json!({
+                "toolCallId": "t1", "title": "Bash", "status": "in_progress",
+                "kind": "execute", "name": "Bash"
+            })
         );
+        // Without a name the kind is the title.
+        let kind_only = ToolCallProgress {
+            identity: ToolIdentity {
+                kind: Some("execute"),
+                ..ToolIdentity::default()
+            },
+            ..start.clone()
+        };
+        assert_eq!(kind_only.payload()["title"], serde_json::json!("execute"));
         // A status-only update omits the title rather than blanking it on the client.
         let done = ToolCallProgress {
             tool_call_id: "t1".into(),
-            title: String::new(),
             status: "completed",
             is_new: false,
             identity: ToolIdentity::default(),
@@ -2762,13 +2786,13 @@ mod tool_progress_tests {
             done.payload(),
             serde_json::json!({"toolCallId": "t1", "status": "completed"})
         );
-        // ACP requires `title` on tool_call, so a new call keeps it even when empty.
+        // ACP requires `title` on tool_call, so a new call with no identity gets a generic one.
         let untitled = ToolCallProgress {
             is_new: true,
             ..done.clone()
         };
-        assert_eq!(untitled.payload()["title"], serde_json::json!(""));
-        // Identity rides along as ACP `kind` / `name`; a facade capability goes in `_meta`.
+        assert_eq!(untitled.payload()["title"], serde_json::json!("tool"));
+        // A facade call is titled by its capability; the capability also goes in `_meta`.
         let facade = ToolCallProgress {
             identity: ToolIdentity {
                 kind: Some("other"),
@@ -2781,6 +2805,7 @@ mod tool_progress_tests {
             facade.payload(),
             serde_json::json!({
                 "toolCallId": "t1",
+                "title": "katashiro.click",
                 "status": "completed",
                 "kind": "other",
                 "name": "mcp__oab__execute_capability",
@@ -2967,24 +2992,24 @@ done
             name: Some("Bash".into()),
             capability: None,
         };
-        let p = |title: &str, status: &'static str, is_new: bool, identity: &ToolIdentity| {
-            ToolCallProgress {
-                tool_call_id: "t1".into(),
-                title: title.into(),
-                status,
-                is_new,
-                identity: identity.clone(),
-            }
+        let p = |status: &'static str, is_new: bool, identity: &ToolIdentity| ToolCallProgress {
+            tool_call_id: "t1".into(),
+            status,
+            is_new,
+            identity: identity.clone(),
         };
         assert_eq!(
             progress,
             vec![
-                p("Terminal", "in_progress", true, &bash),
+                p("in_progress", true, &bash),
                 // the refinement names the tool only in `_meta.claudeCode.toolName`
-                p("cargo test", "in_progress", false, &bash),
-                p("", "completed", false, &ToolIdentity::default()),
+                p("in_progress", false, &bash),
+                p("completed", false, &ToolIdentity::default()),
             ]
         );
+        // The agent's titles ("Terminal", the command) never reach the ACP payload.
+        let titles: Vec<_> = progress.iter().map(|p| p.payload()["title"].clone()).collect();
+        assert_eq!(titles, [serde_json::json!("Bash"), serde_json::json!("Bash"), serde_json::Value::Null]);
         let sent = rec.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 1, "send-once: one answer message, got {sent:?}");
         assert!(sent[0].contains("the answer"), "{sent:?}");
@@ -3006,17 +3031,18 @@ done
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"migrated"}}}}'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
 
-    // Tool titles are redacted where core parses the agent event, so neither the ACP tool
-    // progress nor another platform's tool lines carry the credential.
+    // ACP tool progress never carries the agent's title at all, so not even its redacted form
+    // (redaction is best effort) reaches the client; other platforms show the title, masked.
     #[tokio::test]
-    async fn tool_titles_are_redacted_on_every_platform() {
+    async fn tool_titles_never_reach_acp_and_are_redacted_elsewhere() {
         let default_timeout = crate::config::default_prompt_hard_timeout_secs();
         let rec = run_turn_with("acp", SECRET_TOOL_TURN, 10, default_timeout).await;
         let progress = rec.progress.lock().unwrap().clone();
-        assert_eq!(progress[0].title, "export DB_PASSWORD=*** && ./migrate");
+        assert_eq!(progress[0].payload()["title"], serde_json::json!("tool"));
+        let wire: Vec<_> = progress.iter().map(|p| p.payload().to_string()).collect();
         assert!(
-            progress.iter().all(|p| !p.title.contains("hunter2")),
-            "{progress:?}"
+            wire.iter().all(|w| !w.contains("DB_PASSWORD") && !w.contains("migrate")),
+            "{wire:?}"
         );
 
         let rec = run_turn_with("telegram", SECRET_TOOL_TURN, 10, default_timeout).await;
