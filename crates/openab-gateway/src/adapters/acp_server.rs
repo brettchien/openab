@@ -2854,7 +2854,8 @@ fn cap_tool_title(title: &str) -> String {
     }
 }
 
-/// Turn a core tool-progress payload (`{toolCallId, title?, status}`, the ACP update body minus
+/// Turn a core tool-progress payload (`{toolCallId, title?, status, kind?, name?,
+/// _meta.openab.capability?}`, the ACP update body minus
 /// its discriminator) into a `session/update` `update` object. Only the fields this server vouches
 /// for are copied, so the emitted shape is exactly what the conformance tests pin. The title
 /// arrives already credential-redacted (core masks it where it parses the agent event, see
@@ -2875,7 +2876,50 @@ fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
             update["status"] = json!(status);
         }
     }
+    if let Some(kind) = p.get("kind").and_then(Value::as_str) {
+        if TOOL_KINDS.contains(&kind) {
+            update["kind"] = json!(kind);
+        }
+    }
+    if let Some(name) = p
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| tool_name_ok(n))
+    {
+        update["name"] = json!(name);
+    }
+    if let Some(capability) = p
+        .pointer("/_meta/openab/capability")
+        .and_then(Value::as_str)
+        .filter(|c| tool_name_ok(c))
+    {
+        update["_meta"] = json!({ "openab": { "capability": capability } });
+    }
     Some(update)
+}
+
+/// ACP v1 `ToolKind`.
+const TOOL_KINDS: [&str; 10] = [
+    "read",
+    "edit",
+    "delete",
+    "move",
+    "search",
+    "execute",
+    "think",
+    "fetch",
+    "switch_mode",
+    "other",
+];
+
+/// A tool / capability name as core emits it: a non-empty `[A-Za-z0-9_.:/-]` identifier of at
+/// most 128 chars. Unlike the title these are not credential-redacted, so this server re-checks
+/// the shape instead of trusting the payload — free text never passes as a name.
+fn tool_name_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().count() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '/' | '-'))
 }
 
 // ---------------------------------------------------------------------------
@@ -2967,6 +3011,14 @@ mod acp_conformance {
             ("tool_call_update", r#"{"toolCallId":"t1","title":"cargo test","status":"in_progress"}"#),
             ("tool_call_update", r#"{"toolCallId":"t1","status":"completed"}"#),
             ("tool_call_update", r#"{"toolCallId":"t1","status":"failed"}"#),
+            (
+                "tool_call",
+                r#"{"toolCallId":"t2","title":"Terminal","status":"in_progress","kind":"execute","name":"Bash"}"#,
+            ),
+            (
+                "tool_call_update",
+                r#"{"toolCallId":"t3","status":"completed","kind":"other","name":"mcp__oab__execute_capability","_meta":{"openab":{"capability":"katashiro.click"}}}"#,
+            ),
         ] {
             let update = super::tool_progress_update(kind, payload).expect("valid progress");
             conforms::<sc::SessionNotification>(json!({
@@ -4776,6 +4828,39 @@ mod acp_review_fixes {
         assert!(title.ends_with('…'));
         let exact = "x".repeat(MAX_TOOL_TITLE_CHARS);
         assert_eq!(cap_tool_title(&exact), exact, "at the limit nothing is cut");
+    }
+
+    #[test]
+    fn tool_progress_update_identity() {
+        // kind / name / facade capability pass through when they are in vocabulary…
+        assert_eq!(
+            tool_progress_update(
+                "tool_call_update",
+                r#"{"toolCallId":"a","kind":"execute","name":"mcp__oab__execute_capability",
+                    "_meta":{"openab":{"capability":"katashiro.click"},"other":1}}"#
+            ),
+            Some(json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "a", "kind": "execute",
+                "name": "mcp__oab__execute_capability",
+                "_meta": { "openab": { "capability": "katashiro.click" } }
+            }))
+        );
+        // …and are dropped, not sanitised, when they are not.
+        assert_eq!(
+            tool_progress_update(
+                "tool_call_update",
+                r#"{"toolCallId":"a","kind":"shell","name":"export K=v",
+                    "_meta":{"openab":{"capability":"a b"}},"rawInput":{"command":"x"}}"#
+            ),
+            Some(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "a" }))
+        );
+        let long = json!({ "toolCallId": "a", "name": "n".repeat(129) }).to_string();
+        assert_eq!(
+            tool_progress_update("tool_call_update", &long)
+                .unwrap()
+                .get("name"),
+            None
+        );
     }
 
     #[test]
