@@ -96,8 +96,10 @@ JSON-RPC 2.0; non-`"2.0"` rejected with `-32600`.
 | `session/prompt` | `{ sessionId, prompt: [ContentBlock] }` | `{ stopReason }` |
 
 `agentCapabilities` advertises `sessionCapabilities.resume` (we support resume) and
-`loadSession: false` (we cannot replay history — see §3). `promptCapabilities` are
-all `false` in the base (text only). `protocolVersion` is the integer `1`.
+`loadSession: false` (we cannot replay history — see §3). `promptCapabilities.image` is
+`true`: an `image` block is resized like any platform image and forwarded to core as an
+`image` attachment (a `session/prompt` frame may be up to 8 MiB for it); `audio` and
+`embeddedContext` are `false`. `protocolVersion` is the integer `1`.
 
 ### Client → Agent (notification)
 
@@ -289,7 +291,7 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
 - other richer `session/update` variants: `agent_thought_chunk` / `plan` /
   `available_commands_update` / `usage_update`
 - `fs/*`, `terminal/*` (sibling agent→client capabilities)
-- `ContentBlock` image / audio / resource (image only if screenshot-based browser tools)
+- `ContentBlock` audio / resource (image is supported — see the capabilities above)
 - session admin: `session/close` / `list` / `delete`, `set_mode` / `set_config_option`,
   `session/load` (history replay — needs an upstream transcript store)
 - typed command UI: `authenticate`, `available_commands_update` advertisement

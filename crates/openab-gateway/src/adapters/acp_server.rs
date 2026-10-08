@@ -188,12 +188,26 @@ const MAX_FRAME_BYTES: usize = 8 << 20; // 8 MiB — browser-tool results (e.g. 
 /// The method of a parsed inbound frame when it exceeds the limit for its kind, else `None`.
 ///
 /// Only client **responses** — `id` present, no `method` — carry tunnel results and may use the
-/// full [`MAX_FRAME_BYTES`]. Everything method-bearing is a client request or notification and is
-/// held to [`MAX_NON_TUNNEL_FRAME_BYTES`].
+/// full [`MAX_FRAME_BYTES`]. A `session/prompt` may carry base64 images (a pasted screenshot is
+/// routinely over 1 MiB) and is held to [`MAX_PROMPT_FRAME_BYTES`]. Every other method-bearing
+/// frame is a client request or notification and is held to [`MAX_NON_TUNNEL_FRAME_BYTES`].
 fn oversized_for_its_kind(len: usize, raw: &Value) -> Option<&str> {
     let method = raw.get("method").and_then(Value::as_str)?;
-    (len > MAX_NON_TUNNEL_FRAME_BYTES).then_some(method)
+    (len > frame_limit_for(method)).then_some(method)
 }
+
+/// The inbound size limit for a frame carrying `method` (see [`oversized_for_its_kind`]).
+fn frame_limit_for(method: &str) -> usize {
+    if method == "session/prompt" {
+        MAX_PROMPT_FRAME_BYTES
+    } else {
+        MAX_NON_TUNNEL_FRAME_BYTES
+    }
+}
+
+/// Ceiling for a `session/prompt` frame, which may carry `image` blocks. The transport ceiling:
+/// 8 MiB of base64 is a ~6 MiB image, under `media::IMAGE_MAX_DOWNLOAD`.
+const MAX_PROMPT_FRAME_BYTES: usize = MAX_FRAME_BYTES;
 
 /// Ceiling for every inbound frame that is **not** a tunnel result (review F2).
 ///
@@ -1657,14 +1671,16 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         // tunnel results legitimately reach it — those are client RESPONSES (no `method`), handled
         // just below. Anything carrying a `method` is a client request or notification, so hold it
         // to the pre-existing 1 MiB: otherwise the browser-result allowance doubles as a way to
-        // park MAX_INFLIGHT_PROMPTS × 8 MiB of prompt text on one connection.
+        // park MAX_INFLIGHT_PROMPTS × 8 MiB of prompt text on one connection. The exception is
+        // `session/prompt`, which may carry images (see `frame_limit_for`).
         if let Some(method) = oversized_for_its_kind(text.len(), &raw) {
             {
+                let max = frame_limit_for(method);
                 warn!(
                     connection = %connection_id,
                     method,
                     bytes = text.len(),
-                    max = MAX_NON_TUNNEL_FRAME_BYTES,
+                    max,
                     "ACP frame too large for its method; rejecting"
                 );
                 // A notification MUST NOT be answered; drop it and keep the connection.
@@ -1674,7 +1690,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         id,
                         ACP_OVERLOADED,
                         format!(
-                            "Frame too large: {} exceeds the {MAX_NON_TUNNEL_FRAME_BYTES}-byte limit for `{method}`",
+                            "Frame too large: {} exceeds the {max}-byte limit for `{method}`",
                             text.len()
                         ),
                     );
@@ -2208,7 +2224,7 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
                     "resume": {}
                 },
                 "promptCapabilities": {
-                    "image": false,
+                    "image": true,
                     "audio": false,
                     "embeddedContext": false
                 }
@@ -2494,8 +2510,8 @@ async fn handle_session_prompt(
     connection_generation: u64,
 ) {
     // sessionId was validated + reserved by the caller; only the prompt body can still be bad.
-    let prompt_text = match extract_prompt_params(params) {
-        Ok((_sid, text)) => text,
+    let (prompt_text, prompt_images) = match extract_prompt_params(params) {
+        Ok(p) => (p.text, p.images),
         Err(e) => {
             let resp = JsonRpcResponse::error(id, -32602, e);
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -2520,9 +2536,19 @@ async fn handle_session_prompt(
         }
     };
 
+    let attachments = match prompt_image_attachments(prompt_images).await {
+        Ok(a) => a,
+        Err((code, e)) => {
+            let resp = JsonRpcResponse::error(id, code, e);
+            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            release_prompt(sessions, &session_id).await;
+            return;
+        }
+    };
+
     // Convert to GatewayEvent and dispatch. Build it first so its `event_id` can fence
     // this turn's replies (round-tripped as `GatewayReply.reply_to`).
-    let event = GatewayEvent::new(
+    let mut event = GatewayEvent::new(
         "acp",
         ChannelInfo {
             id: channel_id.clone(),
@@ -2539,6 +2565,7 @@ async fn handle_session_prompt(
         &format!("acpmsg_{}", Uuid::new_v4()),
         Vec::new(),
     );
+    event.content.attachments = attachments;
     let turn_id = event.event_id.clone();
 
     // Create reply channel for this prompt and register it, keyed by channel_id with the
@@ -2681,20 +2708,39 @@ async fn handle_session_prompt(
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 }
 
-fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), String> {
+/// MIME types an ACP `image` prompt block may carry: what `media::resize_and_compress` can decode
+/// (the gateway's `image` crate features).
+const PROMPT_IMAGE_MIME_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// A `session/prompt` body: the text blocks joined, plus any `image` blocks, decoded.
+#[derive(Debug)]
+struct PromptParams {
+    text: String,
+    images: Vec<PromptImage>,
+}
+
+/// One ACP `image` content block, base64-decoded but otherwise as the client sent it.
+#[derive(Debug, PartialEq)]
+struct PromptImage {
+    bytes: Vec<u8>,
+    mime_type: String,
+}
+
+fn extract_prompt_params(params: Option<&Value>) -> Result<PromptParams, String> {
     let params = params.ok_or("Missing params")?;
-    let session_id = params
+    // sessionId is validated (and reserved) by the caller; it must still be present here.
+    params
         .get("sessionId")
         .and_then(|v| v.as_str())
-        .ok_or("Missing sessionId")?
-        .to_string();
+        .ok_or("Missing sessionId")?;
     let prompt = params.get("prompt").ok_or("Missing prompt")?;
 
     // Per the ACP schema the generated `PromptRequest.prompt` is `[ContentBlock]`; a plain
     // string (or any non-array) is non-conformant and rejected below (-32602), never
-    // leniently coerced. The base is text-only: an unsupported block type (image / audio /
-    // resource / resource_link) is rejected explicitly rather than silently dropped, so the
-    // client knows its content was not delivered.
+    // leniently coerced. Text, resource_link and (advertised in promptCapabilities) image are
+    // accepted; any other block type (audio / resource) is rejected explicitly rather than
+    // silently dropped, so the client knows its content was not delivered.
+    let mut images = Vec::new();
     let text = if let Some(arr) = prompt.as_array() {
         let mut parts: Vec<String> = Vec::with_capacity(arr.len());
         for block in arr {
@@ -2726,12 +2772,48 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
                     // `name` is now mandatory).
                     parts.push(format!("[{name}]({uri})"));
                 }
+                Some("image") => {
+                    // ACP `ImageContent`: `data` (base64) and `mimeType` are both required. It is
+                    // carried to core as an `image` attachment, the same way a Discord / Telegram
+                    // image is, so the agent receives a real image block.
+                    let mime_type = block
+                        .get("mimeType")
+                        .and_then(|v| v.as_str())
+                        .ok_or("image content block missing required 'mimeType'")?;
+                    if !PROMPT_IMAGE_MIME_TYPES.contains(&mime_type) {
+                        return Err(format!(
+                            "Unsupported image mimeType '{mime_type}' (accepted: {})",
+                            PROMPT_IMAGE_MIME_TYPES.join(", ")
+                        ));
+                    }
+                    let data = block
+                        .get("data")
+                        .and_then(|v| v.as_str())
+                        .ok_or("image content block missing required 'data'")?;
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|_| "image content block 'data' is not valid base64")?;
+                    if bytes.is_empty() {
+                        return Err("image content block 'data' is empty".into());
+                    }
+                    if bytes.len() as u64 > crate::media::IMAGE_MAX_DOWNLOAD {
+                        return Err(format!(
+                            "image exceeds {}",
+                            crate::media::format_bytes(crate::media::IMAGE_MAX_DOWNLOAD)
+                        ));
+                    }
+                    images.push(PromptImage {
+                        bytes,
+                        mime_type: mime_type.to_string(),
+                    });
+                }
                 Some(other) => {
-                    // Capability-gated variants (image / audio / embedded resource) that
-                    // this agent does not advertise in promptCapabilities are rejected
-                    // explicitly rather than silently dropped.
+                    // Capability-gated variants (audio / embedded resource) that this agent
+                    // does not advertise in promptCapabilities are rejected explicitly rather
+                    // than silently dropped.
                     return Err(format!(
-                        "Unsupported prompt content block type '{other}' — this agent advertises no such capability (base accepts text and resource_link)"
+                        "Unsupported prompt content block type '{other}' — this agent advertises no such capability (accepts text, resource_link and image)"
                     ));
                 }
                 None => return Err("Prompt content block missing 'type'".into()),
@@ -2744,11 +2826,51 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
         return Err("Invalid prompt: 'prompt' must be an array of content blocks".into());
     };
 
-    if text.trim().is_empty() {
+    // An image alone is a prompt (a pasted screenshot needs no caption).
+    if text.trim().is_empty() && images.is_empty() {
         return Err("Empty prompt".into());
     }
 
-    Ok((session_id, text))
+    Ok(PromptParams {
+        text,
+        images,
+    })
+}
+
+/// Turn a prompt's images into core `image` attachments: resized / re-encoded by the same
+/// `media::resize_and_compress` every other platform uses (longest side ≤ 1200px, JPEG; small
+/// GIFs pass through), then stored under `~/.openab/media/inbound` and referenced by path, as the
+/// other adapters do. `Err((code, message))` is the JSON-RPC error to answer the prompt with.
+async fn prompt_image_attachments(images: Vec<PromptImage>) -> Result<Vec<Attachment>, (i32, String)> {
+    let mut out = Vec::with_capacity(images.len());
+    for (i, PromptImage { bytes, mime_type }) in images.into_iter().enumerate() {
+        let (compressed, mime) =
+            match tokio::task::spawn_blocking(move || crate::media::resize_and_compress(&bytes)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    warn!(index = i, mime = %mime_type, error = %e, "ACP prompt image could not be decoded");
+                    return Err((-32602, format!("image {} could not be decoded as {mime_type}", i + 1)));
+                }
+                Err(e) => {
+                    warn!(index = i, error = %e, "ACP prompt image processing task failed");
+                    return Err((-32603, "image processing failed".into()));
+                }
+            };
+        let Some(path) = crate::store::store_media(&compressed).await else {
+            return Err((-32603, "image storage failed".into()));
+        };
+        let ext = if mime == "image/gif" { "gif" } else { "jpg" };
+        out.push(Attachment {
+            attachment_type: "image".into(),
+            filename: format!("acp_image_{}.{ext}", i + 1),
+            mime_type: mime,
+            data: String::new(),
+            size: compressed.len() as u64,
+            path: Some(path),
+            status: None,
+        });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2960,7 +3082,7 @@ mod acp_conformance {
                 // expressible before upstream has a real field for it.
                 "mcpCapabilities": { "http": false, "sse": false, "_meta": { "dev.openab/acp": true } },
                 "sessionCapabilities": { "resume": {} },
-                "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false }
+                "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false }
             },
             "agentInfo": { "name": "openab", "title": "OpenAB", "version": "0.0.0" },
             "authMethods": []
@@ -3140,21 +3262,23 @@ mod acp_conformance {
     fn prompt_content_blocks_baseline_accepted_gated_rejected() {
         use super::extract_prompt_params;
         // text blocks accepted and concatenated
-        let (_, text) = extract_prompt_params(Some(&json!({
+        let text = extract_prompt_params(Some(&json!({
             "sessionId": "sess_x",
             "prompt": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
         })))
-        .unwrap();
+        .unwrap()
+        .text;
         assert_eq!(text, "a\nb");
         // resource_link is BASELINE — accepted, rendered as a link reference (not fetched)
-        let (_, text) = extract_prompt_params(Some(&json!({
+        let text = extract_prompt_params(Some(&json!({
             "sessionId": "sess_x",
             "prompt": [
                 {"type": "text", "text": "see"},
                 {"type": "resource_link", "uri": "file:///x", "name": "X"}
             ]
         })))
-        .unwrap();
+        .unwrap()
+        .text;
         assert_eq!(text, "see\n[X](file:///x)");
         // R17-F3b — `ResourceLink` requires `name`; a link missing it is rejected (-32602),
         // no longer rendered as a bare uri.
@@ -3172,13 +3296,18 @@ mod acp_conformance {
             "prompt": [{"type": "resource_link", "name": "X"}]
         })))
         .is_err());
-        // capability-gated variants (image / audio / embedded resource) are rejected,
-        // never silently dropped
-        assert!(extract_prompt_params(Some(&json!({
-            "sessionId": "sess_x",
-            "prompt": [{"type": "image", "data": "..", "mimeType": "image/png"}]
-        })))
-        .is_err());
+        // capability-gated variants that are NOT advertised (audio / embedded resource) are
+        // rejected, never silently dropped
+        for block in [
+            json!({"type": "audio", "data": "AAAA", "mimeType": "audio/wav"}),
+            json!({"type": "resource", "resource": {"uri": "file:///x", "text": "x"}}),
+        ] {
+            assert!(
+                extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": [block.clone()]})))
+                    .is_err(),
+                "{block}"
+            );
+        }
         // R17-F3a — a plain-string prompt is non-conformant (schema requires
         // `prompt: [ContentBlock]`) → rejected, surfaced as -32602 at the call site.
         assert!(
@@ -3191,6 +3320,99 @@ mod acp_conformance {
                 .is_err(),
             "a non-array prompt must be rejected"
         );
+    }
+
+    /// A real PNG, as a client pasting a screenshot would send it.
+    fn tiny_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 30, 30]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    // --- prompt images (advertised in promptCapabilities.image) ---
+
+    #[test]
+    fn prompt_image_blocks_are_accepted_and_decoded() {
+        use super::extract_prompt_params;
+        let png = tiny_png(4, 3);
+        let p = extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image", "data": b64(&png), "mimeType": "image/png"}
+            ]
+        })))
+        .unwrap();
+        assert_eq!(p.text, "what is this?");
+        assert_eq!(p.images.len(), 1);
+        assert_eq!(p.images[0].bytes, png);
+        assert_eq!(p.images[0].mime_type, "image/png");
+        // An image alone is a prompt — a pasted screenshot needs no caption.
+        let p = extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [{"type": "image", "data": b64(&png), "mimeType": "image/png"}]
+        })))
+        .unwrap();
+        assert_eq!((p.text.as_str(), p.images.len()), ("", 1));
+        // …but nothing at all still is not.
+        assert!(extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": []}))).is_err());
+    }
+
+    #[test]
+    fn malformed_prompt_image_blocks_are_rejected() {
+        use super::extract_prompt_params;
+        let png = b64(&tiny_png(2, 2));
+        let reject = |block: Value| {
+            let r = extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": [block.clone()]})));
+            assert!(r.is_err(), "{block} must be rejected");
+            r.unwrap_err()
+        };
+        assert!(reject(json!({"type": "image", "data": png})).contains("mimeType"));
+        assert!(reject(json!({"type": "image", "mimeType": "image/png"})).contains("data"));
+        assert!(reject(json!({"type": "image", "data": "not base64!", "mimeType": "image/png"}))
+            .contains("base64"));
+        assert!(reject(json!({"type": "image", "data": "", "mimeType": "image/png"})).contains("empty"));
+        assert!(reject(json!({"type": "image", "data": png, "mimeType": "image/svg+xml"}))
+            .contains("Unsupported image mimeType"));
+        let huge = b64(&vec![0u8; crate::media::IMAGE_MAX_DOWNLOAD as usize + 1]);
+        assert!(reject(json!({"type": "image", "data": huge, "mimeType": "image/png"})).contains("exceeds"));
+    }
+
+    // The images reach core exactly like a Discord / Telegram image: an `image` attachment,
+    // resized by the shared pipeline and referenced by path.
+    #[tokio::test]
+    async fn prompt_images_become_core_image_attachments() {
+        use super::{prompt_image_attachments, PromptImage};
+        let atts = prompt_image_attachments(vec![
+            PromptImage { bytes: tiny_png(1600, 800), mime_type: "image/png".into() },
+            PromptImage { bytes: tiny_png(10, 10), mime_type: "image/png".into() },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(atts.len(), 2);
+        for (i, a) in atts.iter().enumerate() {
+            assert_eq!(a.attachment_type, "image");
+            assert_eq!(a.mime_type, "image/jpeg", "re-encoded by resize_and_compress");
+            assert_eq!(a.filename, format!("acp_image_{}.jpg", i + 1));
+            assert!(a.status.is_none() && a.data.is_empty());
+            let path = a.path.as_deref().expect("stored by path, like the other adapters");
+            let stored = std::fs::read(path).unwrap();
+            assert_eq!(stored.len() as u64, a.size);
+            let img = image::load_from_memory(&stored).unwrap();
+            assert!(img.width() <= crate::media::IMAGE_MAX_DIMENSION_PX && img.height() <= crate::media::IMAGE_MAX_DIMENSION_PX);
+            let _ = std::fs::remove_file(path);
+        }
+        // Bytes that are not an image are a client error (-32602), not a silent drop.
+        let err = prompt_image_attachments(vec![PromptImage { bytes: b"not an image".to_vec(), mime_type: "image/png".into() }])
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32602, "{err:?}");
     }
 
     // --- transport auth gate (F1): no key allowed only on loopback ---
@@ -4188,14 +4410,14 @@ mod acp_review_fixes {
         }
     }
 
-    // --- F2: the 8 MiB allowance is for tunnel results only ---
+    // --- F2: the 8 MiB allowance is for tunnel results and image prompts only ---
 
     /// The raise to 8 MiB was for browser tool results, which arrive as client RESPONSES
-    /// (`id`, no `method`). Frames carrying a method — `session/prompt` above all — stay at the
-    /// pre-existing 1 MiB, so the allowance cannot be used to park
-    /// MAX_INFLIGHT_PROMPTS × 8 MiB of prompt text on one connection.
+    /// (`id`, no `method`). Since `promptCapabilities.image`, `session/prompt` may carry a
+    /// screenshot and gets the same allowance; every other method-bearing frame stays at the
+    /// pre-existing 1 MiB.
     #[test]
-    fn only_tunnel_results_may_use_the_larger_frame_allowance() {
+    fn only_tunnel_results_and_prompts_may_use_the_larger_frame_allowance() {
         let over_1mib = super::MAX_NON_TUNNEL_FRAME_BYTES + 1;
         let big_result = 8 * 1024 * 1024; // within MAX_FRAME_BYTES
 
@@ -4206,15 +4428,31 @@ mod acp_review_fixes {
             "an 8 MiB tunnel result must still be accepted — that is what the raise is for"
         );
 
-        // A prompt of the same size must not be.
+        // A prompt may carry images (a pasted screenshot), so it gets the prompt allowance —
+        // up to it, inclusive, and no further.
         let prompt = json!({ "jsonrpc": "2.0", "id": 1, "method": "session/prompt" });
-        assert_eq!(
-            super::oversized_for_its_kind(over_1mib, &prompt),
-            Some("session/prompt"),
-            "a >1 MiB prompt must be rejected"
+        assert!(
+            super::oversized_for_its_kind(over_1mib, &prompt).is_none(),
+            "a >1 MiB prompt (an image) is accepted"
         );
         assert!(
-            super::oversized_for_its_kind(super::MAX_NON_TUNNEL_FRAME_BYTES, &prompt).is_none(),
+            super::oversized_for_its_kind(super::MAX_PROMPT_FRAME_BYTES, &prompt).is_none(),
+            "the prompt bound is inclusive"
+        );
+        assert_eq!(
+            super::oversized_for_its_kind(super::MAX_PROMPT_FRAME_BYTES + 1, &prompt),
+            Some("session/prompt")
+        );
+
+        // Every other request stays at 1 MiB.
+        let new_session = json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new" });
+        assert_eq!(
+            super::oversized_for_its_kind(over_1mib, &new_session),
+            Some("session/new"),
+            "a >1 MiB non-prompt request must be rejected"
+        );
+        assert!(
+            super::oversized_for_its_kind(super::MAX_NON_TUNNEL_FRAME_BYTES, &new_session).is_none(),
             "exactly 1 MiB is still allowed — the bound is inclusive"
         );
 
@@ -4628,6 +4866,54 @@ mod acp_review_fixes {
         }
         let turn_id = turn_id.expect("handler must register a reply sink");
         PromptHarness { registry, channel_id, _event_rx: event_rx, out_rx, handle, turn_id }
+    }
+
+    // End to end through the prompt handler: an ACP image block leaves the gateway as an
+    // `image` attachment on the GatewayEvent core receives — the same shape a Discord or
+    // Telegram image has, so core's existing image path hands it to the agent.
+    #[tokio::test]
+    async fn an_image_prompt_reaches_core_as_an_image_attachment() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(new_reply_registry());
+        let state = Arc::new(st);
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession { channel_id: format!("acp_{}", Uuid::new_v4()), busy: true, cancel: Some(cancel.clone()) },
+        );
+        let png = {
+            let img = image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+        };
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<String>();
+        let params = json!({"sessionId": sid, "prompt": [
+            {"type": "text", "text": "look"},
+            {"type": "image", "data": png, "mimeType": "image/png"}
+        ]});
+        let handle = tokio::spawn(async move {
+            handle_session_prompt(&state, &sessions, json!(1), Some(&params), &out_tx, sid, cancel, "conn-test", 0).await;
+        });
+
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("the prompt must be dispatched to core")
+            .unwrap();
+        handle.abort();
+        let event: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(event["content"]["text"], json!("look"));
+        let atts = event["content"]["attachments"].as_array().expect("attachments");
+        assert_eq!(atts.len(), 1, "{event}");
+        assert_eq!(atts[0]["type"], json!("image"));
+        assert_eq!(atts[0]["mime_type"], json!("image/jpeg"));
+        let path = atts[0]["path"].as_str().expect("referenced by path");
+        assert!(std::path::Path::new(path).exists());
+        let _ = std::fs::remove_file(path);
     }
 
     // P0 — over ACP the answer is send-once, so a long tool-heavy turn used to send nothing for
