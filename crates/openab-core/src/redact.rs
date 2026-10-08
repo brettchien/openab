@@ -157,9 +157,8 @@ static VAR_NAME: LazyLock<Regex> =
 
 /// Mask credentials in an agent tool title. With claude-agent-acp the title is often the literal
 /// shell command (`curl -H "Authorization: Bot …"`, `export GH_TOKEN=ghp_…`), and it is shown on
-/// chat platforms (Discord / Slack tool lines, the assistant status line) and logged, so core
-/// masks it once where it parses the agent's event. ACP tool progress does not carry the title at
-/// all (see `ToolCallProgress`), so it does not depend on this mask. Best-effort and
+/// every platform (Discord / Slack tool lines, the assistant status line, ACP `tool_call`
+/// updates) and logged, so core masks it once where it parses the agent's event. Best-effort and
 /// pattern-based: it errs on over-redaction of secret-named values, never panics (all edits are at
 /// regex match boundaries, so non-ASCII text is safe), and is idempotent.
 ///
