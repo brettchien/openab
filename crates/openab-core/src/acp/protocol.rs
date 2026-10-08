@@ -411,24 +411,12 @@ pub enum AcpEvent {
     Status,
 }
 
-/// A tool event's title, credential-redacted. Titles are often the literal shell command and are
-/// shown on every platform (tool lines, status line, ACP `tool_call`), so they are masked here,
-/// where they enter core, rather than at each display.
-fn tool_title(update: &Value) -> String {
-    update
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(crate::redact::redact_tool_title)
-        .unwrap_or_default()
-}
-
 /// What a tool event says about the tool itself, beyond its title: enough for a client to pick a
 /// short label or icon (`Bash` instead of the whole command) and to recognise its own tools.
 ///
 /// Every field is a closed vocabulary or a shape-checked identifier, never free text — unlike the
-/// title, none of it goes through credential redaction, so nothing that can carry an argument
-/// value is allowed in. `rawInput` as a whole is deliberately NOT carried: it holds the tool's
-/// arguments verbatim.
+/// title, which is usually the literal command, nothing here can carry an argument value.
+/// `rawInput` as a whole is deliberately NOT carried: it holds the tool's arguments verbatim.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolIdentity {
     /// ACP `ToolKind` (`execute`, `read`, `edit`, …); anything outside the spec's set is dropped.
@@ -465,7 +453,7 @@ const MAX_TOOL_NAME_CHARS: usize = 128;
 
 /// A tool or capability name: a non-empty identifier of `[A-Za-z0-9_.:/-]`, at most
 /// [`MAX_TOOL_NAME_CHARS`]. Anything else (spaces, quotes, `=`) is not a name and is dropped
-/// rather than sanitised, so a value can never smuggle text past the title's redaction.
+/// rather than sanitised, so an argument value can never ride along as a name.
 fn tool_name_ok(s: &str) -> bool {
     !s.is_empty()
         && s.chars().count() <= MAX_TOOL_NAME_CHARS
@@ -522,7 +510,11 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
         }
         "agent_thought_chunk" => Some(AcpEvent::Thinking),
         "tool_call" => {
-            let title = tool_title(update);
+            let title = update
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let identity = tool_identity(update);
             Some(AcpEvent::ToolStart {
                 id: tool_id,
@@ -531,7 +523,11 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
             })
         }
         "tool_call_update" => {
-            let title = tool_title(update);
+            let title = update
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let identity = tool_identity(update);
             let status = update
                 .get("status")
