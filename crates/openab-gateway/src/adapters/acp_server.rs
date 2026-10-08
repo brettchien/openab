@@ -2712,6 +2712,17 @@ async fn handle_session_prompt(
 /// (the gateway's `image` crate features).
 const PROMPT_IMAGE_MIME_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+/// How many prompt images may be decoded at once, across every ACP connection.
+///
+/// The frame and per-image byte caps bound the *encoded* size only. `resize_and_compress`
+/// decodes with the `image` crate's default limits (no dimension cap, 512 MiB allocation), so a
+/// few hundred KiB of flat-colour PNG can expand to ~500 MiB of pixels, plus the Lanczos3
+/// resize buffer. `MAX_INFLIGHT_PROMPTS` prompts per connection, each carrying several such
+/// images, would otherwise decode in parallel; this keeps the worst case to a few decodes.
+const IMAGE_DECODE_CONCURRENCY: usize = 2;
+static IMAGE_DECODE_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(IMAGE_DECODE_CONCURRENCY);
+
 /// A `session/prompt` body: the text blocks joined, plus any `image` blocks, decoded.
 #[derive(Debug)]
 struct PromptParams {
@@ -2844,8 +2855,19 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<PromptParams, String>
 async fn prompt_image_attachments(images: Vec<PromptImage>) -> Result<Vec<Attachment>, (i32, String)> {
     let mut out = Vec::with_capacity(images.len());
     for (i, PromptImage { bytes, mime_type }) in images.into_iter().enumerate() {
+        // Gateway-wide cap on concurrent decodes (see `IMAGE_DECODE_PERMITS`). The permit moves
+        // into the blocking closure so it is held until the decode itself ends, even if this
+        // prompt task is aborted while it runs.
+        let Ok(permit) = IMAGE_DECODE_PERMITS.acquire().await else {
+            return Err((-32603, "image processing failed".into()));
+        };
         let (compressed, mime) =
-            match tokio::task::spawn_blocking(move || crate::media::resize_and_compress(&bytes)).await {
+            match tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::media::resize_and_compress(&bytes)
+            })
+            .await
+            {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     warn!(index = i, mime = %mime_type, error = %e, "ACP prompt image could not be decoded");
@@ -3413,6 +3435,33 @@ mod acp_conformance {
             .await
             .unwrap_err();
         assert_eq!(err.0, -32602, "{err:?}");
+    }
+
+    // Decodes are capped gateway-wide: with every permit taken, an image waits instead of
+    // decoding alongside, and proceeds once a permit frees up.
+    #[tokio::test]
+    async fn prompt_image_decodes_wait_for_a_permit() {
+        use super::{prompt_image_attachments, PromptImage, IMAGE_DECODE_CONCURRENCY, IMAGE_DECODE_PERMITS};
+        let held = IMAGE_DECODE_PERMITS
+            .acquire_many(IMAGE_DECODE_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let task = tokio::spawn(prompt_image_attachments(vec![PromptImage {
+            bytes: tiny_png(10, 10),
+            mime_type: "image/png".into(),
+        }]));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "decoded without a permit");
+        drop(held);
+        let atts = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("must proceed once a permit is free")
+            .unwrap()
+            .unwrap();
+        for a in &atts {
+            let _ = std::fs::remove_file(a.path.as_deref().unwrap());
+        }
+        assert_eq!(atts.len(), 1);
     }
 
     // --- transport auth gate (F1): no key allowed only on loopback ---

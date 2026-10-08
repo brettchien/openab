@@ -98,7 +98,8 @@ JSON-RPC 2.0; non-`"2.0"` rejected with `-32600`.
 `agentCapabilities` advertises `sessionCapabilities.resume` (we support resume) and
 `loadSession: false` (we cannot replay history — see §3). `promptCapabilities.image` is
 `true`: an `image` block is resized like any platform image and forwarded to core as an
-`image` attachment (a `session/prompt` frame may be up to 8 MiB for it); `audio` and
+`image` attachment (a `session/prompt` frame may be up to 8 MiB for it; decodes are capped
+gateway-wide at 2 concurrent, since decoded size is unbounded by the encoded size); `audio` and
 `embeddedContext` are `false`. `protocolVersion` is the integer `1`.
 
 ### Client → Agent (notification)
