@@ -4,7 +4,10 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
+use crate::acp::{
+    classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, ToolIdentity,
+    TurnResult,
+};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -333,17 +336,23 @@ pub struct SenderContext {
 /// platforms that render tool activity natively (ACP `session/update`
 /// `tool_call` / `tool_call_update`). Text is NOT carried here — the answer
 /// still arrives through the normal send path.
+///
+/// Nor is the agent's tool title: it is usually the literal command (`export TOKEN=… && …`), and
+/// leaving it out is the only guarantee that no credential in it reaches an ACP client — pattern
+/// redaction is best effort. The ACP `title` is derived from [`ToolIdentity`] alone (see
+/// [`ToolCallProgress::payload`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallProgress {
     /// Agent-assigned `toolCallId`, stable across the call's lifetime.
     pub tool_call_id: String,
-    /// Human-readable title. May be empty on an update that only changes status.
-    pub title: String,
     /// ACP `ToolCallStatus`: `in_progress` / `completed` / `failed`.
     pub status: &'static str,
     /// `true` for the first event of this id this turn (ACP `tool_call`),
     /// `false` for a refinement of an already-announced call (`tool_call_update`).
     pub is_new: bool,
+    /// The tool's kind / name / facade capability, as far as this event tells (see
+    /// [`ToolIdentity`]). Absent fields are omitted, so the client keeps what it already has.
+    pub identity: ToolIdentity,
 }
 
 impl ToolCallProgress {
@@ -357,15 +366,32 @@ impl ToolCallProgress {
     }
 
     /// JSON payload carried in `GatewayReply.content.text`: the ACP update body
-    /// without `sessionUpdate` (the gateway adds it from the command). `title`
-    /// is required on `tool_call` and omitted from an update when empty.
+    /// without `sessionUpdate` (the gateway adds it from the command).
+    ///
+    /// `title` is the most specific identity this event has — facade capability, then tool name,
+    /// then kind — never the agent's own title. ACP requires it on `tool_call`, so a new call
+    /// with no identity is titled `tool`; an update with none omits it and the client keeps
+    /// what it has.
     pub fn payload(&self) -> serde_json::Value {
         let mut v = serde_json::json!({
             "toolCallId": self.tool_call_id,
             "status": self.status,
         });
-        if self.is_new || !self.title.is_empty() {
-            v["title"] = serde_json::Value::String(self.title.clone());
+        let id = &self.identity;
+        let title = id.capability.as_deref().or(id.name.as_deref()).or(id.kind);
+        match title {
+            Some(title) => v["title"] = title.into(),
+            None if self.is_new => v["title"] = "tool".into(),
+            None => {}
+        }
+        if let Some(kind) = self.identity.kind {
+            v["kind"] = kind.into();
+        }
+        if let Some(name) = &self.identity.name {
+            v["name"] = name.as_str().into();
+        }
+        if let Some(capability) = &self.identity.capability {
+            v["_meta"] = serde_json::json!({ "openab": { "capability": capability } });
         }
         v
     }
@@ -1074,7 +1100,7 @@ impl AdapterRouter {
                                         reactions.set_thinking().await;
                                     }
                                 }
-                                AcpEvent::ToolStart { id, title } if !title.is_empty() => {
+                                AcpEvent::ToolStart { id, title, identity } if !title.is_empty() => {
                                     // Live indicator: assistant status line vs emoji reaction.
                                     if assistant_status {
                                         let _ = adapter
@@ -1098,9 +1124,9 @@ impl AdapterRouter {
                                             &thread_channel,
                                             ToolCallProgress {
                                                 tool_call_id: id.clone(),
-                                                title: title.clone(),
                                                 status: "in_progress",
                                                 is_new,
+                                                identity,
                                             },
                                         )
                                         .await;
@@ -1129,7 +1155,7 @@ impl AdapterRouter {
                                         ));
                                     }
                                 }
-                                AcpEvent::ToolDone { id, title, status } => {
+                                AcpEvent::ToolDone { id, title, status, identity } => {
                                     // The final answer block is whatever text the agent
                                     // emits AFTER its last tool. Advancing this on every
                                     // completion leaves it pointing just past the last
@@ -1160,13 +1186,13 @@ impl AdapterRouter {
                                             &thread_channel,
                                             ToolCallProgress {
                                                 tool_call_id: id.clone(),
-                                                title: title.clone(),
                                                 status: if new_state == ToolState::Completed {
                                                     "completed"
                                                 } else {
                                                     "failed"
                                                 },
                                                 is_new: !known,
+                                                identity,
                                             },
                                         )
                                         .await;
@@ -2720,35 +2746,72 @@ mod tool_progress_tests {
 
     #[test]
     fn tool_call_progress_wire_shape() {
+        let bash = ToolIdentity {
+            kind: Some("execute"),
+            name: Some("Bash".into()),
+            capability: None,
+        };
         let start = ToolCallProgress {
             tool_call_id: "t1".into(),
-            title: "Terminal".into(),
             status: "in_progress",
             is_new: true,
+            identity: bash.clone(),
         };
         assert_eq!(start.command(), "tool_call");
         assert_eq!(
             start.payload(),
-            serde_json::json!({"toolCallId": "t1", "title": "Terminal", "status": "in_progress"})
+            serde_json::json!({
+                "toolCallId": "t1", "title": "Bash", "status": "in_progress",
+                "kind": "execute", "name": "Bash"
+            })
         );
+        // Without a name the kind is the title.
+        let kind_only = ToolCallProgress {
+            identity: ToolIdentity {
+                kind: Some("execute"),
+                ..ToolIdentity::default()
+            },
+            ..start.clone()
+        };
+        assert_eq!(kind_only.payload()["title"], serde_json::json!("execute"));
         // A status-only update omits the title rather than blanking it on the client.
         let done = ToolCallProgress {
             tool_call_id: "t1".into(),
-            title: String::new(),
             status: "completed",
             is_new: false,
+            identity: ToolIdentity::default(),
         };
         assert_eq!(done.command(), "tool_call_update");
         assert_eq!(
             done.payload(),
             serde_json::json!({"toolCallId": "t1", "status": "completed"})
         );
-        // ACP requires `title` on tool_call, so a new call keeps it even when empty.
+        // ACP requires `title` on tool_call, so a new call with no identity gets a generic one.
         let untitled = ToolCallProgress {
             is_new: true,
+            ..done.clone()
+        };
+        assert_eq!(untitled.payload()["title"], serde_json::json!("tool"));
+        // A facade call is titled by its capability; the capability also goes in `_meta`.
+        let facade = ToolCallProgress {
+            identity: ToolIdentity {
+                kind: Some("other"),
+                name: Some("mcp__oab__execute_capability".into()),
+                capability: Some("katashiro.click".into()),
+            },
             ..done
         };
-        assert_eq!(untitled.payload()["title"], serde_json::json!(""));
+        assert_eq!(
+            facade.payload(),
+            serde_json::json!({
+                "toolCallId": "t1",
+                "title": "katashiro.click",
+                "status": "completed",
+                "kind": "other",
+                "name": "mcp__oab__execute_capability",
+                "_meta": { "openab": { "capability": "katashiro.click" } }
+            })
+        );
     }
 
     /// Records what the turn loop hands the adapter.
@@ -2826,8 +2889,8 @@ done
     /// streams in), refines its title, goes silent for 3s (a long tool), completes it, then
     /// answers.
     const TOOL_TURN: &str = r#"
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Terminal","status":"pending"}}}'
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"cargo test","status":"in_progress"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","name":"Bash","kind":"execute","title":"Terminal","status":"pending"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","_meta":{"claudeCode":{"toolName":"Bash"}},"kind":"execute","rawInput":{"command":"cargo test"},"title":"cargo test","status":"in_progress"}}}'
       sleep 3
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the answer"}}}}'
@@ -2924,20 +2987,29 @@ done
     async fn acp_turn_forwards_tool_progress_and_sends_the_answer_once() {
         let rec = run_turn("acp").await;
         let progress = rec.progress.lock().unwrap().clone();
-        let p = |title: &str, status: &'static str, is_new: bool| ToolCallProgress {
+        let bash = ToolIdentity {
+            kind: Some("execute"),
+            name: Some("Bash".into()),
+            capability: None,
+        };
+        let p = |status: &'static str, is_new: bool, identity: &ToolIdentity| ToolCallProgress {
             tool_call_id: "t1".into(),
-            title: title.into(),
             status,
             is_new,
+            identity: identity.clone(),
         };
         assert_eq!(
             progress,
             vec![
-                p("Terminal", "in_progress", true),
-                p("cargo test", "in_progress", false),
-                p("", "completed", false),
+                p("in_progress", true, &bash),
+                // the refinement names the tool only in `_meta.claudeCode.toolName`
+                p("in_progress", false, &bash),
+                p("completed", false, &ToolIdentity::default()),
             ]
         );
+        // The agent's titles ("Terminal", the command) never reach the ACP payload.
+        let titles: Vec<_> = progress.iter().map(|p| p.payload()["title"].clone()).collect();
+        assert_eq!(titles, [serde_json::json!("Bash"), serde_json::json!("Bash"), serde_json::Value::Null]);
         let sent = rec.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 1, "send-once: one answer message, got {sent:?}");
         assert!(sent[0].contains("the answer"), "{sent:?}");
@@ -2959,17 +3031,18 @@ done
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"migrated"}}}}'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
 
-    // Tool titles are redacted where core parses the agent event, so neither the ACP tool
-    // progress nor another platform's tool lines carry the credential.
+    // ACP tool progress never carries the agent's title at all, so not even its redacted form
+    // (redaction is best effort) reaches the client; other platforms show the title, masked.
     #[tokio::test]
-    async fn tool_titles_are_redacted_on_every_platform() {
+    async fn tool_titles_never_reach_acp_and_are_redacted_elsewhere() {
         let default_timeout = crate::config::default_prompt_hard_timeout_secs();
         let rec = run_turn_with("acp", SECRET_TOOL_TURN, 10, default_timeout).await;
         let progress = rec.progress.lock().unwrap().clone();
-        assert_eq!(progress[0].title, "export DB_PASSWORD=*** && ./migrate");
+        assert_eq!(progress[0].payload()["title"], serde_json::json!("tool"));
+        let wire: Vec<_> = progress.iter().map(|p| p.payload().to_string()).collect();
         assert!(
-            progress.iter().all(|p| !p.title.contains("hunter2")),
-            "{progress:?}"
+            wire.iter().all(|w| !w.contains("DB_PASSWORD") && !w.contains("migrate")),
+            "{wire:?}"
         );
 
         let rec = run_turn_with("telegram", SECRET_TOOL_TURN, 10, default_timeout).await;

@@ -397,11 +397,13 @@ pub enum AcpEvent {
     ToolStart {
         id: String,
         title: String,
+        identity: ToolIdentity,
     },
     ToolDone {
         id: String,
         title: String,
         status: String,
+        identity: ToolIdentity,
     },
     ConfigUpdate {
         options: Vec<ConfigOption>,
@@ -418,6 +420,81 @@ fn tool_title(update: &Value) -> String {
         .and_then(|v| v.as_str())
         .map(crate::redact::redact_tool_title)
         .unwrap_or_default()
+}
+
+/// What a tool event says about the tool itself, beyond its title: enough for a client to pick a
+/// short label or icon (`Bash` instead of the whole command) and to recognise its own tools.
+///
+/// Every field is a closed vocabulary or a shape-checked identifier, never free text — unlike the
+/// title, none of it goes through credential redaction, so nothing that can carry an argument
+/// value is allowed in. `rawInput` as a whole is deliberately NOT carried: it holds the tool's
+/// arguments verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolIdentity {
+    /// ACP `ToolKind` (`execute`, `read`, `edit`, …); anything outside the spec's set is dropped.
+    pub kind: Option<&'static str>,
+    /// Programmatic tool name (ACP `ToolCall.name`, e.g. `Bash`,
+    /// `mcp__grafana__query_prometheus`).
+    pub name: Option<String>,
+    /// For a call through the OAB MCP Facade (`…execute_capability`), the capability it invokes
+    /// (`rawInput.name`, e.g. `katashiro.click`) — the facade's own name says nothing about it.
+    pub capability: Option<String>,
+}
+
+impl ToolIdentity {
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_none() && self.name.is_none() && self.capability.is_none()
+    }
+}
+
+/// ACP v1 `ToolKind`.
+const TOOL_KINDS: [&str; 10] = [
+    "read",
+    "edit",
+    "delete",
+    "move",
+    "search",
+    "execute",
+    "think",
+    "fetch",
+    "switch_mode",
+    "other",
+];
+
+const MAX_TOOL_NAME_CHARS: usize = 128;
+
+/// A tool or capability name: a non-empty identifier of `[A-Za-z0-9_.:/-]`, at most
+/// [`MAX_TOOL_NAME_CHARS`]. Anything else (spaces, quotes, `=`) is not a name and is dropped
+/// rather than sanitised, so a value can never smuggle text past the title's redaction.
+fn tool_name_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().count() <= MAX_TOOL_NAME_CHARS
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '/' | '-'))
+}
+
+fn tool_identity(update: &Value) -> ToolIdentity {
+    fn str_at(v: Option<&Value>) -> Option<&str> {
+        v.and_then(Value::as_str)
+    }
+    let kind =
+        str_at(update.get("kind")).and_then(|k| TOOL_KINDS.iter().copied().find(|t| *t == k));
+    // `name` is the ACP field, but claude-agent-acp only sets it on the first `tool_call`; its
+    // refinements carry the same name in `_meta.claudeCode.toolName`, and the refinement is the
+    // event whose rawInput is complete enough to hold a facade capability.
+    let name = str_at(update.get("name"))
+        .or_else(|| str_at(update.pointer("/_meta/claudeCode/toolName")))
+        .filter(|n| tool_name_ok(n));
+    let capability = name
+        .filter(|n| n.ends_with("execute_capability"))
+        .and_then(|_| str_at(update.pointer("/rawInput/name")))
+        .filter(|c| tool_name_ok(c))
+        .map(str::to_string);
+    ToolIdentity {
+        kind,
+        name: name.map(str::to_string),
+        capability,
+    }
 }
 
 pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
@@ -446,10 +523,16 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
         "agent_thought_chunk" => Some(AcpEvent::Thinking),
         "tool_call" => {
             let title = tool_title(update);
-            Some(AcpEvent::ToolStart { id: tool_id, title })
+            let identity = tool_identity(update);
+            Some(AcpEvent::ToolStart {
+                id: tool_id,
+                title,
+                identity,
+            })
         }
         "tool_call_update" => {
             let title = tool_title(update);
+            let identity = tool_identity(update);
             let status = update
                 .get("status")
                 .and_then(|v| v.as_str())
@@ -460,9 +543,14 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
                     id: tool_id,
                     title,
                     status,
+                    identity,
                 })
             } else {
-                Some(AcpEvent::ToolStart { id: tool_id, title })
+                Some(AcpEvent::ToolStart {
+                    id: tool_id,
+                    title,
+                    identity,
+                })
             }
         }
         "plan" => Some(AcpEvent::Status),
@@ -523,6 +611,101 @@ mod tests {
         assert_eq!(opts[0].id, "model");
         assert_eq!(opts[0].current_value, "claude-sonnet-4");
         assert_eq!(opts[0].options.len(), 2);
+    }
+
+    fn tool_event(update: Value) -> AcpEvent {
+        let msg: JsonRpcMessage = serde_json::from_value(json!({
+            "method": "session/update",
+            "params": { "sessionId": "s1", "update": update }
+        }))
+        .unwrap();
+        classify_notification(&msg).expect("a tool event")
+    }
+
+    fn identity_of(update: Value) -> ToolIdentity {
+        match tool_event(update) {
+            AcpEvent::ToolStart { identity, .. } | AcpEvent::ToolDone { identity, .. } => identity,
+            other => panic!("not a tool event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_identity_reads_kind_and_name() {
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Terminal",
+            "name": "Bash", "kind": "execute", "status": "pending"
+        }));
+        assert_eq!(
+            id,
+            ToolIdentity {
+                kind: Some("execute"),
+                name: Some("Bash".into()),
+                capability: None
+            }
+        );
+        // claude-agent-acp's refinement names the tool only in its own _meta.
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "t1", "title": "cargo test",
+            "_meta": { "claudeCode": { "toolName": "Bash" } }, "kind": "execute"
+        }));
+        assert_eq!(id.name.as_deref(), Some("Bash"));
+        // ToolDone carries it too.
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
+            "_meta": { "claudeCode": { "toolName": "Bash" } }
+        }));
+        assert_eq!(id.name.as_deref(), Some("Bash"));
+        // A bare event carries nothing.
+        assert!(identity_of(
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "x" })
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn tool_identity_drops_anything_outside_its_vocabulary() {
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t", "title": "x",
+            "kind": "rm -rf /", "name": "export TOKEN=hunter2"
+        }));
+        assert!(id.is_empty(), "{id:?}");
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t", "title": "x",
+            "kind": 7, "name": "a".repeat(129)
+        }));
+        assert!(id.is_empty(), "{id:?}");
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t", "title": "x",
+            "kind": "switch_mode", "name": "mcp__plugin_x-y__a.b:c/d"
+        }));
+        assert_eq!(id.kind, Some("switch_mode"));
+        assert_eq!(id.name.as_deref(), Some("mcp__plugin_x-y__a.b:c/d"));
+    }
+
+    #[test]
+    fn tool_identity_takes_only_the_capability_name_from_a_facade_call() {
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "f", "title": "mcp__oab__execute_capability",
+            "_meta": { "claudeCode": { "toolName": "mcp__oab__execute_capability" } },
+            "rawInput": { "name": "katashiro.click", "arguments": { "text": "hunter2" } }
+        }));
+        assert_eq!(id.capability.as_deref(), Some("katashiro.click"));
+        assert!(
+            !format!("{id:?}").contains("hunter2"),
+            "arguments must never be carried"
+        );
+        // rawInput.name of any other tool is not a capability.
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "g", "title": "x",
+            "name": "mcp__github__get_pr", "rawInput": { "name": "katashiro.click" }
+        }));
+        assert_eq!(id.capability, None);
+        // A capability that is not a name is dropped.
+        let id = identity_of(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "h", "title": "x",
+            "name": "mcp__oab__execute_capability", "rawInput": { "name": "a b" }
+        }));
+        assert_eq!(id.capability, None);
     }
 
     #[test]
