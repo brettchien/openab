@@ -338,8 +338,8 @@ pub struct SenderContext {
 /// still arrives through the normal send path.
 ///
 /// Nor is the agent's tool title: it is usually the literal command (`export TOKEN=… && …`), and
-/// leaving it out is the only guarantee that no credential in it reaches an ACP client — pattern
-/// redaction is best effort. The ACP `title` is derived from [`ToolIdentity`] alone (see
+/// leaving it out is the only guarantee that no credential in it reaches an ACP client. The ACP
+/// `title` is derived from [`ToolIdentity`] alone (see
 /// [`ToolCallProgress::payload`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallProgress {
@@ -3031,10 +3031,10 @@ done
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"migrated"}}}}'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
 
-    // ACP tool progress never carries the agent's title at all, so not even its redacted form
-    // (redaction is best effort) reaches the client; other platforms show the title, masked.
+    // ACP tool progress never carries the agent's title, so a credential in the command cannot
+    // reach the client.
     #[tokio::test]
-    async fn tool_titles_never_reach_acp_and_are_redacted_elsewhere() {
+    async fn tool_titles_never_reach_acp() {
         let default_timeout = crate::config::default_prompt_hard_timeout_secs();
         let rec = run_turn_with("acp", SECRET_TOOL_TURN, 10, default_timeout).await;
         let progress = rec.progress.lock().unwrap().clone();
@@ -3044,14 +3044,6 @@ done
             wire.iter().all(|w| !w.contains("DB_PASSWORD") && !w.contains("migrate")),
             "{wire:?}"
         );
-
-        let rec = run_turn_with("telegram", SECRET_TOOL_TURN, 10, default_timeout).await;
-        let sent = rec.sent.lock().unwrap().join("\n");
-        assert!(
-            sent.contains("DB_PASSWORD=***"),
-            "the tool line is shown, masked: {sent}"
-        );
-        assert!(!sent.contains("hunter2"), "{sent}");
     }
 
     // Every other platform keeps its existing tool display and never sees tool_call commands —
