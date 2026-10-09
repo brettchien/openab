@@ -95,29 +95,12 @@ pub struct McpFacadeConfig {
     ///
     /// Enforced server-side because on this tunnel OPENAB is the requester and the peer is a
     /// browser extension we neither ship nor control, so there is nobody else to bound it.
-    /// The default sits STRICTLY beneath the ACP per-chunk idle timeout in `handle_session_prompt`
-    /// (`ACP_PROMPT_IDLE_TIMEOUT_SECS`, 180s), and the margin is the point. Referenced by name, not
-    /// by line: the same claim was written as a line number twice and was wrong both times, because
-    /// every edit above it moves the target. Setting the two equal makes which one fires
-    /// first undecidable at the boundary, and they do different things: only when this one wins
-    /// does the peer receive `mcp/cancel` and the caller see a timeout error. If the idle timeout
-    /// wins the turn simply ends, which leaves exactly the stranded work on the extension that
-    /// cancellation exists to prevent.
+    /// When this fires the peer receives `mcp/cancel` and the caller sees a timeout error.
     ///
-    /// **The idle timeout (180s by default) is therefore the effective ceiling.** A larger value
-    /// here is not an error and is not clamped, but it cannot take effect: the turn ends there
-    /// first and this setting stops mattering. Raise the idle timeout itself with
-    /// `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS` to go higher. Startup warns when this is set at or
-    /// above it rather than letting the number look effective.
-    ///
-    /// The check lives in the gateway, beside the constant, as
-    /// `warn_if_tunnel_timeout_is_ineffective`; the binary only hands it this value. That keeps the
-    /// ceiling and the comparison in one place, so changing it — or making it configurable — is a
-    /// single edit. It does not remove coupling: this crate cannot see the constant, since
-    /// `openab-gateway` does not depend on `openab-core`, and the gateway never sees this value. The
-    /// binary is the only place both are visible, and it already depends on the gateway. Moving the
-    /// constant into this crate would ADD a dependency edge to save nothing. To raise both, raise
-    /// the idle timeout first, then this value, keeping it strictly beneath.
+    /// The ACP per-chunk idle timeout (`ACP_PROMPT_IDLE_TIMEOUT_SECS` in the gateway) does not cap
+    /// this wait: while the agent is blocked on a tunnelled request it is still alive, so core's
+    /// liveness tick keeps sending keepalives and the turn stays open. The ceiling above this value
+    /// is core's own `prompt_hard_timeout_secs`.
     #[serde(default = "default_tunnel_timeout_seconds")]
     pub tunnel_timeout_seconds: u64,
 }

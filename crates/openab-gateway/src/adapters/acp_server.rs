@@ -46,17 +46,15 @@ const MAX_INFLIGHT_PROMPTS: usize = 32;
 const MAX_INFLIGHT_ESTABLISHES: usize = 64;
 /// Default per-chunk idle timeout for a prompt turn, in `handle_session_prompt`.
 ///
-/// Named rather than left inline because it is the effective ceiling on anything a turn waits for:
-/// the tunnel's own timeout has to stay strictly beneath it, and `[mcp] tunnel_timeout_seconds`
-/// documents itself against this value. As a bare literal in the middle of a loop it was invisible
-/// to exactly the person who needed it — the operator raising the tunnel timeout into it.
-///
 /// "Idle" means no chunk of any kind: core sends the answer text once at turn end, but forwards
 /// tool progress (`tool_call` / `tool_call_update`) as it happens, and while the agent is alive
 /// but silent it sends a `keepalive` on every liveness tick (`[pool] liveness_check_secs`, 30s by
 /// default — keep it beneath this value). So in practice this fires when core or its connection
-/// is gone; a stuck-but-alive agent is bounded by core's own `prompt_hard_timeout_secs`. Override with `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS`; the effective
-/// value is [`prompt_idle_timeout_secs`].
+/// is gone; a stuck-but-alive agent is bounded by core's own `prompt_hard_timeout_secs`. That
+/// includes a turn waiting on a tunnelled `type:acp` request: the agent is alive, so keepalives
+/// hold the turn open and `[mcp] tunnel_timeout_seconds` decides that wait, not this value.
+/// Override with `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS`; the effective value is
+/// [`prompt_idle_timeout_secs`].
 pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 
 /// Env override for [`ACP_PROMPT_IDLE_TIMEOUT_SECS`].
@@ -123,37 +121,6 @@ async fn next_ws_ping(ping: &mut Option<tokio::time::Interval>) {
     }
 }
 
-/// Whether a configured tunnel timeout is overtaken by the idle timeout, and so cannot decide the
-/// outcome.
-///
-/// Split out from the warning so the boundary is testable without capturing log output: the
-/// interesting part is one comparison, and an inverted `>=` would be silent in exactly the case it
-/// exists to report.
-pub fn tunnel_timeout_is_ineffective(configured_secs: u64) -> bool {
-    configured_secs >= prompt_idle_timeout_secs()
-}
-
-/// Warn when a configured tunnel timeout cannot take effect because the idle timeout above overtakes
-/// it.
-///
-/// Lives here, next to the number it is about, rather than in the binary that reads the config. The
-/// edge is unchanged — the binary already depends on this crate — but the caller no longer has to
-/// know what the ceiling is or which direction to compare, so when that constant changes or becomes
-/// configurable there is one place to edit instead of two. This is a relocation of the invariant, not
-/// a removal of coupling: the value still has to be handed in, because this crate never sees the
-/// config.
-pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
-    if tunnel_timeout_is_ineffective(configured_secs) {
-        warn!(
-            configured = configured_secs,
-            effective_ceiling = prompt_idle_timeout_secs(),
-            "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout \
-             ({ACP_PROMPT_IDLE_TIMEOUT_ENV}) — the turn ends there first, so this value cannot \
-             take effect"
-        );
-    }
-}
-
 /// Whether core's liveness tick is too slow to keep an idle-but-alive ACP turn open.
 ///
 /// Keepalives ride `[pool] liveness_check_secs`, and each one has to land inside the idle window.
@@ -163,8 +130,8 @@ pub fn liveness_tick_too_slow_for_idle_timeout(liveness_check_secs: u64) -> bool
 }
 
 /// Warn when `[pool] liveness_check_secs` leaves keepalives too little margin under the ACP idle
-/// timeout. Same split as [`warn_if_tunnel_timeout_is_ineffective`]: the comparison lives beside
-/// the timeout, the binary only hands over the configured value.
+/// timeout. The comparison lives beside the timeout; the binary only hands over the configured
+/// value, since this crate never sees core's config.
 pub fn warn_if_liveness_tick_too_slow(liveness_check_secs: u64) {
     if liveness_tick_too_slow_for_idle_timeout(liveness_check_secs) {
         warn!(
@@ -188,21 +155,35 @@ const MAX_FRAME_BYTES: usize = 8 << 20; // 8 MiB — browser-tool results (e.g. 
 /// The method of a parsed inbound frame when it exceeds the limit for its kind, else `None`.
 ///
 /// Only client **responses** — `id` present, no `method` — carry tunnel results and may use the
-/// full [`MAX_FRAME_BYTES`]. A `session/prompt` may carry base64 images (a pasted screenshot is
-/// routinely over 1 MiB) and is held to [`MAX_PROMPT_FRAME_BYTES`]. Every other method-bearing
-/// frame is a client request or notification and is held to [`MAX_NON_TUNNEL_FRAME_BYTES`].
+/// full [`MAX_FRAME_BYTES`]. A `session/prompt` that carries an `image` block (a pasted screenshot
+/// is routinely over 1 MiB) is held to [`MAX_PROMPT_FRAME_BYTES`]. Every other method-bearing
+/// frame — a text-only prompt included — is held to [`MAX_NON_TUNNEL_FRAME_BYTES`].
 fn oversized_for_its_kind(len: usize, raw: &Value) -> Option<&str> {
     let method = raw.get("method").and_then(Value::as_str)?;
-    (len > frame_limit_for(method)).then_some(method)
+    (len > frame_limit_for(method, raw)).then_some(method)
 }
 
 /// The inbound size limit for a frame carrying `method` (see [`oversized_for_its_kind`]).
-fn frame_limit_for(method: &str) -> usize {
-    if method == "session/prompt" {
+///
+/// The image allowance follows the content, not the method: granting it to every prompt would
+/// reopen what F2 closed, `MAX_INFLIGHT_PROMPTS` × 8 MiB of prompt text parked on one connection.
+fn frame_limit_for(method: &str, raw: &Value) -> usize {
+    if method == "session/prompt" && prompt_has_image_block(raw) {
         MAX_PROMPT_FRAME_BYTES
     } else {
         MAX_NON_TUNNEL_FRAME_BYTES
     }
+}
+
+/// Whether a `session/prompt` frame carries at least one `image` content block.
+fn prompt_has_image_block(raw: &Value) -> bool {
+    raw.pointer("/params/prompt")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+        })
 }
 
 /// Ceiling for a `session/prompt` frame, which may carry `image` blocks. The transport ceiling:
@@ -1675,7 +1656,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         // `session/prompt`, which may carry images (see `frame_limit_for`).
         if let Some(method) = oversized_for_its_kind(text.len(), &raw) {
             {
-                let max = frame_limit_for(method);
+                let max = frame_limit_for(method, &raw);
                 warn!(
                     connection = %connection_id,
                     method,
@@ -2536,14 +2517,31 @@ async fn handle_session_prompt(
         }
     };
 
-    let attachments = match prompt_image_attachments(prompt_images).await {
-        Ok(a) => a,
-        Err((code, e)) => {
-            let resp = JsonRpcResponse::error(id, code, e);
-            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+    // Images can wait a long time for a gateway-wide decode permit. A `session/cancel` in that
+    // window has to end the turn HERE: once the event is dispatched core runs it, and nothing
+    // tells core to stop. `biased` so a cancel that is already pending wins over an instant
+    // (image-less) completion. There is no await between this and the dispatch below.
+    let attachments = tokio::select! {
+        biased;
+        _ = cancel.notified() => {
             release_prompt(sessions, &session_id).await;
+            let pr = crate::adapters::acp_schema::PromptResponse {
+                stop_reason: crate::adapters::acp_schema::StopReason::Cancelled,
+                meta: None,
+            };
+            let resp = JsonRpcResponse::success(id, serde_json::to_value(&pr).unwrap());
+            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             return;
         }
+        r = prompt_image_attachments(prompt_images) => match r {
+            Ok(a) => a,
+            Err((code, e)) => {
+                let resp = JsonRpcResponse::error(id, code, e);
+                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                release_prompt(sessions, &session_id).await;
+                return;
+            }
+        },
     };
 
     // Convert to GatewayEvent and dispatch. Build it first so its `event_id` can fence
@@ -2836,6 +2834,15 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<PromptParams, String>
         // `PromptRequest.prompt: [ContentBlock]` shape → -32602 invalid params.
         return Err("Invalid prompt: 'prompt' must be an array of content blocks".into());
     };
+
+    // The frame may have used the image allowance; the text riding along with the image still
+    // gets the text-only limit, or one tiny image block would unlock 8 MiB of prompt text.
+    if text.len() > MAX_NON_TUNNEL_FRAME_BYTES {
+        return Err(format!(
+            "Prompt text exceeds {}",
+            crate::media::format_bytes(MAX_NON_TUNNEL_FRAME_BYTES as u64)
+        ));
+    }
 
     // An image alone is a prompt (a pasted screenshot needs no caption).
     if text.trim().is_empty() && images.is_empty() {
@@ -3386,6 +3393,26 @@ mod acp_conformance {
         assert!(extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": []}))).is_err());
     }
 
+    /// An image lifts the frame limit, not the text limit: a small image must not carry
+    /// megabytes of prompt text past F2's 1 MiB.
+    #[test]
+    fn an_image_does_not_lift_the_prompt_text_limit() {
+        use super::extract_prompt_params;
+        let png = b64(&tiny_png(2, 2));
+        let prompt = |text: String| {
+            extract_prompt_params(Some(&json!({
+                "sessionId": "sess_x",
+                "prompt": [
+                    {"type": "text", "text": text},
+                    {"type": "image", "data": png, "mimeType": "image/png"}
+                ]
+            })))
+        };
+        assert!(prompt("a".repeat(super::MAX_NON_TUNNEL_FRAME_BYTES)).is_ok());
+        let err = prompt("a".repeat(super::MAX_NON_TUNNEL_FRAME_BYTES + 1)).unwrap_err();
+        assert!(err.contains("Prompt text exceeds"), "{err}");
+    }
+
     #[test]
     fn malformed_prompt_image_blocks_are_rejected() {
         use super::extract_prompt_params;
@@ -3911,28 +3938,6 @@ mod acp_requests {
             None,
             "resolution is scoped to the channel — another channel's tunnel must not be reachable"
         );
-    }
-
-    /// The ineffective-timeout boundary is inclusive on the ceiling.
-    ///
-    /// Equal is the case that matters and the one an inverted comparison would drop: at exactly the
-    /// idle timeout the two clocks start together and which fires first is undecided, so the value
-    /// cannot be relied on to decide anything — that is the whole reason the margin exists.
-    #[test]
-    fn a_tunnel_timeout_at_or_above_the_idle_timeout_is_ineffective() {
-        let ceiling = super::ACP_PROMPT_IDLE_TIMEOUT_SECS;
-        assert!(
-            super::tunnel_timeout_is_ineffective(ceiling),
-            "equal to the ceiling must count as ineffective: the two clocks start together, so \
-             neither reliably wins"
-        );
-        assert!(super::tunnel_timeout_is_ineffective(ceiling + 1));
-        assert!(
-            !super::tunnel_timeout_is_ineffective(ceiling - 1),
-            "one second beneath the ceiling is the intended configuration, not a warning"
-        );
-        // The shipped default cannot be checked here: this crate does not depend on the one that
-        // owns it. That pairing is asserted in the binary, which is the only place both are visible.
     }
 
     /// An establish that finishes after its connection closed must not register.
@@ -4477,12 +4482,18 @@ mod acp_review_fixes {
             "an 8 MiB tunnel result must still be accepted — that is what the raise is for"
         );
 
-        // A prompt may carry images (a pasted screenshot), so it gets the prompt allowance —
-        // up to it, inclusive, and no further.
-        let prompt = json!({ "jsonrpc": "2.0", "id": 1, "method": "session/prompt" });
+        // A prompt carrying an image (a pasted screenshot) gets the prompt allowance — up to it,
+        // inclusive, and no further.
+        let prompt = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/prompt",
+            "params": { "prompt": [
+                { "type": "text", "text": "look" },
+                { "type": "image", "mimeType": "image/png", "data": "" }
+            ] }
+        });
         assert!(
             super::oversized_for_its_kind(over_1mib, &prompt).is_none(),
-            "a >1 MiB prompt (an image) is accepted"
+            "a >1 MiB prompt carrying an image is accepted"
         );
         assert!(
             super::oversized_for_its_kind(super::MAX_PROMPT_FRAME_BYTES, &prompt).is_none(),
@@ -4491,6 +4502,20 @@ mod acp_review_fixes {
         assert_eq!(
             super::oversized_for_its_kind(super::MAX_PROMPT_FRAME_BYTES + 1, &prompt),
             Some("session/prompt")
+        );
+
+        // A text-only prompt has no image to justify the allowance: F2's 1 MiB applies.
+        let text_prompt = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": { "prompt": [{ "type": "text", "text": "hi" }] }
+        });
+        assert_eq!(
+            super::oversized_for_its_kind(over_1mib, &text_prompt),
+            Some("session/prompt"),
+            "a >1 MiB text-only prompt must be rejected"
+        );
+        assert!(
+            super::oversized_for_its_kind(super::MAX_NON_TUNNEL_FRAME_BYTES, &text_prompt).is_none()
         );
 
         // Every other request stays at 1 MiB.
@@ -4915,6 +4940,61 @@ mod acp_review_fixes {
         }
         let turn_id = turn_id.expect("handler must register a reply sink");
         PromptHarness { registry, channel_id, _event_rx: event_rx, out_rx, handle, turn_id }
+    }
+
+    // A cancel that lands while the prompt's images wait for a decode permit ends the turn in
+    // the gateway: nothing is dispatched, so core never runs a turn the client already
+    // cancelled (and the session is free for the next prompt).
+    #[tokio::test]
+    async fn a_cancel_during_image_processing_is_never_dispatched() {
+        use super::{IMAGE_DECODE_CONCURRENCY, IMAGE_DECODE_PERMITS};
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(new_reply_registry());
+        let state = Arc::new(st);
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession { channel_id: format!("acp_{}", Uuid::new_v4()), busy: true, cancel: Some(cancel.clone()) },
+        );
+        let png = {
+            let img = image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+        };
+
+        let held = IMAGE_DECODE_PERMITS
+            .acquire_many(IMAGE_DECODE_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let params = json!({"sessionId": sid, "prompt": [
+            {"type": "image", "data": png, "mimeType": "image/png"}
+        ]});
+        let (st2, sessions2, sid2, cancel2) = (state.clone(), sessions.clone(), sid.clone(), cancel.clone());
+        let handle = tokio::spawn(async move {
+            handle_session_prompt(&st2, &sessions2, json!(5), Some(&params), &out_tx, sid2, cancel2, "conn-test", 0).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "the image must be waiting on a permit");
+        cancel.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("a cancel must end a turn still waiting on images")
+            .unwrap();
+        drop(held);
+
+        assert!(event_rx.try_recv().is_err(), "a cancelled turn must not reach core");
+        let resp: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(resp["id"], json!(5));
+        assert_eq!(resp["result"]["stopReason"], json!("cancelled"), "{resp}");
+        let s = sessions.lock().await;
+        let s = s.get(&sid).unwrap();
+        assert!(!s.busy && s.cancel.is_none(), "the session must be released");
     }
 
     // End to end through the prompt handler: an ACP image block leaves the gateway as an
