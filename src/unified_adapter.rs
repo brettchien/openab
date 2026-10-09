@@ -381,6 +381,10 @@ mod tests {
                 assert_eq!(u["status"], "in_progress", "{u}");
                 assert_eq!(u["kind"], "execute", "{u}");
                 assert_eq!(u["title"], "Bash", "{u}");
+                // The programmatic name rides in `_meta.openab` (katashiro#50 reads it there);
+                // ACP's ToolCall has no top-level `name`.
+                assert_eq!(u["_meta"]["openab"]["name"], "Bash", "{u}");
+                assert!(u.get("name").is_none(), "{u}");
             }
             _ => panic!("tool progress must arrive as a session/update body"),
         }

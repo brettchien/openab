@@ -1697,7 +1697,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             continue;
         }
 
-        let req: JsonRpcRequest = match serde_json::from_value(raw) {
+        let mut req: JsonRpcRequest = match serde_json::from_value(raw) {
             Ok(r) => r,
             Err(e) => {
                 if !is_notification {
@@ -2017,7 +2017,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     }
                 }
 
-                // session/prompt is async — spawn a task to handle streaming
+                // session/prompt is async — spawn a task to handle streaming. The params move in
+                // owned so the task can drop them right after parsing: an image prompt's frame is
+                // up to MAX_PROMPT_FRAME_BYTES, and holding it for the whole turn would park
+                // MAX_INFLIGHT_PROMPTS of them per connection (review F2).
+                let params = req.params.take();
                 let state_clone = state.clone();
                 let sessions_clone = sessions.clone();
                 let out_tx_clone = out_tx.clone();
@@ -2027,7 +2031,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &state_clone,
                         &sessions_clone,
                         id,
-                        req.params.as_ref(),
+                        params,
                         &out_tx_clone,
                         session_id,
                         cancel,
@@ -2485,7 +2489,9 @@ async fn handle_session_prompt(
     state: &Arc<crate::AppState>,
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
-    params: Option<&Value>,
+    // Owned: dropped as soon as it is parsed, so the raw frame (base64 and any padding beside it)
+    // does not outlive the parse. Only the decoded image bytes are carried on.
+    params: Option<Value>,
     out_tx: &mpsc::UnboundedSender<String>,
     // The caller (read loop) already reserved this session SYNCHRONOUSLY: `busy = true` and
     // `cancel` installed under the session lock (R16-F1). This task owns releasing it on return.
@@ -2500,12 +2506,14 @@ async fn handle_session_prompt(
     connection_generation: u64,
 ) {
     // sessionId was validated + reserved by the caller; only the prompt body can still be bad.
-    let (prompt_text, prompt_images) = match extract_prompt_params(params) {
+    let parsed = extract_prompt_params(params.as_ref());
+    drop(params);
+    let (prompt_text, prompt_images) = match parsed {
         Ok(p) => (p.text, p.images),
         Err(e) => {
+            release_prompt(sessions, &session_id).await;
             let resp = JsonRpcResponse::error(id, -32602, e);
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            release_prompt(sessions, &session_id).await;
             return;
         }
     };
@@ -2514,6 +2522,7 @@ async fn handle_session_prompt(
     let channel_id = match sessions.lock().await.get(&session_id) {
         Some(s) => s.channel_id.clone(),
         None => {
+            release_prompt(sessions, &session_id).await;
             let resp =
                 JsonRpcResponse::error(
                     id,
@@ -2521,7 +2530,6 @@ async fn handle_session_prompt(
                     format!("Unknown session: {}", redact_id(&session_id)),
                 );
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            release_prompt(sessions, &session_id).await;
             return;
         }
     };
@@ -2545,9 +2553,9 @@ async fn handle_session_prompt(
         r = prompt_image_attachments(prompt_images) => match r {
             Ok(a) => a,
             Err((code, e)) => {
+                release_prompt(sessions, &session_id).await;
                 let resp = JsonRpcResponse::error(id, code, e);
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                release_prompt(sessions, &session_id).await;
                 return;
             }
         },
@@ -2597,13 +2605,13 @@ async fn handle_session_prompt(
             if state.event_tx.send(json).is_err() {
                 // No receivers — agent/core not connected
                 warn!("ACP: event_tx send failed — no agent connected");
+                release_prompt(sessions, &session_id).await;
                 let resp = JsonRpcResponse::error(
                     id,
                     -32603,
                     "No agent backend connected",
                 );
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                release_prompt(sessions, &session_id).await;
                 // Cleanup registry — only this turn's own sink (F4).
                 if let Some(ref registry) = state.acp_reply_registry {
                     remove_reply_sink_if_owner(registry, &channel_id, &turn_id);
@@ -2613,9 +2621,9 @@ async fn handle_session_prompt(
         }
         Err(e) => {
             warn!("ACP: failed to serialize event: {e}");
+            release_prompt(sessions, &session_id).await;
             let resp = JsonRpcResponse::error(id, -32603, "Internal error");
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            release_prompt(sessions, &session_id).await;
             return;
         }
     }
@@ -4817,7 +4825,7 @@ mod acp_review_fixes {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
-        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel, "conn-test", 0)
+        handle_session_prompt(&state, &sessions, json!(7), Some(params), &out_tx, sid.clone(), cancel, "conn-test", 0)
             .await;
 
         // The final response (matching our request id) must carry stopReason "cancelled".
@@ -4899,7 +4907,7 @@ mod acp_review_fixes {
         let sid2 = sid.clone();
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, json!(11), Some(&params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
+            handle_session_prompt(&st2, &sessions2, json!(11), Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
                 .await;
         });
 
@@ -4966,7 +4974,7 @@ mod acp_review_fixes {
         let (st2, sessions2, sid2) = (state.clone(), sessions.clone(), sid.clone());
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, request_id, Some(&params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
+            handle_session_prompt(&st2, &sessions2, request_id, Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
                 .await;
         });
 
@@ -5017,7 +5025,7 @@ mod acp_review_fixes {
         ]});
         let (st2, sessions2, sid2, cancel2) = (state.clone(), sessions.clone(), sid.clone(), cancel.clone());
         let handle = tokio::spawn(async move {
-            handle_session_prompt(&st2, &sessions2, json!(5), Some(&params), &out_tx, sid2, cancel2, "conn-test", 0).await;
+            handle_session_prompt(&st2, &sessions2, json!(5), Some(params), &out_tx, sid2, cancel2, "conn-test", 0).await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!handle.is_finished(), "the image must be waiting on a permit");
@@ -5066,7 +5074,7 @@ mod acp_review_fixes {
             {"type": "image", "data": png, "mimeType": "image/png"}
         ]});
         let handle = tokio::spawn(async move {
-            handle_session_prompt(&state, &sessions, json!(1), Some(&params), &out_tx, sid, cancel, "conn-test", 0).await;
+            handle_session_prompt(&state, &sessions, json!(1), Some(params), &out_tx, sid, cancel, "conn-test", 0).await;
         });
 
         let raw = tokio::time::timeout(std::time::Duration::from_secs(10), event_rx.recv())
