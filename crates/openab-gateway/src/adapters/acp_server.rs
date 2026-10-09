@@ -1575,9 +1575,10 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         }
     });
 
-    // Liveness bookkeeping for the disconnect log: when the last frame of any kind arrived, and
-    // whether the client's WS pings were still reaching us.
+    // Liveness bookkeeping for the disconnect log: when the client last sent a frame of its own,
+    // whether its WS pings were still reaching us, and when it last answered one of ours.
     let mut last_inbound = std::time::Instant::now();
+    let mut last_pong: Option<std::time::Instant> = None;
     let mut last_ping: Option<std::time::Instant> = None;
     let mut pings: u64 = 0;
 
@@ -1588,6 +1589,12 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             Some(Err(e)) => break ReadLoopExit::ReadError(e.to_string()),
             None => break ReadLoopExit::StreamEnded,
         };
+        // A Pong only answers our own server ping, so it says the socket is up, not that the
+        // client did anything: counting it would pin `idle_secs` at the ping interval.
+        if matches!(msg, Message::Pong(_)) {
+            last_pong = Some(std::time::Instant::now());
+            continue;
+        }
         last_inbound = std::time::Instant::now();
         let text = match msg {
             Message::Text(text) => text,
@@ -2061,6 +2068,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // One line that says why the connection ended and how quiet it had been. `idle_secs` against
     // the edge proxy's idle limit, and `last_ping_secs` against the client's ping interval, are what
     // separate a proxy timeout from a client that stopped pinging from the gateway hanging up.
+    // `last_pong_secs` is whether the socket still answered our server pings at the end.
     // `out_idle_secs` is the same for the writer: how long since a frame last went out.
     prompt_tasks.retain(|h| !h.is_finished());
     let out_idle_ms = (connected_at.elapsed().as_millis() as u64)
@@ -2072,6 +2080,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         out_idle_secs = out_idle_ms / 1000,
         last_ping_secs = ?last_ping.map(|t| t.elapsed().as_secs()),
         pings,
+        last_pong_secs = ?last_pong.map(|t| t.elapsed().as_secs()),
         inflight_prompts = prompt_tasks.len(),
         "ACP read loop ended"
     );
@@ -2712,11 +2721,11 @@ const PROMPT_IMAGE_MIME_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gi
 
 /// How many prompt images may be decoded at once, across every ACP connection.
 ///
-/// The frame and per-image byte caps bound the *encoded* size only. `resize_and_compress`
-/// decodes with the `image` crate's default limits (no dimension cap, 512 MiB allocation), so a
-/// few hundred KiB of flat-colour PNG can expand to ~500 MiB of pixels, plus the Lanczos3
-/// resize buffer. `MAX_INFLIGHT_PROMPTS` prompts per connection, each carrying several such
-/// images, would otherwise decode in parallel; this keeps the worst case to a few decodes.
+/// The frame and per-image byte caps bound the *encoded* size only. Each decode is held to
+/// `media::resize_and_compress_bounded`'s limits (≤ 10 000 px a side, 128 MiB of decoder
+/// allocation), plus the Lanczos3 resize buffer. `MAX_INFLIGHT_PROMPTS` prompts per connection,
+/// each carrying several images, would otherwise decode in parallel; this keeps the worst case
+/// to a few bounded decodes.
 const IMAGE_DECODE_CONCURRENCY: usize = 2;
 static IMAGE_DECODE_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(IMAGE_DECODE_CONCURRENCY);
@@ -2856,9 +2865,10 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<PromptParams, String>
 }
 
 /// Turn a prompt's images into core `image` attachments: resized / re-encoded by the same
-/// `media::resize_and_compress` every other platform uses (longest side ≤ 1200px, JPEG; small
-/// GIFs pass through), then stored under `~/.openab/media/inbound` and referenced by path, as the
-/// other adapters do. `Err((code, message))` is the JSON-RPC error to answer the prompt with.
+/// transform every other platform uses, with decoder limits added since the client sends the
+/// bytes directly (`media::resize_and_compress_bounded`: longest side ≤ 1200px, JPEG; small GIFs
+/// pass through), then stored under `~/.openab/media/inbound` and referenced by path, as the other
+/// adapters do. `Err((code, message))` is the JSON-RPC error to answer the prompt with.
 async fn prompt_image_attachments(images: Vec<PromptImage>) -> Result<Vec<Attachment>, (i32, String)> {
     let mut out = Vec::with_capacity(images.len());
     for (i, PromptImage { bytes, mime_type }) in images.into_iter().enumerate() {
@@ -2871,7 +2881,7 @@ async fn prompt_image_attachments(images: Vec<PromptImage>) -> Result<Vec<Attach
         let (compressed, mime) =
             match tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                crate::media::resize_and_compress(&bytes)
+                crate::media::resize_and_compress_bounded(&bytes)
             })
             .await
             {
@@ -3026,19 +3036,25 @@ fn tool_progress_update(kind: &str, payload: &str) -> Option<Value> {
             update["kind"] = json!(kind);
         }
     }
+    // ACP's `ToolCall` has no `name` field, so the programmatic name rides in `_meta.openab`
+    // beside the facade capability: extension data goes under `_meta`, not new top-level keys.
+    let mut openab = serde_json::Map::new();
     if let Some(name) = p
         .get("name")
         .and_then(Value::as_str)
         .filter(|n| tool_name_ok(n))
     {
-        update["name"] = json!(name);
+        openab.insert("name".into(), json!(name));
     }
     if let Some(capability) = p
         .pointer("/_meta/openab/capability")
         .and_then(Value::as_str)
         .filter(|c| tool_name_ok(c))
     {
-        update["_meta"] = json!({ "openab": { "capability": capability } });
+        openab.insert("capability".into(), json!(capability));
+    }
+    if !openab.is_empty() {
+        update["_meta"] = json!({ "openab": openab });
     }
     Some(update)
 }
@@ -4638,6 +4654,30 @@ mod acp_review_fixes {
         }
     }
 
+    // The keepalive exception to the fence must not widen to tool progress: a superseded turn's
+    // tool events are content, and would show the old turn's tools in the new turn's stream.
+    #[tokio::test]
+    async fn handle_reply_fences_stale_tool_progress() {
+        let registry = new_reply_registry();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink { turn_id: "evt_current".into(), tx, owner: "conn-test".into(), generation: 0 },
+        );
+        let progress = r#"{"toolCallId":"t1","title":"Bash","status":"in_progress"}"#;
+
+        for kind in ["tool_call", "tool_call_update"] {
+            handle_reply(&reply("acp_chan", "evt_stale", progress, Some(kind)), &registry).await;
+            assert!(rx.try_recv().is_err(), "stale {kind} must not reach the active turn");
+        }
+
+        handle_reply(&reply("acp_chan", "evt_current", progress, Some("tool_call")), &registry).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(ReplyChunk::Update(_))),
+            "the active turn's tool progress is delivered"
+        );
+    }
+
     // F4 — two connections on one session race on the process-wide reply registry (session busy is
     // per-connection). Generation orders them: a newer connection takes over, an older one arriving
     // late cannot clobber it, and neither turn's completion removes the other's live sink.
@@ -5053,7 +5093,7 @@ mod acp_review_fixes {
     #[tokio::test(start_paused = true)]
     async fn tool_progress_keeps_a_long_turn_alive_and_the_answer_stays_one_chunk() {
         let mut h = start_prompt(json!(21)).await;
-        let step = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS * 2 / 3);
+        let step = tokio::time::Duration::from_secs(prompt_idle_timeout_secs() * 2 / 3);
         let progress = [
             ("tool_call", r#"{"toolCallId":"t1","title":"Terminal","status":"in_progress"}"#),
             ("tool_call_update", r#"{"toolCallId":"t1","title":"Bash","status":"in_progress"}"#),
@@ -5099,7 +5139,7 @@ mod acp_review_fixes {
     async fn keepalive_carries_a_silent_turn_and_is_not_forwarded() {
         let mut h = start_prompt(json!(24)).await;
         let tick = tokio::time::Duration::from_secs(30);
-        let ticks = ACP_PROMPT_IDLE_TIMEOUT_SECS * 3 / 30; // 3 idle windows of silence
+        let ticks = prompt_idle_timeout_secs() * 3 / 30; // 3 idle windows of silence
         for _ in 0..ticks {
             tokio::time::sleep(tick).await;
             handle_reply(&reply(&h.channel_id, &h.turn_id, "", Some("keepalive")), &h.registry).await;
@@ -5131,7 +5171,7 @@ mod acp_review_fixes {
         h.handle.await.unwrap();
         let waited = last.elapsed().as_secs();
         assert!(
-            (ACP_PROMPT_IDLE_TIMEOUT_SECS..ACP_PROMPT_IDLE_TIMEOUT_SECS + 5).contains(&waited),
+            (prompt_idle_timeout_secs()..prompt_idle_timeout_secs() + 5).contains(&waited),
             "times out one idle window after the last keepalive (waited {waited}s)"
         );
     }
@@ -5144,7 +5184,7 @@ mod acp_review_fixes {
         let mut h = start_prompt(json!(26)).await;
         let old_turn = "evt_superseded";
         let tick = tokio::time::Duration::from_secs(30);
-        for _ in 0..(ACP_PROMPT_IDLE_TIMEOUT_SECS * 3 / 30) {
+        for _ in 0..(prompt_idle_timeout_secs() * 3 / 30) {
             tokio::time::sleep(tick).await;
             handle_reply(
                 &reply(&h.channel_id, old_turn, "", Some("keepalive")),
@@ -5254,8 +5294,10 @@ mod acp_review_fixes {
             ),
             Some(json!({
                 "sessionUpdate": "tool_call_update", "toolCallId": "a", "kind": "execute",
-                "name": "mcp__oab__execute_capability",
-                "_meta": { "openab": { "capability": "katashiro.click" } }
+                "_meta": { "openab": {
+                    "name": "mcp__oab__execute_capability",
+                    "capability": "katashiro.click"
+                } }
             }))
         );
         // …and are dropped, not sanitised, when they are not.
@@ -5271,7 +5313,7 @@ mod acp_review_fixes {
         assert_eq!(
             tool_progress_update("tool_call_update", &long)
                 .unwrap()
-                .get("name"),
+                .get("_meta"),
             None
         );
     }

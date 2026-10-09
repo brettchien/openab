@@ -537,6 +537,50 @@ async fn handle_config_command(
     }
 }
 
+/// The `GatewayReply` carrying one tool-progress event: `command` names the ACP update and the
+/// body is its JSON payload, fenced to the turn by `reply_to`.
+fn tool_progress_reply(
+    channel: &ChannelRef,
+    progress: &crate::adapter::ToolCallProgress,
+) -> GatewayReply {
+    GatewayReply {
+        schema: "openab.gateway.reply.v1".into(),
+        reply_to: channel.origin_event_id.clone().unwrap_or_default(),
+        platform: channel.platform.clone(),
+        channel: ReplyChannel {
+            id: channel.channel_id.clone(),
+            thread_id: channel.thread_id.clone(),
+        },
+        content: ReplyContent {
+            content_type: "json".into(),
+            text: progress.payload().to_string(),
+        },
+        command: Some(progress.command().into()),
+        request_id: None,
+        quote_message_id: None,
+    }
+}
+
+/// The contentless `keepalive` reply core's liveness tick sends while an ACP turn is silent.
+fn keepalive_reply(channel: &ChannelRef) -> GatewayReply {
+    GatewayReply {
+        schema: "openab.gateway.reply.v1".into(),
+        reply_to: channel.origin_event_id.clone().unwrap_or_default(),
+        platform: channel.platform.clone(),
+        channel: ReplyChannel {
+            id: channel.channel_id.clone(),
+            thread_id: channel.thread_id.clone(),
+        },
+        content: ReplyContent {
+            content_type: "text".into(),
+            text: String::new(),
+        },
+        command: Some("keepalive".into()),
+        request_id: None,
+        quote_message_id: None,
+    }
+}
+
 #[async_trait]
 impl ChatAdapter for GatewayAdapter {
     fn platform(&self) -> &'static str {
@@ -661,45 +705,13 @@ impl ChatAdapter for GatewayAdapter {
         progress: &crate::adapter::ToolCallProgress,
     ) -> Result<()> {
         // Fire-and-forget: progress is advisory and must not stall the turn on an ack.
-        let reply = GatewayReply {
-            schema: "openab.gateway.reply.v1".into(),
-            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
-            platform: channel.platform.clone(),
-            channel: ReplyChannel {
-                id: channel.channel_id.clone(),
-                thread_id: channel.thread_id.clone(),
-            },
-            content: ReplyContent {
-                content_type: "json".into(),
-                text: progress.payload().to_string(),
-            },
-            command: Some(progress.command().into()),
-            request_id: None,
-            quote_message_id: None,
-        };
-        let json = serde_json::to_string(&reply)?;
+        let json = serde_json::to_string(&tool_progress_reply(channel, progress))?;
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
         Ok(())
     }
 
     async fn send_keepalive(&self, channel: &ChannelRef) -> Result<()> {
-        let reply = GatewayReply {
-            schema: "openab.gateway.reply.v1".into(),
-            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
-            platform: channel.platform.clone(),
-            channel: ReplyChannel {
-                id: channel.channel_id.clone(),
-                thread_id: channel.thread_id.clone(),
-            },
-            content: ReplyContent {
-                content_type: "text".into(),
-                text: String::new(),
-            },
-            command: Some("keepalive".into()),
-            request_id: None,
-            quote_message_id: None,
-        };
-        let json = serde_json::to_string(&reply)?;
+        let json = serde_json::to_string(&keepalive_reply(channel))?;
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
         Ok(())
     }
@@ -2076,5 +2088,37 @@ mod redact_channel_tests {
             "-",
             "the no-session sentinel must not be hashed into something that looks like a session"
         );
+    }
+
+    /// What a standalone gateway parses: the command, a JSON body, and the turn's event id as
+    /// `reply_to` (the gateway's stale-turn fence).
+    #[test]
+    fn tool_progress_and_keepalive_replies_have_the_gateway_wire_shape() {
+        let channel = ChannelRef {
+            platform: "acp".into(),
+            channel_id: "acp_chan".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_turn".into()),
+        };
+        let progress = crate::adapter::ToolCallProgress {
+            tool_call_id: "t1".into(),
+            status: "completed",
+            is_new: false,
+            identity: crate::acp::ToolIdentity::default(),
+        };
+        let wire = serde_json::to_value(tool_progress_reply(&channel, &progress)).unwrap();
+        assert_eq!(wire["command"], "tool_call_update", "{wire}");
+        assert_eq!(wire["reply_to"], "evt_turn", "{wire}");
+        assert_eq!(wire["channel"]["id"], "acp_chan", "{wire}");
+        assert_eq!(wire["content"]["type"], "json", "{wire}");
+        let body: serde_json::Value =
+            serde_json::from_str(wire["content"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body, progress.payload());
+
+        let wire = serde_json::to_value(keepalive_reply(&channel)).unwrap();
+        assert_eq!(wire["command"], "keepalive", "{wire}");
+        assert_eq!(wire["reply_to"], "evt_turn", "{wire}");
+        assert_eq!(wire["content"]["text"], "", "{wire}");
     }
 }
