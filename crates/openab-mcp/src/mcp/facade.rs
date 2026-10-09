@@ -381,9 +381,23 @@ fn facade_tools() -> Vec<Tool> {
     ]
 }
 
-/// JSON payload → MCP text content. The provider's `CallToolResult` (already
-/// redacted by the dispatcher) is passed through as serialized JSON, matching
-/// what the meta-tool returns to the native agent.
+/// Capability payload → MCP result. A provider's `CallToolResult` (already
+/// redacted by the dispatcher) is passed through as-is, so its content blocks
+/// reach the model typed: serializing it to JSON text turned an `image` block
+/// into tens of KB of base64 the model can neither see nor fit in its tool
+/// output limit. Anything else (discovery payloads, a source returning plain
+/// JSON) becomes serialized JSON text, as before.
+fn capability_result(value: &Value, is_error: bool) -> CallToolResult {
+    if value.get("content").is_some_and(Value::is_array) {
+        if let Ok(mut result) = serde_json::from_value::<CallToolResult>(value.clone()) {
+            result.is_error = Some(is_error);
+            return result;
+        }
+    }
+    text_result(value, is_error)
+}
+
+/// JSON payload → MCP text content (serialized JSON).
 fn text_result(value: &Value, is_error: bool) -> CallToolResult {
     let text = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
     if is_error {
@@ -438,7 +452,7 @@ impl ServerHandler for McpFacade {
                 )])),
             },
             "execute_capability" => match self.execute_capability(args, ctx.as_ref()).await {
-                Ok((v, is_error)) => Ok(text_result(&v, is_error)),
+                Ok((v, is_error)) => Ok(capability_result(&v, is_error)),
                 Err(e) => Ok(CallToolResult::error(vec![Content::text(
                     super::redact_secrets(&format!("{e:#}")),
                 )])),
@@ -946,5 +960,53 @@ mod redact_channel_tests {
             "-",
             "the no-session sentinel must not be hashed into something that looks like a session"
         );
+    }
+}
+
+#[cfg(test)]
+mod capability_result_tests {
+    use super::{capability_result, text_result};
+    use serde_json::{json, Value};
+
+    /// A provider's image block must reach the model as an image, not as its base64 inside JSON
+    /// text (a katashiro screenshot was ~78K characters of text the model could not see).
+    #[test]
+    fn a_call_tool_result_passes_through_with_its_image_block() {
+        let value = json!({
+            "content": [
+                { "type": "image", "data": "QUJD", "mimeType": "image/jpeg" },
+                { "type": "text", "text": "imageId: img_1" }
+            ]
+        });
+        let out = serde_json::to_value(capability_result(&value, false)).unwrap();
+        assert_eq!(out["content"][0]["type"], "image");
+        assert_eq!(out["content"][0]["data"], "QUJD");
+        assert_eq!(out["content"][1]["text"], "imageId: img_1");
+        assert_eq!(out["isError"], false);
+    }
+
+    #[test]
+    fn the_dispatcher_is_error_flag_wins() {
+        let value = json!({ "content": [{ "type": "text", "text": "boom" }] });
+        let out = serde_json::to_value(capability_result(&value, true)).unwrap();
+        assert_eq!(out["isError"], true);
+        assert_eq!(out["content"][0]["text"], "boom");
+    }
+
+    /// Plain JSON payloads (an in-process source returning an object, or a malformed
+    /// `content`) keep the old serialized-JSON text shape.
+    #[test]
+    fn anything_else_is_serialized_json_text() {
+        for value in [
+            json!({ "channel": "c", "x": 7 }),
+            json!({ "content": "not an array" }),
+            json!({ "content": [{ "type": "no-such-kind" }] }),
+        ] {
+            let got = serde_json::to_value(capability_result(&value, false)).unwrap();
+            let want = serde_json::to_value(text_result(&value, false)).unwrap();
+            assert_eq!(got, want, "{value}");
+            let text = got["content"][0]["text"].as_str().unwrap();
+            assert_eq!(serde_json::from_str::<Value>(text).unwrap(), value);
+        }
     }
 }
