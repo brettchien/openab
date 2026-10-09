@@ -490,6 +490,14 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
+    #[cfg(feature = "acp")]
+    if let Some(m) = cfg.mcp.as_ref() {
+        openab_core::config::warn_if_tunnel_timeout_is_ineffective(
+            m.tunnel_timeout_seconds,
+            cfg.pool.prompt_hard_timeout_secs,
+        );
+    }
+
     // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
     // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
     #[cfg(feature = "acp")]
@@ -1456,7 +1464,10 @@ async fn main() -> anyhow::Result<()> {
                     Ok(()) => {
                         info!("unified: ACP server endpoint enabled at /acp");
                         // Only where /acp is actually served: a deploy without ACP has no
-                        // idle timeout for the liveness tick to undercut.
+                        // idle timeout for the liveness tick to undercut. Unified mode only: with
+                        // a standalone gateway the timeout and `[pool]` live in different
+                        // processes, so neither can check the pair — keep the tick under half
+                        // the gateway's `OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SECS` by hand there.
                         openab_gateway::adapters::acp_server::warn_if_liveness_tick_too_slow(
                             cfg.pool.liveness_check_secs,
                         );

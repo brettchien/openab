@@ -100,7 +100,8 @@ pub struct McpFacadeConfig {
     /// The ACP per-chunk idle timeout (`ACP_PROMPT_IDLE_TIMEOUT_SECS` in the gateway) does not cap
     /// this wait: while the agent is blocked on a tunnelled request it is still alive, so core's
     /// liveness tick keeps sending keepalives and the turn stays open. The ceiling above this value
-    /// is core's own `prompt_hard_timeout_secs`.
+    /// is core's own `prompt_hard_timeout_secs`; startup warns when this is set at or above it
+    /// (`warn_if_tunnel_timeout_is_ineffective`).
     #[serde(default = "default_tunnel_timeout_seconds")]
     pub tunnel_timeout_seconds: u64,
 }
@@ -110,6 +111,27 @@ pub struct McpFacadeConfig {
 /// the binary would silently keep the old number the day this changes.
 pub fn default_tunnel_timeout_seconds() -> u64 {
     170
+}
+
+/// Warn when `[mcp].tunnel_timeout_seconds` can never fire: the turn is cut by
+/// `pool.prompt_hard_timeout_secs` first, so the peer never gets `mcp/cancel`. Not clamped and not
+/// an error — the setting just doesn't do what it reads as. Returns whether it warned.
+pub fn warn_if_tunnel_timeout_is_ineffective(
+    tunnel_timeout_seconds: u64,
+    prompt_hard_timeout_secs: u64,
+) -> bool {
+    if tunnel_timeout_seconds < prompt_hard_timeout_secs {
+        return false;
+    }
+    tracing::warn!(
+        tunnel_timeout_seconds,
+        prompt_hard_timeout_secs,
+        "mcp.tunnel_timeout_seconds >= pool.prompt_hard_timeout_secs; the turn ends first, so \
+         the tunnel timeout never fires and the browser peer is not sent mcp/cancel. \
+         Set tunnel_timeout_seconds well below prompt_hard_timeout_secs (it counts per \
+         request, the hard timeout per turn)."
+    );
+    true
 }
 
 fn default_mcp_listen() -> String {
@@ -2485,6 +2507,15 @@ fn default_ambient_context_flushes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_timeout_at_or_above_hard_timeout_warns() {
+        let hard = default_prompt_hard_timeout_secs();
+        assert!(!warn_if_tunnel_timeout_is_ineffective(default_tunnel_timeout_seconds(), hard));
+        assert!(!warn_if_tunnel_timeout_is_ineffective(hard - 1, hard));
+        assert!(warn_if_tunnel_timeout_is_ineffective(hard, hard));
+        assert!(warn_if_tunnel_timeout_is_ineffective(hard + 1, hard));
+    }
 
     #[test]
     fn mcp_facade_absent_by_default() {

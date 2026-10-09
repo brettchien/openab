@@ -543,26 +543,16 @@ fn tool_progress_reply(
     channel: &ChannelRef,
     progress: &crate::adapter::ToolCallProgress,
 ) -> GatewayReply {
-    GatewayReply {
-        schema: "openab.gateway.reply.v1".into(),
-        reply_to: channel.origin_event_id.clone().unwrap_or_default(),
-        platform: channel.platform.clone(),
-        channel: ReplyChannel {
-            id: channel.channel_id.clone(),
-            thread_id: channel.thread_id.clone(),
-        },
-        content: ReplyContent {
-            content_type: "json".into(),
-            text: progress.payload().to_string(),
-        },
-        command: Some(progress.command().into()),
-        request_id: None,
-        quote_message_id: None,
-    }
+    turn_reply(channel, "json", progress.payload().to_string(), progress.command())
 }
 
 /// The contentless `keepalive` reply core's liveness tick sends while an ACP turn is silent.
 fn keepalive_reply(channel: &ChannelRef) -> GatewayReply {
+    turn_reply(channel, "text", String::new(), "keepalive")
+}
+
+/// A mid-turn command reply on `channel`, carrying the turn's event id as `reply_to`.
+fn turn_reply(channel: &ChannelRef, content_type: &str, text: String, command: &str) -> GatewayReply {
     GatewayReply {
         schema: "openab.gateway.reply.v1".into(),
         reply_to: channel.origin_event_id.clone().unwrap_or_default(),
@@ -572,10 +562,10 @@ fn keepalive_reply(channel: &ChannelRef) -> GatewayReply {
             thread_id: channel.thread_id.clone(),
         },
         content: ReplyContent {
-            content_type: "text".into(),
-            text: String::new(),
+            content_type: content_type.into(),
+            text,
         },
-        command: Some("keepalive".into()),
+        command: Some(command.into()),
         request_id: None,
         quote_message_id: None,
     }
