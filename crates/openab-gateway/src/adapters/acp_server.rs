@@ -64,10 +64,16 @@ pub const ACP_PROMPT_IDLE_TIMEOUT_ENV: &str = "OPENAB_ACP_PROMPT_IDLE_TIMEOUT_SE
 /// before its first chunk) falls back to the default; the `Err` carries the rejected value so the
 /// caller can warn once.
 fn parse_prompt_idle_timeout(raw: Option<&str>) -> Result<u64, String> {
+    parse_secs_override(raw, ACP_PROMPT_IDLE_TIMEOUT_SECS, false)
+}
+
+/// A seconds-valued env override: unset or empty is `default`; anything unparsable (or `0` when
+/// `allow_zero` is false) is an `Err` carrying the rejected value.
+fn parse_secs_override(raw: Option<&str>, default: u64, allow_zero: bool) -> Result<u64, String> {
     match raw.map(str::trim) {
-        None | Some("") => Ok(ACP_PROMPT_IDLE_TIMEOUT_SECS),
+        None | Some("") => Ok(default),
         Some(v) => match v.parse::<u64>() {
-            Ok(n) if n > 0 => Ok(n),
+            Ok(n) if n > 0 || allow_zero => Ok(n),
             _ => Err(v.to_string()),
         },
     }
@@ -91,8 +97,8 @@ pub fn prompt_idle_timeout_secs() -> u64 {
 
 /// Default interval, in seconds, between the server's own WebSocket pings.
 ///
-/// Edge proxies cut a WebSocket that carries no frame for a while — Cloudflare at about 100s (E2E
-/// T7: a client that sent no pings was dropped ~126s after the last frame, mid-turn). Keepalives
+/// Edge proxies cut a WebSocket that carries no frame for a while — Cloudflare at about 100s (in
+/// testing, a client that sent no pings was dropped ~126s after the last frame, mid-turn). Keepalives
 /// stop at the gateway and are never forwarded, a browser cannot send a WS ping, and a client may
 /// pause its own heartbeat during a turn, so a long silent tool left the socket idle end to end.
 /// A server ping is transport-level traffic every client already answers (browsers send the pong
@@ -105,10 +111,7 @@ pub const ACP_WS_PING_ENV: &str = "OPENAB_ACP_WS_PING_SECS";
 /// Parse a ping-interval override. Unset or empty falls back to the default; `0` is valid and
 /// means off. The `Err` carries the rejected value so the caller can warn once.
 fn parse_ws_ping_secs(raw: Option<&str>) -> Result<u64, String> {
-    match raw.map(str::trim) {
-        None | Some("") => Ok(ACP_WS_PING_SECS),
-        Some(v) => v.parse::<u64>().map_err(|_| v.to_string()),
-    }
+    parse_secs_override(raw, ACP_WS_PING_SECS, true)
 }
 
 /// Resolves when the next server ping is due; never, when pings are off.
@@ -2637,6 +2640,16 @@ async fn handle_session_prompt(
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
 
+    // Every client-visible chunk of the turn is one `session/update` notification.
+    let send_update = |update: Value| {
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update".into(),
+            params: json!({ "sessionId": session_id, "update": update }),
+        };
+        let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+    };
+
     loop {
         tokio::select! {
             // session/cancel fired — stop gracefully.
@@ -2654,32 +2667,13 @@ async fn handle_session_prompt(
                             None => continue,
                         };
                         sent_len = full_text.len();
-
-                        let notification = JsonRpcNotification {
-                            jsonrpc: "2.0",
-                            method: "session/update".into(),
-                            params: json!({
-                                "sessionId": session_id,
-                                "update": {
-                                    "sessionUpdate": "agent_message_chunk",
-                                    "content": {"type": "text", "text": delta}
-                                }
-                            }),
-                        };
-                        let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+                        send_update(json!({
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": delta}
+                        }));
                     }
-                    Ok(Some(ReplyChunk::Update(update))) => {
-                        // Tool progress. Arriving at all is what resets the idle timer.
-                        let notification = JsonRpcNotification {
-                            jsonrpc: "2.0",
-                            method: "session/update".into(),
-                            params: json!({
-                                "sessionId": session_id,
-                                "update": update,
-                            }),
-                        };
-                        let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
-                    }
+                    // Tool progress. Arriving at all is what resets the idle timer.
+                    Ok(Some(ReplyChunk::Update(update))) => send_update(update),
                     // Core is alive and the turn is still running; nothing to tell the client.
                     // Receiving it already restarted the idle wait.
                     Ok(Some(ReplyChunk::Keepalive)) => {}
@@ -2753,12 +2747,8 @@ struct PromptImage {
 }
 
 fn extract_prompt_params(params: Option<&Value>) -> Result<PromptParams, String> {
+    // sessionId was validated (and the session reserved) by the caller before this runs.
     let params = params.ok_or("Missing params")?;
-    // sessionId is validated (and reserved) by the caller; it must still be present here.
-    params
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing sessionId")?;
     let prompt = params.get("prompt").ok_or("Missing prompt")?;
 
     // Per the ACP schema the generated `PromptRequest.prompt` is `[ContentBlock]`; a plain
@@ -2802,10 +2792,13 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<PromptParams, String>
                     // ACP `ImageContent`: `data` (base64) and `mimeType` are both required. It is
                     // carried to core as an `image` attachment, the same way a Discord / Telegram
                     // image is, so the agent receives a real image block.
+                    // MIME types are case-insensitive (RFC 2045).
                     let mime_type = block
                         .get("mimeType")
                         .and_then(|v| v.as_str())
-                        .ok_or("image content block missing required 'mimeType'")?;
+                        .ok_or("image content block missing required 'mimeType'")?
+                        .to_ascii_lowercase();
+                    let mime_type = mime_type.as_str();
                     if !PROMPT_IMAGE_MIME_TYPES.contains(&mime_type) {
                         return Err(format!(
                             "Unsupported image mimeType '{mime_type}' (accepted: {})",
@@ -2827,6 +2820,16 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<PromptParams, String>
                         return Err(format!(
                             "image exceeds {}",
                             crate::media::format_bytes(crate::media::IMAGE_MAX_DOWNLOAD)
+                        ));
+                    }
+                    // The decoder sniffs the format from the bytes and ignores `mimeType`, so the
+                    // allowlist above only means something if the two agree. A mismatch is a
+                    // client bug worth naming, not a decode failure to guess at later.
+                    let sniffed = image::guess_format(&bytes).ok().map(|f| f.to_mime_type());
+                    if sniffed != Some(mime_type) {
+                        return Err(format!(
+                            "image content block 'data' is not {mime_type} (looks like {})",
+                            sniffed.unwrap_or("an unknown format")
                         ));
                     }
                     images.push(PromptImage {
@@ -2951,7 +2954,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             // Keepalives pass the fence. After a cancel the superseded turn can still be running in
             // core, and the next prompt is queued behind it; that turn's keepalives are the only
             // sign core is alive, and dropping them timed the queued prompt out at one idle window
-            // (E2E T4). A keepalive has no content, so nothing from the old turn reaches the client;
+            // in testing. A keepalive has no content, so nothing from the old turn reaches the client;
             // the fence still drops its text and tool progress below.
             Some(sink) if reply.command.as_deref() == Some("keepalive") => {
                 debug!(
@@ -3455,6 +3458,22 @@ mod acp_conformance {
             .contains("Unsupported image mimeType"));
         let huge = b64(&vec![0u8; crate::media::IMAGE_MAX_DOWNLOAD as usize + 1]);
         assert!(reject(json!({"type": "image", "data": huge, "mimeType": "image/png"})).contains("exceeds"));
+        // The declared type must match the bytes: the decoder trusts the bytes, not the label.
+        let err = reject(json!({"type": "image", "data": png, "mimeType": "image/jpeg"}));
+        assert!(err.contains("is not image/jpeg") && err.contains("image/png"), "{err}");
+        assert!(reject(json!({"type": "image", "data": b64(b"not an image"), "mimeType": "image/png"}))
+            .contains("unknown format"));
+    }
+
+    // MIME types are case-insensitive; an upper-case label for a real PNG is accepted.
+    #[test]
+    fn prompt_image_mime_type_is_case_insensitive() {
+        let p = super::extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [{"type": "image", "data": b64(&tiny_png(2, 2)), "mimeType": "IMAGE/PNG"}]
+        })))
+        .unwrap();
+        assert_eq!(p.images[0].mime_type, "image/png");
     }
 
     // The images reach core exactly like a Discord / Telegram image: an `image` attachment,
@@ -5184,7 +5203,7 @@ mod acp_review_fixes {
         );
     }
 
-    // E2E T4: after a cancel the old turn keeps running in core and the next prompt queues behind
+    // After a cancel the old turn keeps running in core and the next prompt queues behind
     // it. The old turn's keepalives carry its own origin id; they must still hold the queued
     // prompt open, while its text stays fenced out.
     #[tokio::test(start_paused = true)]
@@ -5573,7 +5592,7 @@ mod acp_ws_integration {
         }
     }
 
-    /// A client that sends nothing still sees server traffic, so an edge proxy's idle cut (E2E T7)
+    /// A client that sends nothing still sees server traffic, so an edge proxy's idle cut
     /// never fires on a quiet turn. Read raw frames: `recv` skips pings by design.
     #[tokio::test]
     async fn server_pings_a_client_that_sends_nothing() {

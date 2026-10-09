@@ -98,9 +98,12 @@ JSON-RPC 2.0; non-`"2.0"` rejected with `-32600`.
 `agentCapabilities` advertises `sessionCapabilities.resume` (we support resume) and
 `loadSession: false` (we cannot replay history — see §3). `promptCapabilities.image` is
 `true`: an `image` block is resized like any platform image and forwarded to core as an
-`image` attachment (a `session/prompt` frame may be up to 8 MiB for it; decodes are capped
-gateway-wide at 2 concurrent, since decoded size is unbounded by the encoded size); `audio` and
-`embeddedContext` are `false`. `protocolVersion` is the integer `1`.
+`image` attachment. A `session/prompt` frame that carries an `image` block may be up to 8 MiB;
+a text-only prompt, and the text of any prompt, stays at the 1 MiB every other request gets.
+`mimeType` (png / jpeg / gif / webp, case-insensitive) must match the format sniffed from the
+bytes. Decoding is bounded (≤ 10 000 px a side, 128 MiB decoder allocation) and capped
+gateway-wide at 2 concurrent; a `session/cancel` that arrives while images wait for a decode
+ends the turn before anything is dispatched to core. `audio` and `embeddedContext` are `false`. `protocolVersion` is the integer `1`.
 
 ### Client → Agent (notification)
 
@@ -118,9 +121,13 @@ gateway-wide at 2 concurrent, since decoded size is unbounded by the encoded siz
   The delta is still sliced char-boundary-safe (`str::get`, never byte-index) so CJK /
   顏文字 / emoji cannot panic the stream if/when multiple chunks arrive.
 - `session/update` with `update.sessionUpdate = "tool_call"` / `"tool_call_update"`
-  (`toolCallId`, `title`, `status` ∈ `in_progress` / `completed` / `failed`) — tool
-  activity, emitted **mid-turn** as the agent reports it, separately from the reply text
-  (which stays send-once). Clients that only render `agent_message_chunk` ignore these and
+  (`toolCallId`, `title`, `status` ∈ `pending` / `in_progress` / `completed` / `failed`,
+  `kind` ∈ ACP `ToolKind`, and under `_meta.openab` the tool's programmatic `name` and, for a
+  call through the OAB MCP Facade, the `capability` it invokes) — tool activity, emitted
+  **mid-turn** as the agent reports it, separately from the reply text (which stays
+  send-once). `title` is the tool's identity (capability → name → kind, else `tool`), never
+  the agent's own title, which is usually the literal command line; the server re-checks
+  every title / name / capability against `[A-Za-z0-9_.:/-]{1,128}` and drops what fails. Clients that only render `agent_message_chunk` ignore these and
   still receive the complete answer. See *Idle timeout* below for why they exist.
 - Turn completion is the `session/prompt` **response** (`{ stopReason }`, correlated
   to the request id), not a separate notification. `stopReason` ∈ `end_turn` /
@@ -136,7 +143,9 @@ gateway-wide at 2 concurrent, since decoded size is unbounded by the encoded siz
 - Core therefore forwards tool progress for the `acp` platform as it happens: on
   `AcpEvent::ToolStart` / `ToolDone` it calls `ChatAdapter::send_tool_progress`, which sends a
   `GatewayReply` with `command = "tool_call"` (first event for an id) or `"tool_call_update"`
-  and the ACP update body (`{toolCallId, title?, status}`) as JSON in `content.text`. The ACP
+  and the ACP update body (`{toolCallId, title?, status?, kind?, name?,
+  _meta.openab.capability?}`) as JSON in `content.text`. An event is forwarded when it
+  carries a title or an identity; ids already announced this turn get `tool_call_update`. The ACP
   server maps it to `ReplyChunk::Update` and emits it as a `session/update`; arriving at all
   resets the idle timer. Other platforms never receive these commands (core gates on
   `platform == "acp"`; several gateway adapters would post an unknown command as text).
@@ -153,11 +162,17 @@ gateway-wide at 2 concurrent, since decoded size is unbounded by the encoded siz
   idea as Hermes heartbeating a running tool; OpenClaw instead defers its watchdog while a
   tool is active.) Keepalives pass the stale-reply fence: after a cancel the superseded turn
   may still run in core with the next prompt queued behind it, and its keepalives are what
-  keep that queued prompt open. They carry no content, so nothing of the old turn leaks.
+  keep that queued prompt open. They carry no content, so nothing of the old turn leaks;
+  the old turn's text and tool progress are still dropped.
+- **Tunnelled requests.** An agent waiting on a client-declared `type:acp` server is alive,
+  so keepalives hold the turn open and `[mcp] tunnel_timeout_seconds` decides that wait (the
+  peer gets `mcp/cancel`); the idle timeout does not cap it.
 - **Server WS ping.** Keepalives stop at the gateway, so a quiet turn leaves the WebSocket
   itself silent, and edge proxies cut idle sockets (Cloudflare at ~100s). The writer sends a
   WS `Ping` every `OPENAB_ACP_WS_PING_SECS` (default 30, `0` = off); clients answer at the
-  transport layer (browsers do it themselves), so no client change is needed.
+  transport layer (browsers do it themselves), so no client change is needed. Pongs do not
+  count as client activity in the disconnect log (`idle_secs`); they are logged on their own
+  as `last_pong_secs`.
 
 ### Concurrency, caps & reply fencing
 
@@ -176,9 +191,9 @@ gateway-wide at 2 concurrent, since decoded size is unbounded by the encoded siz
   *gateway* stream tasks, not downstream agent work. A client `session/cancel` ends the
   gateway stream, but the turn keeps running in core until it finishes or hits core's hard
   timeout; a `prompt → cancel` loop can therefore queue backend work beyond the 32 cap.
-  Bounding this needs turn-scoped agent→core cancel propagation (brettchien/openab#4 — a
+  Bounding this needs turn-scoped gateway→core cancel propagation (follow-up — a
   thread-scoped `/cancel` can race the next prompt in unified mode). An idle timeout needs
-  no cancel: with the keepalive below it only fires when core or its connection is gone.
+  no cancel: with the keepalive above it only fires when core or its connection is gone.
   The fence above still prevents late output from corrupting a later turn.
 
 ### Session ↔ core mapping
