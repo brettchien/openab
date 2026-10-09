@@ -493,6 +493,13 @@ async fn main() -> anyhow::Result<()> {
     // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
     // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
     #[cfg(feature = "acp")]
+    if let Some(m) = cfg.mcp.as_ref() {
+        openab_core::config::warn_if_tunnel_timeout_is_ineffective(
+            m.tunnel_timeout_seconds,
+            cfg.pool.prompt_hard_timeout_secs,
+        );
+    }
+    #[cfg(feature = "acp")]
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
     #[cfg(feature = "acp")]
     let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> = Arc::new(
