@@ -3110,6 +3110,30 @@ done
         );
     }
 
+    /// A tool that fails, plus a completion for an id that was never announced and names nothing.
+    const FAILED_AND_GHOST_TURN: &str = r#"
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Bash","status":"in_progress"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"failed"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"ghost","status":"completed"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"it failed"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
+
+    // `failed` reaches the client as `failed`, and a completion for an unannounced id with no
+    // title or identity is not sent at all: the client has nothing to attach it to.
+    #[tokio::test]
+    async fn failed_status_is_forwarded_and_an_empty_unknown_completion_is_not() {
+        let default_timeout = crate::config::default_prompt_hard_timeout_secs();
+        let rec = run_turn_with("acp", FAILED_AND_GHOST_TURN, 10, default_timeout).await;
+        let progress = rec.progress.lock().unwrap().clone();
+        let p = |status: &'static str, is_new: bool| ToolCallProgress {
+            tool_call_id: "t1".into(),
+            status,
+            is_new,
+            identity: ToolIdentity::default(),
+        };
+        assert_eq!(progress, vec![p("in_progress", true), p("failed", false)]);
+    }
+
     // Every other platform keeps its existing tool display and never sees tool_call commands —
     // several gateway adapters would post an unknown command as a plain message.
     #[tokio::test]
