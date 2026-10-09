@@ -304,14 +304,15 @@ impl ChatAdapter for UnifiedGatewayAdapter {
     }
 }
 
-#[cfg(all(test, feature = "googlechat"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use openab_gateway::adapters::googlechat::GoogleChatAdapter;
     use tokio::sync::broadcast;
 
+    #[cfg(feature = "googlechat")]
     #[tokio::test]
     async fn googlechat_send_failure_propagates_in_unified_mode() {
+        use openab_gateway::adapters::googlechat::GoogleChatAdapter;
         let (event_tx, _event_rx) = broadcast::channel(4);
         let mut state = AppState::test_default(event_tx);
         // No credential source: delivery fails before any network access.
@@ -332,6 +333,67 @@ mod tests {
         assert!(
             err.to_string().contains("no credentials configured"),
             "{err}"
+        );
+    }
+
+    /// Core's tool progress and keepalive, through the real reply path into the ACP server's
+    /// reply sink: the wire shape (command, JSON body, `reply_to` fence) is what the gateway
+    /// parses, so assert it end to end rather than per side.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    async fn tool_progress_and_keepalive_reach_the_acp_reply_sink() {
+        use openab_core::acp::ToolIdentity;
+        use openab_gateway::adapters::acp_server::{new_reply_registry, ReplyChunk, ReplySink};
+
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let mut state = AppState::test_default(event_tx);
+        let registry = new_reply_registry();
+        state.acp_reply_registry = Some(registry.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink { turn_id: "evt_turn".into(), tx, owner: "conn".into(), generation: 0 },
+        );
+        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+        let channel = ChannelRef {
+            platform: "acp".into(),
+            channel_id: "acp_chan".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_turn".into()),
+        };
+
+        let progress = ToolCallProgress {
+            tool_call_id: "t1".into(),
+            status: "in_progress",
+            is_new: true,
+            identity: ToolIdentity {
+                kind: Some("execute"),
+                name: Some("Bash".into()),
+                capability: None,
+            },
+        };
+        adapter.send_tool_progress(&channel, &progress).await.unwrap();
+        match rx.try_recv() {
+            Ok(ReplyChunk::Update(u)) => {
+                assert_eq!(u["sessionUpdate"], "tool_call", "{u}");
+                assert_eq!(u["toolCallId"], "t1", "{u}");
+                assert_eq!(u["status"], "in_progress", "{u}");
+                assert_eq!(u["kind"], "execute", "{u}");
+                assert_eq!(u["title"], "Bash", "{u}");
+                // The programmatic name rides in `_meta.openab` (katashiro#50 reads it there);
+                // ACP's ToolCall has no top-level `name`.
+                assert_eq!(u["_meta"]["openab"]["name"], "Bash", "{u}");
+                assert!(u.get("name").is_none(), "{u}");
+            }
+            _ => panic!("tool progress must arrive as a session/update body"),
+        }
+
+        adapter.send_keepalive(&channel).await.unwrap();
+        assert!(matches!(rx.try_recv(), Ok(ReplyChunk::Keepalive)));
+        assert!(
+            registry.lock().unwrap().contains_key("acp_chan"),
+            "progress and keepalives must leave the turn's sink in place"
         );
     }
 }

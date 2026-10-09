@@ -18,7 +18,36 @@ pub const GIF_MAX_SIZE: usize = 5 * 1024 * 1024; // 5 MB — prevents base64 blo
 /// Resize image so longest side <= 1200px, then encode as JPEG.
 /// GIFs under 5MB are passed through unchanged to preserve animation.
 pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
-    let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
+    resize_and_compress_limited(raw, None)
+}
+
+/// Longest side, in pixels, [`resize_and_compress_bounded`] will decode.
+pub const IMAGE_DECODE_MAX_DIMENSION_PX: u32 = 10_000;
+/// Decoder allocation cap for [`resize_and_compress_bounded`] — room for a 5K RGBA screenshot.
+pub const IMAGE_DECODE_MAX_ALLOC: u64 = 128 * 1024 * 1024;
+
+/// [`resize_and_compress`] with decoder limits, for images a remote client sends directly.
+///
+/// The encoded-size caps bound the bytes, not the pixels: a few hundred KiB of flat-colour PNG
+/// can declare tens of thousands of pixels a side and decode to hundreds of MiB under the `image`
+/// crate's defaults (no dimension cap, 512 MiB allocation). These limits reject such an image
+/// before its pixels are allocated.
+pub fn resize_and_compress_bounded(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_DECODE_MAX_DIMENSION_PX);
+    limits.max_image_height = Some(IMAGE_DECODE_MAX_DIMENSION_PX);
+    limits.max_alloc = Some(IMAGE_DECODE_MAX_ALLOC);
+    resize_and_compress_limited(raw, Some(limits))
+}
+
+fn resize_and_compress_limited(
+    raw: &[u8],
+    limits: Option<image::Limits>,
+) -> Result<(Vec<u8>, String), image::ImageError> {
+    let mut reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
+    if let Some(limits) = limits {
+        reader.limits(limits);
+    }
     let format = reader.format();
     if format == Some(image::ImageFormat::Gif) {
         if raw.len() > GIF_MAX_SIZE {
@@ -81,6 +110,30 @@ pub fn format_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PNG whose header declares more pixels than the bounded decoder allows is rejected
+    /// before decode, even though it is only a few bytes on the wire.
+    #[test]
+    fn bounded_rejects_oversized_dimensions() {
+        let img = image::GrayImage::new(IMAGE_DECODE_MAX_DIMENSION_PX + 1, 1);
+        let mut png = Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+        assert!(png.len() < 64 * 1024, "the point is a small file");
+        assert!(matches!(
+            resize_and_compress_bounded(&png),
+            Err(image::ImageError::Limits(_))
+        ));
+    }
+
+    #[test]
+    fn bounded_accepts_an_ordinary_image() {
+        let img = image::RgbImage::from_pixel(1600, 900, image::Rgb([10, 20, 30]));
+        let mut png = Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let (_, mime) = resize_and_compress_bounded(&png.into_inner()).unwrap();
+        assert_eq!(mime, "image/jpeg");
+    }
 
     #[test]
     fn gif_under_limit_passes_through() {

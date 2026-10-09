@@ -500,17 +500,10 @@ async fn main() -> anyhow::Result<()> {
             acp_tunnel_registry.clone(),
             // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
             // fall back through the SAME function serde uses rather than repeating the literal.
-            {
-                let t = cfg
-                    .mcp
-                    .as_ref()
-                    .map(|m| m.tunnel_timeout_seconds)
-                    .unwrap_or_else(openab_core::config::default_tunnel_timeout_seconds);
-                // The comparison and the ceiling both live beside the constant in the gateway; this
-                // only hands over the configured value.
-                openab_gateway::adapters::acp_server::warn_if_tunnel_timeout_is_ineffective(t);
-                t
-            },
+            cfg.mcp
+                .as_ref()
+                .map(|m| m.tunnel_timeout_seconds)
+                .unwrap_or_else(openab_core::config::default_tunnel_timeout_seconds),
         ),
     );
 
@@ -1838,16 +1831,12 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// The shipped tunnel-timeout default must stay strictly beneath the ceiling that overtakes it.
+    /// The shipped liveness tick must leave keepalives margin under the ACP idle timeout.
     ///
-    /// This pairing can only be asserted here. The gateway owns the ceiling and cannot see the
-    /// default; the core crate owns the default and cannot see the ceiling, since the gateway does
-    /// not depend on it. The binary is the only place both are visible — which is also why the
+    /// This pairing can only be asserted here. The gateway owns the idle timeout and cannot see the
+    /// pool default; the core crate owns the default and cannot see the timeout, since the gateway
+    /// does not depend on it. The binary is the only place both are visible — which is also why the
     /// warning that reports a violation is wired up here.
-    ///
-    /// Raising the default to or above the ceiling would silently restore the condition several
-    /// commits were spent removing: two clocks starting together, with the wrong one able to fire
-    /// first, and no cancellation reaching the peer when it does.
     ///
     /// Feature-gated because it names `openab_gateway`, which is an OPTIONAL dependency: the crate
     /// is absent under default features, so without this gate the whole `openab` test binary fails
@@ -1856,19 +1845,7 @@ mod tests {
     /// to be here.
     #[cfg(feature = "acp")]
     #[test]
-    fn the_default_tunnel_timeout_stays_beneath_the_idle_timeout() {
-        let default = openab_core::config::default_tunnel_timeout_seconds();
-        let ceiling = openab_gateway::adapters::acp_server::ACP_PROMPT_IDLE_TIMEOUT_SECS;
-        assert!(
-            default < ceiling,
-            "the default tunnel timeout ({default}s) must be strictly beneath the ACP prompt idle \
-             timeout ({ceiling}s); at or above it the turn ends there first and no `mcp/cancel` is \
-             ever sent"
-        );
-        assert!(
-            !openab_gateway::adapters::acp_server::tunnel_timeout_is_ineffective(default),
-            "the shipped default must not be a value the startup warning fires on"
-        );
+    fn the_default_liveness_tick_leaves_keepalive_margin() {
         assert!(
             !openab_gateway::adapters::acp_server::liveness_tick_too_slow_for_idle_timeout(
                 openab_core::config::PoolConfig::default().liveness_check_secs

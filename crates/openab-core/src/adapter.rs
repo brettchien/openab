@@ -857,6 +857,11 @@ impl AdapterRouter {
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
+                    // Tool call ids already announced over ACP. Tracked apart from `tool_lines`,
+                    // which only records titled tools: ACP forwards a tool's identity, so a
+                    // title-less event that carries one is still announced.
+                    let mut acp_announced: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     // Byte offset into `text_buf` where the final answer block
                     // begins — advanced to the buffer end on every tool
                     // completion so it tracks "just past the last tool". Used by
@@ -1100,7 +1105,25 @@ impl AdapterRouter {
                                         reactions.set_thinking().await;
                                     }
                                 }
-                                AcpEvent::ToolStart { id, title, identity } if !title.is_empty() => {
+                                // No title: nothing for the status line or tool summary, but over
+                                // ACP the client is sent the identity, which may still be there.
+                                AcpEvent::ToolStart { id, title, identity } if title.is_empty() => {
+                                    if platform_is_acp && !identity.is_empty() {
+                                        let is_new = acp_announced.insert(id.clone());
+                                        send_tool_progress_best_effort(
+                                            adapter.as_ref(),
+                                            &thread_channel,
+                                            ToolCallProgress {
+                                                tool_call_id: id,
+                                                status: "in_progress",
+                                                is_new,
+                                                identity,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
+                                AcpEvent::ToolStart { id, title, identity } => {
                                     // Live indicator: assistant status line vs emoji reaction.
                                     if assistant_status {
                                         let _ = adapter
@@ -1117,8 +1140,8 @@ impl AdapterRouter {
                                     // assistant_mode the status line is transient and cleared before
                                     // the reply, so without this the message would retain no record
                                     // of which tools ran.
-                                    let is_new = !tool_lines.iter().any(|e| e.id == id);
                                     if platform_is_acp {
+                                        let is_new = acp_announced.insert(id.clone());
                                         send_tool_progress_best_effort(
                                             adapter.as_ref(),
                                             &thread_channel,
@@ -1177,10 +1200,13 @@ impl AdapterRouter {
                                     } else {
                                         ToolState::Failed
                                     };
-                                    let known = tool_lines.iter().any(|e| e.id == id);
-                                    // An unknown id with no title has nothing to announce
-                                    // (mirrors the tool_lines rule below).
-                                    if platform_is_acp && (known || !title.is_empty()) {
+                                    // An unannounced id with neither title nor identity has
+                                    // nothing to announce.
+                                    let known = acp_announced.contains(&id);
+                                    if platform_is_acp
+                                        && (known || !title.is_empty() || !identity.is_empty())
+                                    {
+                                        acp_announced.insert(id.clone());
                                         send_tool_progress_best_effort(
                                             adapter.as_ref(),
                                             &thread_channel,
@@ -1549,7 +1575,6 @@ fn contains_bot_mention(content: &str) -> bool {
     false
 }
 
-/// Flatten a tool-call title into a single line safe for inline-code spans.
 /// Tool progress is advisory: a delivery failure must not abort the turn, whose
 /// answer still arrives through the send-once path.
 async fn send_tool_progress_best_effort(
@@ -1562,6 +1587,7 @@ async fn send_tool_progress_best_effort(
     }
 }
 
+/// Flatten a tool-call title into a single line safe for inline-code spans.
 fn sanitize_title(title: &str) -> String {
     title
         .replace('\r', "")
@@ -3043,6 +3069,44 @@ done
         assert!(
             wire.iter().all(|w| !w.contains("DB_PASSWORD") && !w.contains("migrate")),
             "{wire:?}"
+        );
+    }
+
+    /// A tool call that never gets a title but does name its tool.
+    const TITLELESS_TOOL_TURN: &str = r#"
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","_meta":{"claudeCode":{"toolName":"Bash"}},"kind":"execute","status":"pending"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id""#;
+
+    // ACP sends identity, not title, so a missing title must not swallow the event — and the
+    // completion that follows is an update to the call already announced, not a new one.
+    #[tokio::test]
+    async fn a_titleless_tool_with_an_identity_still_reaches_acp() {
+        let default_timeout = crate::config::default_prompt_hard_timeout_secs();
+        let rec = run_turn_with("acp", TITLELESS_TOOL_TURN, 10, default_timeout).await;
+        let progress = rec.progress.lock().unwrap().clone();
+        let bash = ToolIdentity {
+            kind: Some("execute"),
+            name: Some("Bash".into()),
+            capability: None,
+        };
+        assert_eq!(
+            progress,
+            vec![
+                ToolCallProgress {
+                    tool_call_id: "t1".into(),
+                    status: "in_progress",
+                    is_new: true,
+                    identity: bash,
+                },
+                ToolCallProgress {
+                    tool_call_id: "t1".into(),
+                    status: "completed",
+                    is_new: false,
+                    identity: ToolIdentity::default(),
+                },
+            ]
         );
     }
 
