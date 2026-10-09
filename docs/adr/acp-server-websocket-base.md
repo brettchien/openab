@@ -103,7 +103,8 @@ a text-only prompt, and the text of any prompt, stays at the 1 MiB every other r
 `mimeType` (png / jpeg / gif / webp, case-insensitive) must match the format sniffed from the
 bytes. Decoding is bounded (≤ 10 000 px a side, 128 MiB decoder allocation) and capped
 gateway-wide at 2 concurrent; a `session/cancel` that arrives while images wait for a decode
-ends the turn before anything is dispatched to core. `audio` and `embeddedContext` are `false`. `protocolVersion` is the integer `1`.
+ends the turn before anything is dispatched to core. `audio` and `embeddedContext` are
+`false`. `protocolVersion` is the integer `1`.
 
 ### Client → Agent (notification)
 
@@ -127,8 +128,9 @@ ends the turn before anything is dispatched to core. `audio` and `embeddedContex
   **mid-turn** as the agent reports it, separately from the reply text (which stays
   send-once). `title` is the tool's identity (capability → name → kind, else `tool`), never
   the agent's own title, which is usually the literal command line; the server re-checks
-  every title / name / capability against `[A-Za-z0-9_.:/-]{1,128}` and drops what fails. Clients that only render `agent_message_chunk` ignore these and
-  still receive the complete answer. See *Idle timeout* below for why they exist.
+  every title / name / capability against `[A-Za-z0-9_.:/-]{1,128}` and drops what fails.
+  Clients that only render `agent_message_chunk` ignore these and still receive the complete
+  answer. See *Idle timeout* below for why they exist.
 - Turn completion is the `session/prompt` **response** (`{ stopReason }`, correlated
   to the request id), not a separate notification. `stopReason` ∈ `end_turn` /
   `cancelled`. A backend timeout has no ACP stopReason, so it returns a JSON-RPC
@@ -166,7 +168,10 @@ ends the turn before anything is dispatched to core. `audio` and `embeddedContex
   the old turn's text and tool progress are still dropped.
 - **Tunnelled requests.** An agent waiting on a client-declared `type:acp` server is alive,
   so keepalives hold the turn open and `[mcp] tunnel_timeout_seconds` decides that wait (the
-  peer gets `mcp/cancel`); the idle timeout does not cap it.
+  peer gets `mcp/cancel`); the idle timeout does not cap it. Core's `prompt_hard_timeout_secs`
+  still does: a tunnel timeout at or above it can never fire, and startup warns. Staying below
+  is necessary, not sufficient — the tunnel timeout counts from each request, the hard timeout
+  from the start of the turn, so a request made late in a long turn can still be cut first.
 - **Server WS ping.** Keepalives stop at the gateway, so a quiet turn leaves the WebSocket
   itself silent, and edge proxies cut idle sockets (Cloudflare at ~100s). The writer sends a
   WS `Ping` every `OPENAB_ACP_WS_PING_SECS` (default 30, `0` = off); clients answer at the

@@ -128,7 +128,8 @@ pub fn warn_if_tunnel_timeout_is_ineffective(
         prompt_hard_timeout_secs,
         "mcp.tunnel_timeout_seconds >= pool.prompt_hard_timeout_secs; the turn ends first, so \
          the tunnel timeout never fires and the browser peer is not sent mcp/cancel. \
-         Keep tunnel_timeout_seconds below prompt_hard_timeout_secs."
+         Set tunnel_timeout_seconds well below prompt_hard_timeout_secs (it counts per \
+         request, the hard timeout per turn)."
     );
     true
 }
