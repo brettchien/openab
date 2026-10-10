@@ -1,0 +1,52 @@
+name: Build Images on downstream tag
+
+# Pushing a `downstream-*` tag dispatches Build Images for that tag, with the
+# tag name as the image prefix (ghcr.io/<repo>:<tag>-<variant>, all variants).
+# build-images.yml itself is left untouched so it keeps syncing cleanly with
+# upstream; this file only exists on the downstream branch.
+#
+# A workflow_dispatch sent with GITHUB_TOKEN does start a new run (it is one of
+# the documented exceptions to the "no recursive runs" rule), so no PAT needed.
+#
+# The dispatch uses --ref <tag> so the build-images.yml definition comes from
+# the same commit as the sources it builds (main may have drifted, e.g. a new
+# variant in ALLOWED that the tag's Dockerfile.unified does not have yet).
+# `latest` is keyed off inputs.branch == main, not the ref, so it is unaffected.
+
+on:
+  push:
+    tags:
+      - 'downstream-*'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag is on the downstream branch
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin downstream
+          if ! git merge-base --is-ancestor "refs/tags/${TAG}^{commit}" origin/downstream; then
+            echo "::error::${TAG} does not point at a commit on the downstream branch"
+            exit 1
+          fi
+
+      - name: Dispatch Build Images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-images.yml -R "${GITHUB_REPOSITORY}" --ref "${TAG}" \
+            -f branch="${TAG}" -f variants=all -f tag="${TAG}"
+          echo "Dispatched Build Images for \`${TAG}\` → \`ghcr.io/${GITHUB_REPOSITORY}:${TAG}-<variant>\`" >> "$GITHUB_STEP_SUMMARY"
