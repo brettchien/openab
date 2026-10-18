@@ -1,5 +1,6 @@
 mod adapter;
 mod db;
+mod mcp;
 mod protobuf;
 mod streaming;
 mod types;
@@ -30,6 +31,7 @@ impl Adapter {
         conversations_dir: PathBuf,
         cancelled: Arc<AtomicBool>,
         out_tx: mpsc::UnboundedSender<Option<String>>,
+        extra_env: Vec<(String, String)>,
     ) -> PromptOutput {
         // Snapshot agy's existing cli-*.log sizes before spawning so that, if the
         // turn produces no output, we can attribute only bytes written *during*
@@ -42,6 +44,7 @@ impl Adapter {
         let spawn_result = Command::new(Adapter::agy_bin())
             .args(&args)
             .env("PATH", Adapter::augmented_path())
+            .envs(extra_env)
             .current_dir(&working_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -460,6 +463,15 @@ fn extract_agy_error_message(content: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some(mcp::BRIDGE_SUBCOMMAND) {
+        let Some(name) = argv.get(2) else {
+            eprintln!("usage: agy-acp {} <server-name>", mcp::BRIDGE_SUBCOMMAND);
+            std::process::exit(2);
+        };
+        std::process::exit(mcp::run_bridge(name));
+    }
+
     let prefetch = tokio::task::spawn_blocking(Adapter::fetch_available_models);
     let adapter = Arc::new(tokio::sync::Mutex::new(Adapter::new()));
 
@@ -563,11 +575,12 @@ async fn main() {
                 Vec::new()
             }
             Some("session/new") => {
+                let params = req.params.unwrap_or(json!({}));
                 let adapter = Arc::clone(&adapter); let out_tx = out_tx.clone();
                 pending_prompts += 1;
                 tokio::spawn(async move {
                     let mut adapter = adapter.lock().await;
-                    let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_new(id)).unwrap()));
+                    let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_new(id, &params)).unwrap()));
                     let _ = out_tx.send(None);
                 });
                 Vec::new()
@@ -595,15 +608,16 @@ async fn main() {
                 let out_tx = out_tx.clone();
                 pending_prompts += 1;
                 tokio::spawn(async move {
-                    let (sid, args, snapshot, init_conv, init_idx, wd, cd) = {
+                    let (sid, args, snapshot, init_conv, init_idx, wd, cd, mcp_env) = {
                         let mut adapter = adapter.lock().await;
                         let (sid, _prompt, args, snapshot, init_conv, init_idx) = adapter.prepare_prompt_state(&params);
                         let wd = adapter.working_dir.clone();
                         let cd = adapter.conversations_dir.clone();
-                        (sid, args, snapshot, init_conv, init_idx, wd, cd)
+                        let mcp_env = adapter.mcp_env_for(&sid);
+                        (sid, args, snapshot, init_conv, init_idx, wd, cd, mcp_env)
                     };
                     let output = Adapter::execute_prompt(
-                        id, &sid, args, snapshot, init_conv, init_idx, wd, cd, cancelled, out_tx.clone(),
+                        id, &sid, args, snapshot, init_conv, init_idx, wd, cd, cancelled, out_tx.clone(), mcp_env,
                     ).await;
                     if let Some((bound_conv_id, new_step_idx)) = output.session_update {
                         let mut adapter = adapter.lock().await;
@@ -712,6 +726,7 @@ mod tests {
             sessions: HashMap::new(), working_dir: "/tmp".to_string(),
             conversations_dir: PathBuf::from("/tmp"), state_file: PathBuf::from("/tmp/sessions.json"),
             available_models: Some(vec![]),
+            mcp_env: HashMap::new(),
         };
         let response = adapter.handle_initialize(json!(1));
         assert_eq!(response.result.as_ref().and_then(|r| r.get("agentCapabilities"))
@@ -1068,6 +1083,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
             sessions: HashMap::new(), working_dir: root.to_string_lossy().to_string(),
             conversations_dir: root.join("conversations"), state_file: root.join("sessions.json"),
             available_models: Some(vec![]),
+            mcp_env: HashMap::new(),
         };
         adapter.persist_session("sess-1", Some("conv-abc"), 5, None);
         let response = adapter.handle_session_load(json!(7), &json!({"sessionId": "sess-1"}));
@@ -1089,6 +1105,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
                 "Gemini 3.5 Flash (Low)".to_string(),
                 selected_model.to_string(),
             ]),
+            mcp_env: HashMap::new(),
         };
         adapter.persist_session("sess-1", Some("conv-abc"), 5, Some(selected_model));
         let response = adapter.handle_session_load(json!(7), &json!({"sessionId": "sess-1"}));
@@ -1120,6 +1137,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
             sessions: HashMap::new(), working_dir: root.to_string_lossy().to_string(),
             conversations_dir: root.join("conversations"), state_file: root.join("sessions.json"),
             available_models: Some(vec![]),
+            mcp_env: HashMap::new(),
         };
         adapter.persist_session("sess-1", Some("conv-abc"), 7, None);
         assert_eq!(adapter.restore_session("sess-1"), Some(("conv-abc".to_string(), 7, None)));

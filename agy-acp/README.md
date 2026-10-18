@@ -12,6 +12,18 @@ openab ──JSON-RPC──► agy-acp ──spawns──► agy -p "prompt"
                         └─ Persists session state for multi-turn conversations
 ```
 
+## MCP servers
+
+agy-acp advertises `mcpCapabilities.http` and accepts `http` entries in `session/new` /
+`session/load` `mcpServers` (stdio / sse entries are skipped). agy itself has no per-invocation MCP
+config and does not expand `${VAR}` in headers, so each server becomes a static stdio entry in
+`~/.gemini/config/mcp_config.json` that runs `agy-acp mcp-bridge <name>`; the session's url and
+headers ride the `agy -p` env as `AGY_ACP_MCP_<NAME>`, so concurrent sessions never see each
+other's credentials. A session that was not given the server sees it as an empty server. User-defined
+entries with the same name are left untouched.
+
+With openab, set `[mcp] pass_to_agent = true` to have the broker pass the OAB MCP Facade this way.
+
 ## Build
 
 ```bash

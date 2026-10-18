@@ -184,6 +184,18 @@ pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io
     write_json_atomic(&path, &cfg).await
 }
 
+/// The facade as an ACP `mcpServers` entry (`[mcp] pass_to_agent`). Unlike the static file this
+/// carries the session's real token: it goes to one agent process over its own stdio, so there
+/// is nothing shared to clobber.
+pub fn facade_session_mcp_server(facade_url: &str, token: &str) -> serde_json::Value {
+    json!({
+        "type": "http",
+        "name": "openab",
+        "url": facade_url,
+        "headers": [{ "name": "Authorization", "value": format!("Bearer {token}") }],
+    })
+}
+
 /// The one file openab authors: `<workdir>/.openab/mcp-facade.json`.
 ///
 /// Source for the operator's `kiro-cli mcp import --file … workspace`, and the intended source for
@@ -281,6 +293,21 @@ mod facade_config_writer {
         let _ = tokio::fs::remove_dir_all(&d).await;
         tokio::fs::create_dir_all(&d).await.unwrap();
         d
+    }
+
+    /// `[mcp] pass_to_agent`: an ACP `http` McpServer carrying the real token, not a placeholder.
+    #[test]
+    fn the_session_mcp_server_entry_carries_the_real_token() {
+        let v = facade_session_mcp_server("http://127.0.0.1:8848/mcp", "tok-1");
+        assert_eq!(
+            v,
+            json!({
+                "type": "http",
+                "name": "openab",
+                "url": "http://127.0.0.1:8848/mcp",
+                "headers": [{ "name": "Authorization", "value": "Bearer tok-1" }],
+            })
+        );
     }
 
     /// We author exactly one file, in our own directory, with the facade entry.

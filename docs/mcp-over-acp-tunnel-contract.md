@@ -213,3 +213,13 @@ per-call consent UX yet. Fine-grained consent is a later addition to this contra
   session has already started — ADR D4).
 - Never assume an inner MCP `id`; always correlate by the outer ACP frame `id`.
 - Keep tool execution idempotent where possible; the agent may retry.
+
+## Handing the facade to the agent (`[mcp] pass_to_agent`)
+
+By default openab only writes `.openab/mcp-facade.json` and the operator wires it into the agent
+(D-15). With `[mcp] pass_to_agent = true`, the pool also sends the facade to agents that advertise
+`agentCapabilities.mcpCapabilities.http`, as an ACP `mcpServers` entry in `session/new` /
+`session/load`: `{type:"http", name:"openab", url, headers:[{name:"Authorization", value:"Bearer <session token>"}]}`.
+The token is the session's real one (it travels over that agent's own stdio, so nothing shared can be
+clobbered). Leave it off for agents already wired via `--mcp-config` or an import, or they will see
+the facade twice.
