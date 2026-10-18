@@ -312,8 +312,8 @@ fn post(target: &Target, session: Option<&str>, body: &str) -> io::Result<HttpRe
         req.push_str(&format!("Mcp-Session-Id: {sid}\r\n"));
     }
     req.push_str("\r\n");
+    req.push_str(body);
     stream.write_all(req.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
@@ -411,21 +411,35 @@ struct Bridge {
     /// The client's `initialize`, replayed if the server expires our session (rmcp's local
     /// session manager reaps idle sessions; a long shell step between two tool calls is enough).
     initialize: Mutex<Option<String>>,
+    /// Serializes re-initialization so concurrent 404s replay `initialize` once.
+    reinit: Mutex<()>,
 }
 
 impl Bridge {
-    fn send(&self, body: &str) -> io::Result<HttpResponse> {
-        let sid = self.session.lock().unwrap().clone();
-        let resp = post(&self.target, sid.as_deref(), body)?;
+    fn current_session(&self) -> Option<String> {
+        self.session.lock().unwrap().clone()
+    }
+
+    /// POST with an explicit session id; adopt any session id the server hands back.
+    fn send_with(&self, sid: Option<&str>, body: &str) -> io::Result<HttpResponse> {
+        let resp = post(&self.target, sid, body)?;
         if let Some(new_sid) = resp.header("mcp-session-id") {
             *self.session.lock().unwrap() = Some(new_sid.to_string());
         }
         Ok(resp)
     }
 
-    /// The server dropped our session (HTTP 404 with a session id): open a fresh one by
-    /// replaying `initialize` + `notifications/initialized`. Returns whether it worked.
-    fn reinitialize(&self) -> bool {
+    /// The server dropped session `stale` (HTTP 404): open a fresh one by replaying
+    /// `initialize` + `notifications/initialized`. Several request threads can hit the same 404;
+    /// whoever gets the lock first re-initializes, and the rest see the session already replaced
+    /// and just retry. Returns whether a usable session now exists.
+    fn reinitialize(&self, stale: &str) -> bool {
+        let _guard = self.reinit.lock().unwrap();
+        if let Some(cur) = self.current_session() {
+            if cur != stale {
+                return true;
+            }
+        }
         let Some(init) = self.initialize.lock().unwrap().clone() else {
             return false;
         };
@@ -434,25 +448,30 @@ impl Bridge {
             "[agy-acp mcp-bridge] {}: server session expired; re-initializing",
             self.name
         );
-        let ok = self.send(&init).is_ok_and(|r| r.status < 400);
+        let ok = self.send_with(None, &init).is_ok_and(|r| r.status < 400);
         if ok {
-            let _ = self.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+            let sid = self.current_session();
+            let _ = self.send_with(
+                sid.as_deref(),
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            );
         }
-        ok
+        ok && self.current_session().is_some()
     }
 
     /// Relay one message; returns whatever JSON-RPC messages came back, guaranteeing a reply for
     /// a request.
     fn relay(&self, line: &str, msg: &Value) -> Vec<Value> {
         let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("?");
-        let had_session = self.session.lock().unwrap().is_some();
-        let mut result = self.send(line);
-        if had_session
-            && method != "initialize"
-            && matches!(&result, Ok(r) if r.status == 404)
-            && self.reinitialize()
-        {
-            result = self.send(line);
+        let sid = self.current_session();
+        let mut result = self.send_with(sid.as_deref(), line);
+        if let Some(stale) = sid.as_deref() {
+            if method != "initialize"
+                && matches!(&result, Ok(r) if r.status == 404)
+                && self.reinitialize(stale)
+            {
+                result = self.send_with(self.current_session().as_deref(), line);
+            }
         }
         let (mut replies, failure) = match result {
             Ok(resp) => {
@@ -524,6 +543,7 @@ pub fn run_bridge(name: &str) -> i32 {
             target,
             session: Mutex::new(None),
             initialize: Mutex::new(None),
+            reinit: Mutex::new(()),
         })
     });
     for line in io::stdin().lock().lines() {
@@ -711,6 +731,31 @@ mod tests {
         );
     }
 
+    /// Read one HTTP request: headers plus a `Content-Length` body, however it is segmented.
+    fn read_request(conn: &mut std::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let k = conn.read(&mut chunk).unwrap();
+            if k == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..k]);
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let cl = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= h + 4 + cl {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
     /// Minimal HTTP server: answers each connection with `respond(request)`, `n` times.
     fn fake_server(
         n: usize,
@@ -722,25 +767,7 @@ mod tests {
             let mut seen = Vec::new();
             for _ in 0..n {
                 let (mut conn, _) = listener.accept().unwrap();
-                let mut buf = vec![0u8; 8192];
-                let mut len = 0;
-                // Read headers + Content-Length body.
-                loop {
-                    let k = conn.read(&mut buf[len..]).unwrap();
-                    len += k;
-                    let text = String::from_utf8_lossy(&buf[..len]).to_string();
-                    if let Some(h) = text.find("\r\n\r\n") {
-                        let cl = text
-                            .lines()
-                            .find_map(|l| l.strip_prefix("Content-Length: "))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        if len >= h + 4 + cl || k == 0 {
-                            break;
-                        }
-                    }
-                }
-                let req = String::from_utf8_lossy(&buf[..len]).to_string();
+                let req = read_request(&mut conn);
                 conn.write_all(respond(&req).as_bytes()).unwrap();
                 seen.push(req);
             }
@@ -794,6 +821,7 @@ mod tests {
             },
             session: Mutex::new(None),
             initialize: Mutex::new(None),
+            reinit: Mutex::new(()),
         };
         // Recorded initialize carries a marker so the fake server can tell the replay apart.
         let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"replay":false}}"#;
@@ -819,14 +847,82 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_404s_replay_initialize_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let replays = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter = Arc::clone(&replays);
+        // Serves forever on a detached thread; the test reads the counters afterwards.
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                let req = read_request(&mut conn);
+                let resp = if req.contains("\"initialize\"") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    http(
+                        "200 OK",
+                        "Mcp-Session-Id: s-2\r\n",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+                    )
+                } else if req.contains("notifications/initialized") {
+                    http("202 Accepted", "", "")
+                } else if req.contains("Mcp-Session-Id: s-1") {
+                    http("404 Not Found", "", "")
+                } else {
+                    let id = if req.contains("\"id\":3") { 3 } else { 2 };
+                    http(
+                        "200 OK",
+                        "",
+                        &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{}}}}"#),
+                    )
+                };
+                let _ = conn.write_all(resp.as_bytes());
+            }
+        });
+        let bridge = Arc::new(Bridge {
+            name: "t".into(),
+            target: Target {
+                host: "127.0.0.1".into(),
+                port,
+                path: "/mcp".into(),
+                headers: vec![],
+            },
+            session: Mutex::new(Some("s-1".into())),
+            initialize: Mutex::new(Some(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.into(),
+            )),
+            reinit: Mutex::new(()),
+        });
+        let calls: Vec<_> = [2, 3]
+            .into_iter()
+            .map(|id| {
+                let bridge = Arc::clone(&bridge);
+                std::thread::spawn(move || {
+                    let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#);
+                    bridge.relay(&line, &serde_json::from_str(&line).unwrap())
+                })
+            })
+            .collect();
+        for (call, id) in calls.into_iter().zip([2, 3]) {
+            let replies = call.join().unwrap();
+            assert_eq!(replies, vec![json!({"jsonrpc":"2.0","id":id,"result":{}})]);
+        }
+        assert_eq!(
+            replays.load(Ordering::SeqCst),
+            1,
+            "initialize must be replayed once"
+        );
+        assert_eq!(bridge.current_session().as_deref(), Some("s-2"));
+    }
+
+    #[test]
     fn post_sends_headers_and_reads_session_id() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = conn.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let req = read_request(&mut conn);
             let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
             write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-1\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
             req
