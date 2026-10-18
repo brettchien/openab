@@ -104,6 +104,15 @@ pub struct McpFacadeConfig {
     /// (`warn_if_tunnel_timeout_is_ineffective`).
     #[serde(default = "default_tunnel_timeout_seconds")]
     pub tunnel_timeout_seconds: u64,
+    /// Also hand the facade to the agent in ACP `session/new` / `session/load` `mcpServers`, as
+    /// an `http` server carrying the session's real token. Off by default: agents wired the D-15
+    /// way (`--mcp-config` / an import of `.openab/mcp-facade.json`) would otherwise see the
+    /// facade twice. Only sent to agents that advertise `mcpCapabilities.http`.
+    ///
+    /// claude-agent-acp also advertises `mcpCapabilities.http`, so do NOT enable this for Claude
+    /// agents that keep `--mcp-config .openab/mcp-facade.json` in `[agent] args` — pick one path.
+    #[serde(default)]
+    pub pass_to_agent: bool,
 }
 
 /// Public so the binary can use the same value instead of repeating the literal. A private
@@ -2564,6 +2573,18 @@ mod tests {
         .expect("the surviving [mcp] shape must keep working");
         let mcp = cfg.mcp.expect("[mcp] present");
         assert_eq!(mcp.listen, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn mcp_pass_to_agent_defaults_off_and_parses() {
+        let off = parse_config_str("[discord]\nbot_token = \"x\"\n[mcp]\n", "test").unwrap();
+        assert!(!off.mcp.unwrap().pass_to_agent);
+        let on = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\npass_to_agent = true\n",
+            "test",
+        )
+        .unwrap();
+        assert!(on.mcp.unwrap().pass_to_agent);
     }
 
     #[test]

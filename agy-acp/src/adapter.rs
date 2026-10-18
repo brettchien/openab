@@ -30,6 +30,8 @@ pub struct Adapter {
     pub conversations_dir: PathBuf,
     pub state_file: PathBuf,
     pub available_models: Option<Vec<String>>,
+    /// Per-session env for `agy -p`, carrying the session's ACP `mcpServers` to the bridge.
+    pub mcp_env: HashMap<String, Vec<(String, String)>>,
 }
 
 impl Adapter {
@@ -44,6 +46,7 @@ impl Adapter {
             conversations_dir: PathBuf::from(&home).join(".gemini/antigravity-cli/conversations"),
             state_file: state_dir.join("sessions.json"),
             available_models: None,
+            mcp_env: HashMap::new(),
         }
     }
 
@@ -243,6 +246,7 @@ impl Adapter {
         while self.sessions.len() >= MAX_SESSIONS {
             if let Some(key) = self.sessions.keys().next().cloned() {
                 self.sessions.remove(&key);
+                self.mcp_env.remove(&key);
             }
         }
     }
@@ -270,18 +274,47 @@ impl Adapter {
             result: Some(json!({
                 "protocolVersion": 1,
                 "agentInfo": { "name": "agy", "version": env!("CARGO_PKG_VERSION") },
-                "agentCapabilities": { "streaming": true, "loadSession": true },
+                "agentCapabilities": {
+                    "streaming": true,
+                    "loadSession": true,
+                    "mcpCapabilities": { "http": true, "sse": false },
+                },
             })),
             error: None,
         }
     }
 
-    pub fn handle_session_new(&mut self, id: Value) -> JsonRpcResponse {
+    /// Record the session's ACP `mcpServers`: wire a bridge entry into agy's config for each
+    /// http server and keep the per-session part (url + headers) as env for its `agy -p` runs.
+    /// Re-sent on every session/new and session/load, so it is never persisted.
+    pub fn apply_mcp_servers(&mut self, session_id: &str, params: &Value) {
+        let servers = crate::mcp::parse_http_servers(params);
+        if servers.is_empty() {
+            self.mcp_env.remove(session_id);
+            return;
+        }
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "agy-acp".to_string());
+        let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+        if let Err(e) = crate::mcp::ensure_bridge_entries(&crate::mcp::agy_mcp_config_path(), &exe, &names) {
+            eprintln!("[agy-acp] WARN: could not register MCP bridge in agy config: {e}");
+        }
+        eprintln!("[agy-acp] session MCP servers: {}", names.join(", "));
+        self.mcp_env.insert(session_id.to_string(), crate::mcp::session_env(&servers));
+    }
+
+    pub fn mcp_env_for(&self, session_id: &str) -> Vec<(String, String)> {
+        self.mcp_env.get(session_id).cloned().unwrap_or_default()
+    }
+
+    pub fn handle_session_new(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
         let session_id = Uuid::new_v4().to_string();
         self.evict_if_needed();
         self.sessions.insert(session_id.clone(), Session {
             conversation_id: None, last_step_idx: -1, model_id: None,
         });
+        self.apply_mcp_servers(&session_id, params);
         let config_options = self.config_options_json(None);
         JsonRpcResponse {
             jsonrpc: "2.0",
@@ -298,6 +331,7 @@ impl Adapter {
                 error: Some(json!({"code":-32602,"message":"missing sessionId"})) };
         }
         if self.restore_session_state(session_id) {
+            self.apply_mcp_servers(session_id, params);
             let model_id = self.sessions.get(session_id).and_then(|s| s.model_id.clone());
             let config_options = self.config_options_json(model_id.as_deref());
             return JsonRpcResponse { jsonrpc: "2.0", id,

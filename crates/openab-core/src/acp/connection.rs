@@ -188,6 +188,10 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
+    /// Agent advertised `agentCapabilities.mcpCapabilities.http` in `initialize`.
+    pub supports_http_mcp: bool,
+    /// Sent as `mcpServers` in `session/new` / `session/load` (empty unless the pool sets it).
+    pub mcp_servers: Vec<Value>,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
@@ -516,6 +520,8 @@ impl AcpConnection {
             last_active: Instant::now(),
             activity,
             session_reset: false,
+            supports_http_mcp: false,
+            mcp_servers: Vec::new(),
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
             #[cfg(feature = "acp-mcp")]
@@ -595,6 +601,10 @@ impl AcpConnection {
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.supports_http_mcp = result
+            .and_then(|r| r.pointer("/agentCapabilities/mcpCapabilities/http"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         info!(
             agent = agent_name,
             load_session = self.supports_load_session,
@@ -605,7 +615,10 @@ impl AcpConnection {
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request(
+                "session/new",
+                Some(json!({"cwd": cwd, "mcpServers": self.mcp_servers})),
+            )
             .await?;
 
         let session_id = resp
@@ -822,7 +835,7 @@ impl AcpConnection {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": self.mcp_servers})),
             )
             .await?;
         // Accept any non-error response as success

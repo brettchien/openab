@@ -67,6 +67,8 @@ pub struct SessionPool {
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
     facade_url: Option<String>,
+    #[cfg(feature = "acp-mcp")]
+    facade_pass_to_agent: bool,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
@@ -338,6 +340,8 @@ impl SessionPool {
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
             facade_url: None,
+            #[cfg(feature = "acp-mcp")]
+            facade_pass_to_agent: false,
         }
     }
 
@@ -359,6 +363,14 @@ impl SessionPool {
     ) -> Self {
         self.session_registrar = registrar;
         self.facade_url = facade_url;
+        self
+    }
+
+    /// `[mcp] pass_to_agent`: also hand each session's facade entry (with its real token) to the
+    /// agent in ACP `mcpServers`, for agents that advertise `mcpCapabilities.http`.
+    #[cfg(feature = "acp-mcp")]
+    pub fn with_facade_pass_to_agent(mut self, enabled: bool) -> Self {
+        self.facade_pass_to_agent = enabled;
         self
     }
 
@@ -585,6 +597,21 @@ impl SessionPool {
         .await?;
 
         new_conn.initialize().await?;
+
+        #[cfg(feature = "acp-mcp")]
+        if self.facade_pass_to_agent {
+            if let (Some(tok), Some(url)) = (&session_token, self.facade_url.as_ref()) {
+                if new_conn.supports_http_mcp {
+                    new_conn.mcp_servers =
+                        vec![crate::acp_mcp::facade_session_mcp_server(url, tok)];
+                } else {
+                    warn!(
+                        agent = %new_conn.agent_name,
+                        "[mcp] pass_to_agent is set but the agent does not advertise mcpCapabilities.http; not passing the facade in mcpServers"
+                    );
+                }
+            }
+        }
 
         let mut resumed = false;
         let mut load_failed: Option<&str> = None;

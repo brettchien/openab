@@ -584,6 +584,9 @@ async fn main() -> anyhow::Result<()> {
             )
         }),
     );
+    #[cfg(feature = "acp")]
+    let pool_inner =
+        pool_inner.with_facade_pass_to_agent(cfg.mcp.as_ref().is_some_and(|m| m.pass_to_agent));
     let pool = Arc::new(pool_inner);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
