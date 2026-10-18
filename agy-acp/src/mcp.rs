@@ -443,20 +443,21 @@ impl Bridge {
         let Some(init) = self.initialize.lock().unwrap().clone() else {
             return false;
         };
-        *self.session.lock().unwrap() = None;
+        // Keep the stale id in place until the new one arrives: a request sent meanwhile then
+        // gets a 404 (and waits here, then retries) instead of a no-session 400 it can't recover.
         eprintln!(
             "[agy-acp mcp-bridge] {}: server session expired; re-initializing",
             self.name
         );
         let ok = self.send_with(None, &init).is_ok_and(|r| r.status < 400);
-        if ok {
-            let sid = self.current_session();
+        let fresh = self.current_session().filter(|cur| cur != stale);
+        if ok && fresh.is_some() {
             let _ = self.send_with(
-                sid.as_deref(),
+                fresh.as_deref(),
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             );
         }
-        ok && self.current_session().is_some()
+        ok && fresh.is_some()
     }
 
     /// Relay one message; returns whatever JSON-RPC messages came back, guaranteeing a reply for
@@ -487,7 +488,9 @@ impl Bridge {
                 eprintln!("[agy-acp mcp-bridge] {}: {why} for {method}", self.name);
             }
         }
-        if let Some(id) = msg.get("id") {
+        // Only a request (id + method) is owed a reply. agy's own responses to server requests also
+        // carry an id; a synthesized error for one could collide with an id agy is waiting on.
+        if let (Some(id), true) = (msg.get("id"), msg.get("method").is_some()) {
             if !replies.iter().any(|r| is_reply_to(r, id)) {
                 replies.push(synthesized_error(id, method, failure));
             }
@@ -914,6 +917,28 @@ mod tests {
             "initialize must be replayed once"
         );
         assert_eq!(bridge.current_session().as_deref(), Some("s-2"));
+    }
+
+    #[test]
+    fn client_responses_are_not_answered_with_a_synthesized_error() {
+        let (port, server) = fake_server(1, |_| http("202 Accepted", "", ""));
+        let bridge = Bridge {
+            name: "t".into(),
+            target: Target {
+                host: "127.0.0.1".into(),
+                port,
+                path: "/mcp".into(),
+                headers: vec![],
+            },
+            session: Mutex::new(Some("s-1".into())),
+            initialize: Mutex::new(None),
+            reinit: Mutex::new(()),
+        };
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert!(bridge
+            .relay(response, &serde_json::from_str(response).unwrap())
+            .is_empty());
+        server.join().unwrap();
     }
 
     #[test]

@@ -24,6 +24,10 @@ entries with the same name are left untouched.
 
 With openab, set `[mcp] pass_to_agent = true` to have the broker pass the OAB MCP Facade this way.
 
+The bridge gives up on a request after 240s (`AGY_ACP_MCP_TIMEOUT_SECS`), above openab's default
+`[mcp] tunnel_timeout_seconds` (170s). If you raise `tunnel_timeout_seconds` past that, raise
+`AGY_ACP_MCP_TIMEOUT_SECS` too, or the bridge times out before the facade does.
+
 ## Build
 
 ```bash
