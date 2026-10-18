@@ -222,4 +222,7 @@ By default openab only writes `.openab/mcp-facade.json` and the operator wires i
 `session/load`: `{type:"http", name:"openab", url, headers:[{name:"Authorization", value:"Bearer <session token>"}]}`.
 The token is the session's real one (it travels over that agent's own stdio, so nothing shared can be
 clobbered). Leave it off for agents already wired via `--mcp-config` or an import, or they will see
-the facade twice.
+the facade twice — this includes claude-agent-acp, which also advertises `mcpCapabilities.http`.
+
+Rollback note: older openab builds reject `pass_to_agent` (`[mcp]` is `deny_unknown_fields`) and fail to
+start. When rolling back to such a build, remove the key from the config first, then roll back the image.

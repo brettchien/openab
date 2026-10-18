@@ -108,6 +108,9 @@ pub struct McpFacadeConfig {
     /// an `http` server carrying the session's real token. Off by default: agents wired the D-15
     /// way (`--mcp-config` / an import of `.openab/mcp-facade.json`) would otherwise see the
     /// facade twice. Only sent to agents that advertise `mcpCapabilities.http`.
+    ///
+    /// claude-agent-acp also advertises `mcpCapabilities.http`, so do NOT enable this for Claude
+    /// agents that keep `--mcp-config .openab/mcp-facade.json` in `[agent] args` — pick one path.
     #[serde(default)]
     pub pass_to_agent: bool,
 }
