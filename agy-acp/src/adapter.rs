@@ -246,6 +246,7 @@ impl Adapter {
         while self.sessions.len() >= MAX_SESSIONS {
             if let Some(key) = self.sessions.keys().next().cloned() {
                 self.sessions.remove(&key);
+                self.mcp_env.remove(&key);
             }
         }
     }

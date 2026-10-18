@@ -20,6 +20,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Subcommand that runs the stdio bridge: `agy-acp mcp-bridge <name>`.
@@ -209,12 +210,22 @@ fn parse_target(raw: &str) -> Result<Target, String> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?,
-        ),
-        None => (authority.to_string(), 80),
+    let bad_port = || format!("bad port in {url}");
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        // `[::1]:8848` — the brackets are URL syntax, not part of the address.
+        let (addr, rest) = v6
+            .split_once(']')
+            .ok_or_else(|| format!("bad IPv6 host in {url}"))?;
+        let port = match rest.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().map_err(|_| bad_port())?,
+            None => 80,
+        };
+        (addr.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| bad_port())?),
+            None => (authority.to_string(), 80),
+        }
     };
     let headers = cfg
         .get("headers")
@@ -270,11 +281,23 @@ fn decode_chunked(mut data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Per-request read timeout. A bit above openab's default `[mcp] tunnel_timeout_seconds` (170s),
+/// so a hung server fails the call instead of wedging the bridge. `AGY_ACP_MCP_TIMEOUT_SECS`
+/// overrides it.
+fn request_timeout() -> Duration {
+    let secs = std::env::var("AGY_ACP_MCP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(240);
+    Duration::from_secs(secs)
+}
+
 /// One POST, `Connection: close`, read to EOF. The facade ends each response stream once the
 /// request is answered, so reading to EOF is enough.
 fn post(target: &Target, session: Option<&str>, body: &str) -> io::Result<HttpResponse> {
     let mut stream = TcpStream::connect((target.host.as_str(), target.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
+    stream.set_read_timeout(Some(request_timeout()))?;
     let mut req = format!(
         "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
         target.path,
@@ -379,11 +402,110 @@ fn empty_server_reply(msg: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-/// Relay agy's stdio JSON-RPC to the session's http MCP server. Requests are serialized so the
-/// `Mcp-Session-Id` from `initialize` is known before later calls. Every request gets a reply:
-/// agy opens with `server/discover` (newer MCP), which Streamable HTTP servers that predate it
-/// answer with a plain HTTP error; a synthesized JSON-RPC error makes agy fall back to
-/// `initialize` instead of waiting forever.
+/// Bridge state shared by the request threads.
+struct Bridge {
+    name: String,
+    target: Target,
+    /// `Mcp-Session-Id` handed out by the server on `initialize`.
+    session: Mutex<Option<String>>,
+    /// The client's `initialize`, replayed if the server expires our session (rmcp's local
+    /// session manager reaps idle sessions; a long shell step between two tool calls is enough).
+    initialize: Mutex<Option<String>>,
+}
+
+impl Bridge {
+    fn send(&self, body: &str) -> io::Result<HttpResponse> {
+        let sid = self.session.lock().unwrap().clone();
+        let resp = post(&self.target, sid.as_deref(), body)?;
+        if let Some(new_sid) = resp.header("mcp-session-id") {
+            *self.session.lock().unwrap() = Some(new_sid.to_string());
+        }
+        Ok(resp)
+    }
+
+    /// The server dropped our session (HTTP 404 with a session id): open a fresh one by
+    /// replaying `initialize` + `notifications/initialized`. Returns whether it worked.
+    fn reinitialize(&self) -> bool {
+        let Some(init) = self.initialize.lock().unwrap().clone() else {
+            return false;
+        };
+        *self.session.lock().unwrap() = None;
+        eprintln!(
+            "[agy-acp mcp-bridge] {}: server session expired; re-initializing",
+            self.name
+        );
+        let ok = self.send(&init).is_ok_and(|r| r.status < 400);
+        if ok {
+            let _ = self.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        }
+        ok
+    }
+
+    /// Relay one message; returns whatever JSON-RPC messages came back, guaranteeing a reply for
+    /// a request.
+    fn relay(&self, line: &str, msg: &Value) -> Vec<Value> {
+        let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+        let had_session = self.session.lock().unwrap().is_some();
+        let mut result = self.send(line);
+        if had_session
+            && method != "initialize"
+            && matches!(&result, Ok(r) if r.status == 404)
+            && self.reinitialize()
+        {
+            result = self.send(line);
+        }
+        let (mut replies, failure) = match result {
+            Ok(resp) => {
+                let replies = messages_from(&resp);
+                let failure =
+                    (resp.status >= 400).then(|| (resp.status, format!("HTTP {}", resp.status)));
+                (replies, failure)
+            }
+            Err(e) => (Vec::new(), Some((0, e.to_string()))),
+        };
+        if let Some((_, why)) = &failure {
+            if replies.is_empty() {
+                eprintln!("[agy-acp mcp-bridge] {}: {why} for {method}", self.name);
+            }
+        }
+        if let Some(id) = msg.get("id") {
+            if !replies.iter().any(|r| is_reply_to(r, id)) {
+                replies.push(synthesized_error(id, method, failure));
+            }
+        }
+        replies
+    }
+}
+
+/// Error for a request the server did not answer. A method the server rejects outright
+/// (`server/discover` → HTTP 422 from servers that predate it) is "method not found" so the
+/// client falls back; anything else is an internal error naming the cause, so a failed
+/// `tools/call` does not masquerade as a missing tool.
+fn synthesized_error(id: &Value, method: &str, failure: Option<(u16, String)>) -> Value {
+    let (code, message) = match failure {
+        Some((422, _)) => (-32601, "Method not found".to_string()),
+        None if method == "server/discover" => (-32601, "Method not found".to_string()),
+        Some((_, why)) => (-32603, format!("MCP server unavailable: {why}")),
+        None => (-32603, "MCP server returned no response".to_string()),
+    };
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn write_lines(out: &Mutex<io::Stdout>, replies: Vec<Value>) {
+    let out = out.lock().unwrap();
+    let mut out = out.lock();
+    for r in replies {
+        let _ = writeln!(out, "{r}");
+    }
+    let _ = out.flush();
+}
+
+/// Relay agy's stdio JSON-RPC to the session's http MCP server. `initialize` and notifications
+/// are handled in order (the session id must exist before anything else); every other request
+/// runs on its own thread, so a long tool call does not block `ping`, cancellation, or other
+/// calls. Every request gets a reply: agy opens with `server/discover` (newer MCP), which
+/// Streamable HTTP servers that predate it answer with a plain HTTP error; a synthesized JSON-RPC
+/// error makes agy fall back to `initialize` instead of waiting forever.
 pub fn run_bridge(name: &str) -> i32 {
     let target = match std::env::var(env_key(name)) {
         Ok(raw) => match parse_target(&raw) {
@@ -395,8 +517,15 @@ pub fn run_bridge(name: &str) -> i32 {
         },
         Err(_) => None,
     };
-    let stdout = io::stdout();
-    let mut session: Option<String> = None;
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+    let bridge = target.map(|target| {
+        Arc::new(Bridge {
+            name: name.to_string(),
+            target,
+            session: Mutex::new(None),
+            initialize: Mutex::new(None),
+        })
+    });
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -405,37 +534,20 @@ pub fn run_bridge(name: &str) -> i32 {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let id = msg.get("id").cloned();
-        let mut replies: Vec<Value> = Vec::new();
-        match &target {
-            None => replies.extend(empty_server_reply(&msg)),
-            Some(t) => match post(t, session.as_deref(), &line) {
-                Ok(resp) => {
-                    if let Some(sid) = resp.header("mcp-session-id") {
-                        session = Some(sid.to_string());
-                    }
-                    replies = messages_from(&resp);
-                    if replies.is_empty() && resp.status >= 400 {
-                        eprintln!(
-                            "[agy-acp mcp-bridge] {name}: HTTP {} for {}",
-                            resp.status,
-                            msg.get("method").and_then(|v| v.as_str()).unwrap_or("?")
-                        );
-                    }
-                }
-                Err(e) => eprintln!("[agy-acp mcp-bridge] {name}: {e}"),
-            },
+        let Some(bridge) = &bridge else {
+            write_lines(&stdout, empty_server_reply(&msg).into_iter().collect());
+            continue;
+        };
+        let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        if method == "initialize" {
+            *bridge.initialize.lock().unwrap() = Some(line.clone());
         }
-        if let Some(id) = &id {
-            if !replies.iter().any(|r| is_reply_to(r, id)) {
-                replies.push(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } }));
-            }
+        if method == "initialize" || msg.get("id").is_none() {
+            write_lines(&stdout, bridge.relay(&line, &msg));
+        } else {
+            let (bridge, stdout) = (Arc::clone(bridge), Arc::clone(&stdout));
+            std::thread::spawn(move || write_lines(&stdout, bridge.relay(&line, &msg)));
         }
-        let mut out = stdout.lock();
-        for r in replies {
-            let _ = writeln!(out, "{r}");
-        }
-        let _ = out.flush();
     }
     0
 }
@@ -565,6 +677,144 @@ mod tests {
         assert_eq!(
             messages_from(&resp),
             vec![json!({"jsonrpc":"2.0","id":1,"result":{}})]
+        );
+    }
+
+    #[test]
+    fn parse_target_handles_ipv6_hosts() {
+        let t = parse_target(r#"{"url":"http://[::1]:8848/mcp"}"#).unwrap();
+        assert_eq!(
+            (t.host.as_str(), t.port, t.path.as_str()),
+            ("::1", 8848, "/mcp")
+        );
+        let t = parse_target(r#"{"url":"http://[::1]/mcp"}"#).unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("::1", 80));
+        assert!(parse_target(r#"{"url":"http://[::1:8848/mcp"}"#).is_err());
+    }
+
+    #[test]
+    fn synthesized_errors_keep_method_not_found_for_rejected_methods_only() {
+        let id = json!(7);
+        let discover = synthesized_error(&id, "server/discover", Some((422, "HTTP 422".into())));
+        assert_eq!(discover["error"]["code"], -32601);
+        let call = synthesized_error(&id, "tools/call", Some((500, "HTTP 500".into())));
+        assert_eq!(call["error"]["code"], -32603);
+        assert!(call["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP 500"));
+        let down = synthesized_error(&id, "tools/call", Some((0, "connection refused".into())));
+        assert_eq!(down["error"]["code"], -32603);
+        assert_eq!(
+            synthesized_error(&id, "tools/call", None)["error"]["code"],
+            -32603
+        );
+    }
+
+    /// Minimal HTTP server: answers each connection with `respond(request)`, `n` times.
+    fn fake_server(
+        n: usize,
+        respond: impl Fn(&str) -> String + Send + 'static,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..n {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 8192];
+                let mut len = 0;
+                // Read headers + Content-Length body.
+                loop {
+                    let k = conn.read(&mut buf[len..]).unwrap();
+                    len += k;
+                    let text = String::from_utf8_lossy(&buf[..len]).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let cl = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if len >= h + 4 + cl || k == 0 {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf[..len]).to_string();
+                conn.write_all(respond(&req).as_bytes()).unwrap();
+                seen.push(req);
+            }
+            seen
+        });
+        (port, handle)
+    }
+
+    fn http(status: &str, extra: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn expired_server_session_is_reinitialized_and_the_call_retried() {
+        let (port, server) = fake_server(5, |req| {
+            if req.contains("\"initialize\"") {
+                let sid = if req.contains("Mcp-Session-Id") {
+                    "s-x"
+                } else if req.contains("\"replay\":true") {
+                    "s-2"
+                } else {
+                    "s-1"
+                };
+                http(
+                    "200 OK",
+                    &format!("Mcp-Session-Id: {sid}\r\n"),
+                    r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+                )
+            } else if req.contains("notifications/initialized") {
+                http("202 Accepted", "", "")
+            } else if req.contains("Mcp-Session-Id: s-1") {
+                http("404 Not Found", "", "")
+            } else {
+                http(
+                    "200 OK",
+                    "",
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#,
+                )
+            }
+        });
+        let bridge = Bridge {
+            name: "t".into(),
+            target: Target {
+                host: "127.0.0.1".into(),
+                port,
+                path: "/mcp".into(),
+                headers: vec![],
+            },
+            session: Mutex::new(None),
+            initialize: Mutex::new(None),
+        };
+        // Recorded initialize carries a marker so the fake server can tell the replay apart.
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"replay":false}}"#;
+        let first = bridge.relay(init, &serde_json::from_str(init).unwrap());
+        assert_eq!(first[0]["id"], 1);
+        assert_eq!(bridge.session.lock().unwrap().as_deref(), Some("s-1"));
+        *bridge.initialize.lock().unwrap() = Some(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"replay":true}}"#.into(),
+        );
+
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let replies = bridge.relay(list, &serde_json::from_str(list).unwrap());
+        assert_eq!(
+            replies,
+            vec![json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})]
+        );
+        assert_eq!(bridge.session.lock().unwrap().as_deref(), Some("s-2"));
+        let seen = server.join().unwrap();
+        assert!(
+            seen[4].contains("Mcp-Session-Id: s-2"),
+            "retry must use the new session"
         );
     }
 
