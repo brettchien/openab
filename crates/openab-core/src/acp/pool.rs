@@ -505,23 +505,6 @@ impl SessionPool {
             }
         }
 
-        // Snapshot active handles so we can inspect them outside the state lock.
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
-            let state = self.state.read().await;
-            state
-                .active
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
-        };
-
-        let (eviction_candidate, skipped_locked_candidates): (Option<EvictionCandidate>, usize) =
-            pick_eviction_candidate(
-                snapshot.iter().map(|(k, v)| (k, v)),
-                thread_id,
-                eviction_meta,
-            );
-
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
         let stored_workdir = {
@@ -716,30 +699,19 @@ impl SessionPool {
         }
 
         if state.active.len() >= self.max_sessions {
-            let mut skipped_locked_candidates = skipped_locked_candidates;
-            let mut victim = None;
-            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    victim = Some((key, sid));
-                } else {
-                    warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal; rescanning");
-                }
-            }
-            if victim.is_none() {
-                // The pre-scan ran outside the lock, before the (multi-second) agent
-                // spawn, so its pick can be stale: a concurrent create may have evicted
-                // the same session and taken the slot, or sessions busy then may be idle
-                // now. Rescan under the write lock — the map cannot change while we hold
-                // it, so a single pass is enough.
-                let (rescan, rescan_skipped) =
-                    pick_eviction_candidate(state.active.iter(), thread_id, eviction_meta);
-                skipped_locked_candidates = rescan_skipped;
-                if let Some((key, expected_conn, _, sid)) = rescan {
-                    if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                        victim = Some((key, sid));
-                    }
-                }
-            }
+            // Pick the victim here, under the write lock, and nowhere earlier. A pick made
+            // before the (multi-second) agent spawn goes stale: a concurrent create may have
+            // evicted the same session and taken the slot, or the pick may have started a
+            // turn since (evicting it then would drop its cancel handle and facade token
+            // mid-turn and let a later message session/load the same sid in a second
+            // process). Under the lock the map cannot change and `try_lock` sees who is busy
+            // right now, so one pass decides. At most `max_sessions` entries; `try_lock`
+            // never waits, so this does not await a connection lock while holding state.
+            let (candidate, skipped_locked_candidates): (Option<EvictionCandidate>, usize) =
+                pick_eviction_candidate(state.active.iter(), thread_id, eviction_meta);
+            let victim = candidate.and_then(|(key, expected_conn, _, sid)| {
+                remove_if_same_handle(&mut state.active, &key, &expected_conn).map(|_| (key, sid))
+            });
             if let Some((key, sid)) = victim {
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
