@@ -73,7 +73,9 @@ pub struct SessionPool {
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
-type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
+/// `(key, handle, last_active, extra)` for one eviction candidate.
+type Candidate<T, X> = (String, Arc<Mutex<T>>, Instant, X);
+type EvictionCandidate = Candidate<AcpConnection, Option<String>>;
 
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
@@ -132,6 +134,38 @@ fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Inst
         Some(oldest) => candidate_last_active < oldest,
         None => true,
     }
+}
+
+/// Pick the least-recently-active idle entry, skipping `exclude`. An entry whose
+/// mutex is currently held (in-flight turn) is busy: it is skipped and counted.
+/// `meta` extracts `(last_active, extra)` from an idle entry. Generic over the
+/// connection type so the selection policy is unit-testable without a live agent.
+fn pick_eviction_candidate<'a, T: 'a, X>(
+    entries: impl IntoIterator<Item = (&'a String, &'a Arc<Mutex<T>>)>,
+    exclude: &str,
+    meta: impl Fn(&T) -> (Instant, X),
+) -> (Option<Candidate<T, X>>, usize) {
+    let mut best: Option<Candidate<T, X>> = None;
+    let mut skipped_busy = 0usize;
+    for (key, conn) in entries {
+        if key == exclude {
+            continue;
+        }
+        let Ok(guard) = conn.try_lock() else {
+            skipped_busy += 1;
+            continue;
+        };
+        let (last_active, extra) = meta(&guard);
+        drop(guard);
+        if better_candidate(best.as_ref().map(|(_, _, t, _)| *t), last_active) {
+            best = Some((key.clone(), Arc::clone(conn), last_active, extra));
+        }
+    }
+    (best, skipped_busy)
+}
+
+fn eviction_meta(conn: &AcpConnection) -> (Instant, Option<String>) {
+    (conn.last_active, conn.acp_session_id.clone())
 }
 
 /// Prepare facade browser capabilities for one session: write the agent's facade MCP entry, and
@@ -471,41 +505,6 @@ impl SessionPool {
             }
         }
 
-        // Snapshot active handles so we can inspect them outside the state lock.
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
-            let state = self.state.read().await;
-            state
-                .active
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
-        };
-
-        let mut eviction_candidate: Option<EvictionCandidate> = None;
-        let mut skipped_locked_candidates = 0usize;
-        for (key, conn) in snapshot {
-            if key == thread_id {
-                continue;
-            }
-            let conn_handle = Arc::clone(&conn);
-            let Ok(conn) = conn.try_lock() else {
-                skipped_locked_candidates += 1;
-                continue;
-            };
-            let candidate = (
-                key,
-                conn_handle,
-                conn.last_active,
-                conn.acp_session_id.clone(),
-            );
-            if better_candidate(
-                eviction_candidate.as_ref().map(|(_, _, t, _)| *t),
-                candidate.2,
-            ) {
-                eviction_candidate = Some(candidate);
-            }
-        }
-
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
         let stored_workdir = {
@@ -700,22 +699,31 @@ impl SessionPool {
         }
 
         if state.active.len() >= self.max_sessions {
-            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    state.cancel_handles.remove(&key);
-                    state.activity.remove(&key);
-                    state.pgids.remove(&key);
-                    #[cfg(feature = "acp-mcp")]
-                    revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
-                    info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
-                    if let Some(sid) = sid {
-                        state.persisted.insert(key.clone(), sid.clone());
-                        state.suspended.insert(key, sid);
-                    } else {
-                        state.persisted.remove(&key);
-                    }
+            // Pick the victim here, under the write lock, and nowhere earlier. A pick made
+            // before the (multi-second) agent spawn goes stale: a concurrent create may have
+            // evicted the same session and taken the slot, or the pick may have started a
+            // turn since (evicting it then would drop its cancel handle and facade token
+            // mid-turn and let a later message session/load the same sid in a second
+            // process). Under the lock the map cannot change and `try_lock` sees who is busy
+            // right now, so one pass decides. At most `max_sessions` entries; `try_lock`
+            // never waits, so this does not await a connection lock while holding state.
+            let (candidate, skipped_locked_candidates): (Option<EvictionCandidate>, usize) =
+                pick_eviction_candidate(state.active.iter(), thread_id, eviction_meta);
+            let victim = candidate.and_then(|(key, expected_conn, _, sid)| {
+                remove_if_same_handle(&mut state.active, &key, &expected_conn).map(|_| (key, sid))
+            });
+            if let Some((key, sid)) = victim {
+                state.cancel_handles.remove(&key);
+                state.activity.remove(&key);
+                state.pgids.remove(&key);
+                #[cfg(feature = "acp-mcp")]
+                revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
+                info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
+                if let Some(sid) = sid {
+                    state.persisted.insert(key.clone(), sid.clone());
+                    state.suspended.insert(key, sid);
                 } else {
-                    warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
+                    state.persisted.remove(&key);
                 }
             } else if skipped_locked_candidates > 0 {
                 warn!(
@@ -1109,8 +1117,8 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        better_candidate, classify_hung, classify_idle, get_or_insert_gate,
+        pick_eviction_candidate, purge_session_entries, remove_if_same_handle, PoolState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1367,6 +1375,62 @@ mod tests {
     fn better_candidate_keeps_existing_on_equal_last_active() {
         let ts = Instant::now() - std::time::Duration::from_secs(60);
         assert!(!better_candidate(Some(ts), ts));
+    }
+
+    fn eviction_pool(entries: &[(&str, u64)]) -> HashMap<String, Arc<Mutex<Instant>>> {
+        let now = Instant::now();
+        entries
+            .iter()
+            .map(|(k, idle_secs)| {
+                let last_active = now - std::time::Duration::from_secs(*idle_secs);
+                (k.to_string(), Arc::new(Mutex::new(last_active)))
+            })
+            .collect()
+    }
+
+    fn pick(map: &HashMap<String, Arc<Mutex<Instant>>>, exclude: &str) -> (Option<String>, usize) {
+        let (c, skipped) = pick_eviction_candidate(map.iter(), exclude, |t: &Instant| (*t, ()));
+        (c.map(|(k, _, _, _)| k), skipped)
+    }
+
+    #[test]
+    fn pick_eviction_candidate_takes_oldest_idle_and_skips_self() {
+        let map = eviction_pool(&[("me", 900), ("a", 300), ("b", 600)]);
+        assert_eq!(pick(&map, "me"), (Some("b".to_string()), 0));
+    }
+
+    #[test]
+    fn pick_eviction_candidate_skips_busy_entries() {
+        let map = eviction_pool(&[("a", 600), ("b", 300)]);
+        let _busy = map["a"].try_lock().unwrap();
+        assert_eq!(pick(&map, "me"), (Some("b".to_string()), 1));
+    }
+
+    #[test]
+    fn pick_eviction_candidate_none_when_all_busy() {
+        let map = eviction_pool(&[("a", 600)]);
+        let _busy = map["a"].try_lock().unwrap();
+        assert_eq!(pick(&map, "me"), (None, 1));
+    }
+
+    /// The race this guards: two creates pre-scan concurrently and both pick the
+    /// same oldest idle session. The first evicts it and inserts its own (fresh)
+    /// session; the second's stale pick no longer matches, so it must rescan and
+    /// evict the next-oldest idle session instead of failing with "pool exhausted".
+    #[test]
+    fn stale_candidate_rescan_picks_next_oldest_not_the_fresh_insert() {
+        let mut map = eviction_pool(&[("old", 900), ("mid", 600), ("new", 60)]);
+        let (stale, _) = pick_eviction_candidate(map.iter(), "second", |t: &Instant| (*t, ()));
+        let (stale_key, stale_handle, _, _) = stale.expect("pre-scan pick");
+        assert_eq!(stale_key, "old");
+
+        // First create wins: evicts "old", inserts its fresh session.
+        assert!(remove_if_same_handle(&mut map, "old", &stale_handle).is_some());
+        map.insert("first".to_string(), Arc::new(Mutex::new(Instant::now())));
+
+        // Second create: stale pick fails, rescan under the lock.
+        assert!(remove_if_same_handle(&mut map, &stale_key, &stale_handle).is_none());
+        assert_eq!(pick(&map, "second"), (Some("mid".to_string()), 0));
     }
 
     /// The force-evict warning must log NEITHER id raw — both the `acp_<uuid>` channel (inside the
