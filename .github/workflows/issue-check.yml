@@ -20,6 +20,9 @@ jobs:
             const issue = context.payload.issue;
             const body = issue.body || '';
             const labels = issue.labels.map(l => l.name);
+            // node-security issues are generated and kept current by node-security-check.yml.
+            // Its GITHUB_TOKEN writes do not trigger this workflow; this covers human edits and relabels.
+            if (labels.includes('node-security')) return;
             const marker = '<!-- openab-issue-check -->';
 
             const rules = {
