@@ -28,7 +28,7 @@ OpenCode supports [75+ LLM providers](https://opencode.ai/docs/providers/) via t
 docker build -f Dockerfile.opencode -t openab-opencode:latest .
 ```
 
-The image installs `opencode-ai` globally via npm on `node:22-bookworm-slim`.
+The image installs `opencode-ai` globally via npm on `node:<NODE22_VERSION>-trixie-slim`, where `NODE22_VERSION` is the pinned Node.js 22 release in `Dockerfile.opencode`.
 
 ## Helm Install
 

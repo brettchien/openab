@@ -5,9 +5,14 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'Dockerfile*'
+      # validate-packaged-pins checks Node.js pins in every tracked Dockerfile,
+      # including nested ones such as openshell/Dockerfile.
+      - '**/Dockerfile*'
       - 'src/**'
       - 'crates/**'
       - 'Cargo.*'
+      - '.github/scripts/node_base_arg.sh'
+      - '.github/scripts/test_node_base_arg.sh'
 
 concurrency:
   group: smoke-test-${{ github.event.pull_request.number }}
@@ -53,6 +58,21 @@ jobs:
 
       - name: Verify agent CLI exists
         run: docker run --rm --entrypoint which openab-test${{ matrix.variant.suffix }} ${{ matrix.variant.agent }}
+
+      - name: Verify Node.js runtime version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Derive the pin from the Dockerfile's base image rather than an agent
+          # allowlist, so a new Node-based variant cannot skip this check, and an
+          # unpinned FROM node: fails here.
+          arg=$(.github/scripts/node_base_arg.sh ${{ matrix.variant.dockerfile }})
+          if [ -z "$arg" ]; then echo "Not a Node.js-based image; skipping."; exit 0; fi
+          expected=$(awk -F= -v key="ARG $arg" '$1 == key {print $2; exit}' ${{ matrix.variant.dockerfile }})
+          test -n "$expected" || { echo "::error::Failed to extract $arg from ${{ matrix.variant.dockerfile }}"; exit 1; }
+          actual=$(docker run --rm --entrypoint node openab-test${{ matrix.variant.suffix }} --version)
+          [ "$actual" = "v$expected" ] || { echo "::error::Node.js version mismatch: expected v$expected ($arg), got $actual"; exit 1; }
+          echo "✅ Node.js $actual"
 
       - name: Verify Codex runtime versions
         if: matrix.variant.suffix == '-codex'
@@ -169,6 +189,21 @@ jobs:
             }
           }
 
+          # Every Dockerfile that builds on Node.js must carry the same pin as
+          # Dockerfile.unified, so a Node bump edits only Dockerfiles and a partial
+          # bump fails. node_base_arg.sh is the only Dockerfile parser for this:
+          # --check fails on any Node base not written as
+          # node:${NODE<n>_VERSION}-<suffix> (literal tag, digest-only, --platform,
+          # registry-qualified, or hidden behind a build arg or another stage).
+          .github/scripts/test_node_base_arg.sh
+          mapfile -t dockerfiles < <(git ls-files -- 'Dockerfile*' '*/Dockerfile*')
+          node_pins=$(.github/scripts/node_base_arg.sh --check "${dockerfiles[@]}")
+          [ -n "$node_pins" ] || { echo "::error::No Node.js-based Dockerfile found; the Node pin parity check would pass vacuously" >&2; exit 1; }
+          while read -r f arg; do
+            pin=$(grep -m1 "^ARG $arg=" Dockerfile.unified) || { echo "::error::$arg is not pinned in Dockerfile.unified" >&2; exit 1; }
+            [[ "$pin" =~ ^ARG\ NODE[0-9]+_VERSION=[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Dockerfile.unified must pin a full Node.js version (got '$pin')" >&2; exit 1; }
+            grep -Fqx -- "$pin" "$f" || { echo "::error file=$f::$f must declare '$pin' to match Dockerfile.unified" >&2; exit 1; }
+          done <<< "$node_pins"
           assert_line 'ARG KIRO_CLI_VERSION=2.25.0' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_AMD64=3e924de9697717b99891bb5f7d2a4bd9c768b8bfa1c498b35b3d242948512984' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_ARM64=cc8a2df90cd354b569b81ed4653db4796c86a69866568b4eb7fa7906afc95309' Dockerfile Dockerfile.package Dockerfile.unified

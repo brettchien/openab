@@ -10,6 +10,7 @@ on:
       - 'Cargo.*'
       - 'openab-agent/**'
       - 'agy-acp/**'
+      - '.github/scripts/node_base_arg.sh'
 
 concurrency:
   group: smoke-test-unified-${{ github.event.pull_request.number }}
@@ -84,6 +85,21 @@ jobs:
 
       - name: Verify agent CLI exists
         run: docker run --rm --entrypoint which openab-unified-${{ matrix.target.name }}:test ${{ matrix.target.agent }}
+
+      - name: Verify Node.js runtime version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Derive the pin from the target stage's base image rather than an
+          # agent allowlist, so a new Node-based target cannot skip this check,
+          # and an unpinned FROM node: fails here.
+          arg=$(.github/scripts/node_base_arg.sh Dockerfile.unified ${{ matrix.target.name }})
+          if [ -z "$arg" ]; then echo "Not a Node.js-based image; skipping."; exit 0; fi
+          expected=$(awk -F= -v key="ARG $arg" '$1 == key {print $2; exit}' Dockerfile.unified)
+          test -n "$expected" || { echo "::error::Failed to extract $arg from Dockerfile.unified"; exit 1; }
+          actual=$(docker run --rm --entrypoint node openab-unified-${{ matrix.target.name }}:test --version)
+          [ "$actual" = "v$expected" ] || { echo "::error::Node.js version mismatch: expected v$expected ($arg), got $actual"; exit 1; }
+          echo "✅ Node.js $actual"
 
       - name: Verify Codex runtime versions
         if: matrix.target.name == 'codex'

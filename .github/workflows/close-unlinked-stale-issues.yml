@@ -312,7 +312,8 @@ jobs:
             }
 
             // ── Phase 2: process new candidates ──
-            const query = `${repoQ} is:issue state:open -linked:pr -label:${HANDLED_LABEL} -label:${PENDING_LABEL} -label:${CLOSING_LABEL} created:<${cutoff}`;
+            // node-security issues are owned by node-security-check.yml, which closes them itself.
+            const query = `${repoQ} is:issue state:open -linked:pr -label:${HANDLED_LABEL} -label:${PENDING_LABEL} -label:${CLOSING_LABEL} -label:node-security created:<${cutoff}`;
             core.info(`query: ${query}${DRY_RUN ? ' (dry run)' : ''}`);
             const result = await searchIssues(query, { sort: 'created', order: 'asc' });
             for (const issue of result.items) {

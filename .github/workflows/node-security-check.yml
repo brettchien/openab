@@ -1,0 +1,48 @@
+name: Node security check
+
+on:
+  schedule:
+    - cron: '47 7 * * *'  # daily at 07:47 UTC
+  workflow_dispatch:
+  # Dry-run regression gate: a change that breaks the Dockerfile parser or the
+  # script fails in its own PR instead of in the next scheduled run.
+  pull_request:
+    paths:
+      - .github/scripts/node_security_check.sh
+      - .github/workflows/node-security-check.yml
+      - Dockerfile.unified
+
+permissions:
+  contents: read
+
+# A scheduled run and a manual dispatch racing could each create an issue.
+# PR dry runs never touch issues, so they get their own per-PR group.
+concurrency:
+  group: node-security-check-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'reconcile' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dry-run:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Dry-run the Node security check (no gh calls)
+        env:
+          DRY_RUN: '1'
+        run: bash .github/scripts/node_security_check.sh
+
+  check:
+    if: github.event_name != 'pull_request' && github.repository == 'openabdev/openab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare Node pins and published images with Node.js security releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/node_security_check.sh

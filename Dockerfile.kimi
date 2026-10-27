@@ -1,3 +1,7 @@
+# Pinned so the shipped Node.js version is explicit; bump it on Node security
+# releases. Passing just the major (e.g. NODE24_VERSION=24) floats to the latest.
+ARG NODE24_VERSION=24.22.1
+
 # --- Build stage ---
 FROM rust:1-bookworm AS builder
 WORKDIR /build
@@ -23,7 +27,7 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
 # Kimi Code CLI is published as @moonshot-ai/kimi-code and exposes the
 # `kimi` binary. Its native ACP adapter is started with `kimi acp`.
 # Keep the package version pinned so image rebuilds are reproducible.
-FROM node:24-trixie-slim
+FROM node:${NODE24_VERSION}-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
     && rm -rf /var/lib/apt/lists/*

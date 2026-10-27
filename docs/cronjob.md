@@ -37,7 +37,7 @@ message = "summarize yesterday's merged PRs" # required: prompt for the agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
 timezone = "America/New_York"                     # optional, default: "UTC"
-thread_id = ""                               # optional: post to existing thread
+# thread_id = "234567890123456789"           # optional: post to existing thread (omit to create a new thread)
 ```
 
 | Field | Required | Default | Description |
@@ -49,7 +49,34 @@ thread_id = ""                               # optional: post to existing thread
 | `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, `"googlechat"`, or `"lineworks"` (non-default platforms require their feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
-| `thread_id` | | — | Post into an existing thread instead of the channel |
+| `thread_id` | | — | Post into an existing thread instead of creating a new one. Omit the field to create a new thread per run, unless a usercron `id` pins the job to its first thread. See [Thread Behavior](#thread-behavior) |
+| `id` | | — | Usercron only (ignored in baseline `[[cron.jobs]]`); a unique job identifier that enables scheduler writeback and is required for `disable_on_success`. See [Thread Behavior](#thread-behavior) |
+
+### Thread Behavior
+
+Where a job posts depends on `thread_id` and, for usercron jobs, `id`. This applies to platforms with thread support; Google Chat and LINE WORKS differ (see [Platform Prerequisites](#platform-prerequisites)).
+
+| `thread_id` | `id` | Behavior |
+|---|---|---|
+| set | any | Every run posts into that thread. No new thread and no `thread_id` writeback. |
+| omitted or blank | omitted | Every run creates a new thread. Since sessions are keyed by thread, each run also starts a fresh agent session. |
+| omitted or blank | set (usercron) | The first run creates a thread and writes its ID back as `thread_id`; later runs post into that thread. |
+
+A blank value (`""` or whitespace) is treated the same as omitting the field, for both `thread_id` and `id`. Surrounding whitespace is trimmed from both fields, so `thread_id = " 123 "` is stored and matched as `"123"`.
+
+`id` does not select a thread — it only tells the scheduler which entry to update. If you remove a written-back `thread_id` but keep `id`, the next run creates a new thread and pins the job to it again.
+
+> [!CAUTION]
+> **Breaking Change** — Duplicate usercron ids now skip. On earlier versions, two `[[jobs]]` entries with the same `id` both loaded and ran; as of this version only the first (in file order) runs and the rest are skipped at load. A job with an accidental copy-paste duplicate id stops firing after upgrading.
+> Before upgrading, check `cronjob.toml` for ids that are equal after trimming (including values that differ only by surrounding whitespace) and make them unique.
+
+Writeback edge cases for the `id` row:
+
+- A blank `id` counts as unset. Ids are compared after trimming, so any duplicates — including identical values and ids that differ only by surrounding whitespace — share one writeback target. The scheduler keeps the first entry in file order and skips the rest at load (`usercron: duplicate id (compared after trimming), skipping`). The first entry owns the id even when it is itself invalid or disabled, so a later entry with the same id still does not run (see the Breaking Change note).
+- The pinned thread takes effect once the scheduler reloads the file (next tick, normally within 60s).
+- Writeback re-resolves the first entry by trimmed `id` at write time, not against the snapshot the job was loaded from. `usercron_write_lock` serializes OpenAB's own writes but not external edits. Editing `cronjob.toml` while a job is in flight — inserting a same-id entry above it, reordering entries, or reusing an id for another job — can redirect the writeback to a different entry: `thread_id` pins the wrong entry (the job that ran keeps creating a new thread each run), or `enabled = false` disables an unrelated job. Avoid reusing or moving ids while jobs are running.
+- If OpenAB cannot write `cronjob.toml` (see [Choosing the right scope](#choosing-the-right-scope)), nothing is pinned and every run creates a new thread. The logs show `failed to persist usercron thread_id`. This also means `disable_on_success` cannot write `enabled = false` back, so the goal command keeps running on every match — avoid both patterns when the file is unwritable.
+- **Known limitation** — On gateway platforms (Telegram), if topic creation fails or times out (5s), the job posts to the chat itself and the **chat ID** is written back as `thread_id`. Because Telegram chat IDs and topic IDs are both numeric, a written-back value cannot be distinguished from a correct topic ID. Later runs then target that ID as a topic. Remove the written-back `thread_id` line to retry topic creation. This is a documented workaround, not the final behavior; the root-cause fix (gating the writeback on a thread actually being created) is a follow-up.
 
 ## Cron Expression Format
 
@@ -362,11 +389,11 @@ Prompts and `disable_on_success` live in the same file, so write access cannot b
 - **Full autonomy**: enable usercron and let the agent manage `cronjob.toml`. Best for a personal agent whose inputs you trust.
 - **Operator-managed only**: leave `usercron_enabled = false` and put schedules in baseline `[[cron.jobs]]`, or keep usercron but make the file unwritable by the agent at the filesystem level. By default the agent runs as the same OS user as OpenAB, so anything the agent cannot write, OpenAB cannot write either, unless you run them as different users. Options:
   - A read-only mount or a Kubernetes ConfigMap. OpenAB cannot write the file either.
-  - A file **and** containing directory owned by a different user than the agent runs as. Write access to the directory alone is enough to replace the file, so making only the file read-only protects nothing. If the directory is shared-writable (such as `/tmp`), also set the sticky bit.
+  - A file **and** containing directory owned by a different user than the agent runs as. Write access to the directory alone is enough to replace the file, so making only the file read-only protects nothing. The containing directory must not be writable by the agent; do not use a shared-writable directory such as `/tmp`.
 
   `usercron_path` may be absolute, so protect the file and directory it actually points to. Agent CLI path rules alone are not enough, because an agent with a shell tool can bypass them.
 
-  OpenAB rewrites the file through a temporary file in the same directory, so scheduler writeback fails whenever OpenAB itself cannot write the file's directory. In that case, do not use `disable_on_success`: an achieved goal cannot be written back as `enabled = false`, so the command keeps running and `✅ Goal achieved` is posted on every schedule match. Also avoid jobs that set `id` but leave `thread_id` unset: the new thread's ID cannot be saved, so a new thread is created on every run. Instead, set a real `thread_id`, or omit `id` if you want a new thread per run.
+  OpenAB rewrites the file through a temporary file in the same directory, so scheduler writeback fails whenever OpenAB itself cannot write the file's directory. In that case, do not use `disable_on_success`, and avoid jobs that set `id` but leave `thread_id` unset; see the [Thread Behavior](#thread-behavior) writeback edge cases for the resulting symptoms.
 
 For an audit trail, record changes somewhere the agent cannot write: push commits to a protected remote, or persist file-monitor events (e.g. from `inotifywait`) to an external or append-only store. A local git repository is not enough, because an agent with a shell tool can rewrite its history. This is detective, not preventive: changes are hot-reloaded and take effect within about a minute.
 
@@ -375,7 +402,7 @@ For an audit trail, record changes somewhere the agent cannot write: push commit
 - **Minute-aligned**: The scheduler aligns to minute boundaries (`:00`), so `0 9 * * *` fires at exactly 09:00:00, not at whatever second the process started.
 - **Overlap protection**: If a previous execution of the same job is still running, the next tick is skipped.
 - **Isolation**: Cron failures are logged but never block interactive chat traffic.
-- **Usercron persistence**: For usercron jobs, the scheduler may write `thread_id` and `enabled = false` back to `cronjob.toml`.
+- **Usercron persistence**: For usercron jobs with an `id`, the scheduler may write `thread_id` and `enabled = false` back to `cronjob.toml` (see [Thread Behavior](#thread-behavior)).
 - **Graceful shutdown**: In-flight cron tasks are waited on (up to 30 seconds) during shutdown.
 
 ## Sender Identity
@@ -438,4 +465,7 @@ See [Kubernetes CronJob Reference Architecture](cronjob_k8s_refarch.md) for the 
 | Channel not found | Bot not in channel | Invite the bot to the target channel |
 | Usercron not reloading | File not saved / wrong path | Check logs for `usercron file changed, reloading` |
 | Usercron parse error | Invalid TOML syntax | Check logs for `failed to parse usercron file` |
+| Usercron job stopped running (e.g. after upgrade) | Another entry earlier in the file has the same `id` (compared after trimming), so this one is skipped | Check logs for `usercron: duplicate id (compared after trimming), skipping`; make the ids unique |
 | Goal job does not auto-disable | Command did not exit `0` or output did not include `disable_on_success_match` | Run the command manually and confirm both conditions |
+| Usercron job with `id` creates a new thread on every run | `thread_id` writeback failed (e.g. agent or OpenAB cannot write the file) | Check logs for `failed to persist usercron thread_id`; see [Thread Behavior](#thread-behavior) |
+| Telegram job with `id`: written-back `thread_id` equals the chat ID | Topic creation failed or timed out on the first run, so the chat ID was persisted | Check logs for `create_topic failed` / `create_topic timeout`; remove the `thread_id` line |

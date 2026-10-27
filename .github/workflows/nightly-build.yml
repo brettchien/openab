@@ -328,7 +328,9 @@ jobs:
           # The BUILD_ARGS literals above are indented for readability; strip any
           # leading whitespace so each emitted line is a clean KEY=VALUE that
           # build-push-action's build-args parser accepts. Drop blank lines too.
-          printf '%s\n' "$BUILD_ARGS" | sed 's/^[[:space:]]*//' | grep -v '^$' > resolved/build_args
+          # Nightly is the Node canary: pass only the major so the base image
+          # floats to the latest patch instead of the pinned Dockerfile default.
+          printf '%s\n' "$BUILD_ARGS" NODE22_VERSION=22 NODE24_VERSION=24 | sed 's/^[[:space:]]*//' | grep -v '^$' > resolved/build_args
           printf '%s\n' "$REPORT" > resolved/report
 
       - name: Upload resolved build args
@@ -417,6 +419,27 @@ jobs:
           # the compile stage via the bins= build context).
           no-cache: true
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Report installed Node.js version
+        # Nightly floats the Node.js patch (NODE<n>_VERSION=<major>, see resolve).
+        # Record what actually shipped so a red canary or a rollback can be
+        # triaged without pulling the image. Warn-only: the float is intentional.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.platform.arch }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -uo pipefail
+          arg=$(.github/scripts/node_base_arg.sh Dockerfile.package "$VARIANT") || {
+            echo "::warning::Could not resolve the Node.js base for $VARIANT"; exit 0; }
+          if [ -z "$arg" ]; then echo "$VARIANT is not Node.js-based; skipping."; exit 0; fi
+          IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          if docker pull -q "$IMAGE" >/dev/null && VERSION=$(docker run --rm --entrypoint node "$IMAGE" --version); then
+            echo "Node.js ${VARIANT} ${ARCH}: ${VERSION}"
+            echo "- Node.js \`${VARIANT}\` (${ARCH}, ${arg}): \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not read node --version from $IMAGE"
+          fi
 
       - name: Verify and report installed Kiro version
         if: matrix.variant == 'kiro'
