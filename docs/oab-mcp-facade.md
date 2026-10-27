@@ -125,12 +125,43 @@ Claude Code:
 claude mcp add --transport http oab http://127.0.0.1:8848/mcp
 ```
 
+## Stateless transport
+
+The facade serves Streamable HTTP in **stateless** mode: it never issues an
+`Mcp-Session-Id`, every POST is handled on its own, and `GET`/`DELETE` on
+`/mcp` return `405`. Nothing it does needs a protocol-level session —
+identity is the per-request `Authorization` bearer, both tools are plain
+request/response, and it never pushes notifications or sends server→client
+requests.
+
+This removes a client-visible failure mode. With sessions, an idle-retired
+(5 minutes) or pre-restart session id got `404 Session not found`; Claude
+Code then retried the call on a fresh session while its own background
+reconnect closed that connection about a second later, so the retried call
+**ran downstream** (a write landed) yet the agent saw
+`MCP server "…" session expired`. Stateless, there is no session to expire.
+A stale `Mcp-Session-Id` header is ignored rather than rejected, so clients
+still holding one after an idle gap or a restart keep working. This also
+aligns with the MCP 2026-07-28 revision's removal of protocol-level sessions
+(the facade still speaks the 2025 `initialize` handshake).
+
+Constraint for future facade tools: they must not rely on server→client
+requests (sampling/elicitation/roots) or the standalone GET SSE stream — both
+need session routing. Client cancellation is not available either: stateless
+mode drops `notifications/cancelled`, so a tool's request cancellation token
+never fires on a client cancel. A tool that needs any of these means
+revisiting this choice.
+
 ## Trust model
 
+"Session" below means the **agent session** behind the per-request
+`Authorization` bearer — application-level, unrelated to the MCP protocol
+session the facade no longer issues (see Stateless transport).
+
 Loopback-only, **no authentication layer** — the host/pod boundary is the
-trust boundary. Any process on the host can invoke every capability that does **not** require a session.
-Session-bound sources are different: since the per-session bearer shipped, the facade filters
-them out unless the request resolves to a session, so a host process without that token can
+trust boundary. Any process on the host can invoke every capability that does **not** require an agent session.
+Session-bound sources are different: since the per-agent-session bearer shipped, the facade filters
+them out unless the request's bearer resolves to an agent session, so a host process without that token can
 neither discover nor call them. Do not enable it on hosts that colocate
 untrusted processes. Least-privilege is enforced per provider with
 `tool_filter` include/exclude lists in `mcp.json`; excluded tools are
