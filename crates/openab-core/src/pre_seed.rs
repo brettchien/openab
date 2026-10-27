@@ -225,6 +225,12 @@ fn extract_zip_budgeted(
         }
 
         let mut file = archive.by_index(i)?;
+        // zip 9.x `enclosed_name()` strips a leading root and accepts absolute
+        // entry names; zip 2.x rejected them. Keep rejecting so an archive with
+        // absolute paths fails closed, as before the 2.x -> 9.x bump.
+        if matches!(file.name_raw().first(), Some(b'/' | b'\\')) {
+            anyhow::bail!("hooks.pre_seed: invalid zip entry name at index {i}");
+        }
         let name = file.enclosed_name().ok_or_else(|| {
             anyhow::anyhow!("hooks.pre_seed: invalid zip entry name at index {i}")
         })?;
@@ -661,6 +667,48 @@ mod tests {
                 .contains("extracted size exceeds limit"),
             "should fail on extracted bytes limit"
         );
+    }
+
+    #[test]
+    fn extract_rejects_path_traversal() {
+        use std::io::Write;
+        // Pins the path-safety contract across the zip 2.x -> 9.x bump: every
+        // escaping or absolute entry name is rejected and nothing is written.
+        fn zip_with(name: &str) -> Vec<u8> {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"pwned").unwrap();
+            writer.finish().unwrap().into_inner()
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+        for evil in [
+            "../escape.txt",
+            "sub/../../escape.txt",
+            "/abs_escape.txt",
+            "\\abs_escape.txt",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let dest = root.path().join("dest");
+            std::fs::create_dir_all(&dest).unwrap();
+
+            let err = extract_zip_with_limits(&zip_with(evil), &dest, deadline).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid zip entry name"),
+                "{evil}: expected rejection, got {err}"
+            );
+            assert!(
+                !root.path().join("escape.txt").exists(),
+                "{evil}: escaped dest"
+            );
+            assert_eq!(
+                std::fs::read_dir(&dest).unwrap().count(),
+                0,
+                "{evil}: dest not empty"
+            );
+        }
     }
 
     #[test]
