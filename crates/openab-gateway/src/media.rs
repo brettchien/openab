@@ -22,8 +22,10 @@ pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::Image
 }
 
 /// Longest side, in pixels, [`resize_and_compress_bounded`] will decode.
+#[cfg_attr(not(feature = "acp"), allow(dead_code))] // only the acp adapter decodes client images
 pub const IMAGE_DECODE_MAX_DIMENSION_PX: u32 = 10_000;
 /// Decoder allocation cap for [`resize_and_compress_bounded`] — room for a 5K RGBA screenshot.
+#[cfg_attr(not(feature = "acp"), allow(dead_code))] // only the acp adapter decodes client images
 pub const IMAGE_DECODE_MAX_ALLOC: u64 = 128 * 1024 * 1024;
 
 /// [`resize_and_compress`] with decoder limits, for images a remote client sends directly.
@@ -32,6 +34,7 @@ pub const IMAGE_DECODE_MAX_ALLOC: u64 = 128 * 1024 * 1024;
 /// can declare tens of thousands of pixels a side and decode to hundreds of MiB under the `image`
 /// crate's defaults (no dimension cap, 512 MiB allocation). These limits reject such an image
 /// before its pixels are allocated.
+#[cfg_attr(not(feature = "acp"), allow(dead_code))]
 pub fn resize_and_compress_bounded(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(IMAGE_DECODE_MAX_DIMENSION_PX);

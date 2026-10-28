@@ -795,13 +795,23 @@ impl SessionPool {
             Box<dyn std::future::Future<Output = Result<R>> + Send + 'a>,
         >,
     {
-        let conn = {
-            let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+        let lookup = || async { self.state.read().await.active.get(thread_id).cloned() };
+        let conn = match lookup().await {
+            Some(conn) => conn,
+            None => {
+                // The session `get_or_create` just made can be evicted before we lock it: it
+                // sits idle until here, so when every other session is busy a concurrent
+                // create picks it. Recreate once instead of failing the turn — eviction
+                // suspended its sid (session/load resumes it) and kept its stored workdir.
+                warn!(thread_id = %crate::redact::redact_session_ids(thread_id), "connection evicted before first use; recreating");
+                self.get_or_create(thread_id, None).await?;
+                lookup().await.ok_or_else(|| {
+                    anyhow!(
+                        "no connection for thread {}",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
+                })?
+            }
         };
 
         let mut conn = conn.lock().await;
@@ -1413,22 +1423,22 @@ mod tests {
         assert_eq!(pick(&map, "me"), (None, 1));
     }
 
-    /// The race this guards: two creates pre-scan concurrently and both pick the
-    /// same oldest idle session. The first evicts it and inserts its own (fresh)
-    /// session; the second's stale pick no longer matches, so it must rescan and
-    /// evict the next-oldest idle session instead of failing with "pool exhausted".
+    /// Why the victim is picked under the write lock: a pick made earlier (before the
+    /// multi-second agent spawn) goes stale — a concurrent create evicts the same oldest
+    /// idle session and inserts its own. That stale handle no longer matches, and picking
+    /// again on the current map takes the next-oldest idle session, never the fresh insert.
     #[test]
-    fn stale_candidate_rescan_picks_next_oldest_not_the_fresh_insert() {
+    fn pick_under_lock_skips_concurrently_evicted_and_fresh_insert() {
         let mut map = eviction_pool(&[("old", 900), ("mid", 600), ("new", 60)]);
         let (stale, _) = pick_eviction_candidate(map.iter(), "second", |t: &Instant| (*t, ()));
-        let (stale_key, stale_handle, _, _) = stale.expect("pre-scan pick");
+        let (stale_key, stale_handle, _, _) = stale.expect("early pick");
         assert_eq!(stale_key, "old");
 
         // First create wins: evicts "old", inserts its fresh session.
         assert!(remove_if_same_handle(&mut map, "old", &stale_handle).is_some());
         map.insert("first".to_string(), Arc::new(Mutex::new(Instant::now())));
 
-        // Second create: stale pick fails, rescan under the lock.
+        // Second create: the early pick is stale; the pick under the lock is not.
         assert!(remove_if_same_handle(&mut map, &stale_key, &stale_handle).is_none());
         assert_eq!(pick(&map, "second"), (Some("mid".to_string()), 0));
     }
