@@ -492,21 +492,36 @@ pub async fn serve_http(addr: &str) -> Result<()> {
     serve_http_with(addr, Vec::new(), SessionTokens::new()).await
 }
 
-/// [`serve_http`] plus in-process capability sources and the broker-shared
-/// session-token registry (see the `sources` module). The broker hands the
-/// same `tokens` handle to its session pool so per-agent-session mint/revoke
-/// is visible here per request.
 /// The facade's axum router — factored out of [`serve_http_with`] so tests
 /// can drive the full HTTP path (including rmcp's injection of the request
 /// `Parts` into extensions, which the session-token resolution depends on)
 /// without binding a port.
+///
+/// **Stateless transport.** The facade never issues an `Mcp-Session-Id`: every
+/// POST is served on its own, and a stale `Mcp-Session-Id` header is ignored
+/// rather than rejected. Nothing here needs a protocol-level session — identity
+/// is the per-request `Authorization` bearer, the two tools are plain
+/// request/response, and the facade never pushes notifications or sends
+/// server→client requests. A stateful session only added state that can expire
+/// (after 5 idle minutes, and every session on restart) plus the client-side
+/// failure that expiry triggers — see `docs/oab-mcp-facade.md`, "Stateless
+/// transport". This also aligns with the MCP 2026-07-28 revision's removal of
+/// protocol-level sessions (the facade still speaks the 2025 `initialize`
+/// handshake).
+///
+/// Constraint for future facade tools: they must not rely on server→client
+/// requests (sampling/elicitation/roots) or the standalone GET SSE stream —
+/// both need session routing. Client cancellation is not available either:
+/// stateless mode drops `notifications/cancelled`, so `RequestContext.ct`
+/// never fires on a client cancel. A tool that needs any of these means
+/// revisiting this choice.
 pub(crate) fn build_router(
     manager: McpRuntimeManager,
     sources: Vec<Arc<dyn CapabilitySource>>,
     tokens: SessionTokens,
 ) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpService,
+        session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
     let sources = Arc::new(sources);
     let service = StreamableHttpService::new(
@@ -517,12 +532,19 @@ pub(crate) fn build_router(
                 tokens: tokens.clone(),
             })
         },
-        LocalSessionManager::default().into(),
-        Default::default(),
+        // Deliberately redundant with `with_stateful_mode(false)`: if stateful
+        // mode is ever flipped back on, `initialize` fails loudly instead of
+        // silently re-enabling sessions.
+        NeverSessionManager::default().into(),
+        StreamableHttpServerConfig::default().with_stateful_mode(false),
     );
     axum::Router::new().nest_service("/mcp", service)
 }
 
+/// [`serve_http`] plus in-process capability sources and the broker-shared
+/// session-token registry (see the `sources` module). The broker hands the
+/// same `tokens` handle to its session pool so per-agent-session mint/revoke
+/// is visible here per request.
 pub async fn serve_http_with(
     addr: &str,
     sources: Vec<Arc<dyn CapabilitySource>>,
@@ -660,7 +682,7 @@ mod tests {
         assert_eq!(out["channel"], "");
     }
 
-    /// Full-HTTP-path proof of the session mechanism: a real request through
+    /// Full-HTTP-path proof of the session-token (bearer) mechanism: a real request through
     /// the router (rmcp StreamableHttpService) must surface the
     /// `Authorization` header to the handler via request extensions, and the
     /// same request without the header must fall back to the anonymous view.
@@ -682,55 +704,20 @@ mod tests {
             tokens,
         );
 
-        let post = |body: String, bearer: Option<String>, session: Option<String>| {
-            let mut b = axum::http::Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream")
-                // tower::oneshot bypasses hyper, which normally supplies Host.
-                .header("host", "127.0.0.1");
-            if let Some(t) = bearer {
-                b = b.header("authorization", format!("Bearer {t}"));
-            }
-            if let Some(s) = session {
-                b = b.header("mcp-session-id", s);
-            }
-            b.body(axum::body::Body::from(body)).unwrap()
-        };
-        let init_body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 0, "method": "initialize",
-            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
-                        "clientInfo": { "name": "t", "version": "0" } }
-        })
-        .to_string();
         let search_body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "search_capabilities", "arguments": {} }
         })
         .to_string();
 
-        // One MCP session per identity variant (initialize → session id → call).
+        // The facade is stateless: identity rides on each request's bearer, so
+        // a bare tools/call (no initialize, no session id) is the whole exchange.
         let run = |bearer: Option<String>| {
             let router = router.clone();
-            let init_body = init_body.clone();
             let search_body = search_body.clone();
             async move {
                 let resp = router
-                    .clone()
-                    .oneshot(post(init_body, bearer.clone(), None))
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), 200, "initialize must succeed");
-                let sid = resp
-                    .headers()
-                    .get("mcp-session-id")
-                    .expect("session id header")
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                let resp = router
-                    .oneshot(post(search_body, bearer, Some(sid)))
+                    .oneshot(mcp_post(search_body, bearer.as_deref(), None))
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), 200);
@@ -754,6 +741,134 @@ mod tests {
             !wrong.contains("echo_channel"),
             "unknown token must resolve to the anonymous view: {wrong}"
         );
+    }
+
+    /// A Streamable HTTP POST to the facade router, shaped like an MCP client's.
+    fn mcp_post(
+        body: String,
+        bearer: Option<&str>,
+        session: Option<&str>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            // tower::oneshot bypasses hyper, which normally supplies Host.
+            .header("host", "127.0.0.1");
+        if let Some(t) = bearer {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        if let Some(s) = session {
+            b = b.header("mcp-session-id", s);
+        }
+        b.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    /// Regression for "session expired, but the write already landed": on the
+    /// stateful transport an idle-retired (or pre-restart) session id got
+    /// `404 Session not found`, which sent Claude Code into a recovery path that
+    /// re-ran the call downstream and then reported it as failed. Stateless:
+    /// initialize returns a result and issues no session id, a notification-only
+    /// POST is 202, a `tools/call` carrying a stale session id is served (not
+    /// 404'd), and GET (the standalone SSE stream) / DELETE (session
+    /// termination) — both session features — are 405 with `Allow: POST`.
+    #[tokio::test]
+    async fn http_stateless_issues_no_session_and_never_404s_a_stale_one() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        // Bounded so a regression that leaves the SSE stream open fails
+        // instead of hanging the test.
+        async fn sse_body(resp: axum::response::Response) -> axum::body::Bytes {
+            tokio::time::timeout(std::time::Duration::from_secs(10), resp.into_body().collect())
+                .await
+                .expect("SSE response body must end")
+                .unwrap()
+                .to_bytes()
+        }
+
+        let router = super::build_router(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            Vec::new(),
+            super::SessionTokens::new(),
+        );
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" } }
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(mcp_post(init_body, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "initialize must succeed");
+        assert!(
+            resp.headers().get("mcp-session-id").is_none(),
+            "the facade must not issue a session id"
+        );
+        // A JSON-RPC error also arrives as HTTP 200 over SSE, so check the body.
+        let bytes = sse_body(resp).await;
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains(r#""result""#)
+                && body.contains("protocolVersion")
+                && !body.contains(r#""error""#),
+            "initialize must return a result, not an error: {body}"
+        );
+
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(mcp_post(initialized, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202, "a notification-only POST must be 202");
+
+        let search_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search_capabilities", "arguments": {} }
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(mcp_post(search_body, None, Some("retired-by-idle-or-restart")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "a stale session id must not be 404'd");
+        let bytes = sse_body(resp).await;
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains(r#""id":1"#)
+                && body.contains(r#""result""#)
+                && body.contains("unavailable")
+                && body.contains(r#""isError":false"#),
+            "tools/call must be served a search result: {body}"
+        );
+
+        for method in ["GET", "DELETE"] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri("/mcp")
+                .header("accept", "text/event-stream")
+                .header("host", "127.0.0.1")
+                .header("mcp-session-id", "retired-by-idle-or-restart")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), 405, "{method} /mcp must be 405");
+            assert_eq!(
+                resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+                Some("POST"),
+                "{method} /mcp must advertise Allow: POST"
+            );
+        }
     }
 
     #[tokio::test]
