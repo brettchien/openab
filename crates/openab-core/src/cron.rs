@@ -951,10 +951,61 @@ fn update_usercron_job(
         anyhow::bail!("usercron job id {:?} not found", id);
     }
 
-    // Atomic write: write to temp file then rename to avoid corruption on crash.
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())?;
-    std::fs::rename(&tmp, path)?;
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// Replace `path` with `contents` atomically.
+///
+/// The temp file gets a random name and is created with `O_EXCL`
+/// (`tempfile::Builder`), so a file or symlink planted next to `path` can't
+/// redirect or capture the write. `path` must already exist: its permissions
+/// are copied to the new file, which would otherwise be created with mode
+/// 0600, and a failure to read them is returned as an error. If any step
+/// fails, the temp file is removed when it is dropped. After the rename the
+/// parent directory is fsynced (best-effort, unix only) so the rename is
+/// durable. If `path` is itself a symlink, the link is replaced by a regular
+/// file and its target is left untouched.
+///
+/// Non-goals:
+/// - No locking: concurrent `update_usercron_job` calls are still
+///   last-writer-wins (read-modify-write race), unchanged from before.
+/// - Only the mode is copied; owner, group, ACLs, and xattrs are not.
+/// - This is defense-in-depth. `docs/cronjob.md` already requires that the
+///   usercron directory is not writable by the agent, and a writer of that
+///   directory can replace `cronjob.toml` directly.
+fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write;
+
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let prefix = format!(
+        ".{}.",
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "usercron".to_string())
+    );
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    tmp.write_all(contents)?;
+    // `path` must already exist (the caller just read it). Propagate any
+    // metadata error instead of silently persisting with tempfile's 0600 mode.
+    let perms = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .permissions();
+    tmp.as_file().set_permissions(perms)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    // fsync the parent dir so the rename itself is durable (best-effort,
+    // matching openab-mcp's auth.rs).
+    #[cfg(unix)]
+    if let Ok(dir_handle) = std::fs::File::open(dir) {
+        let _ = dir_handle.sync_all();
+    }
     Ok(())
 }
 
@@ -1526,6 +1577,114 @@ message = "b"
         assert_eq!(job_b["id"].as_str(), Some("goal-b"));
         assert_eq!(job_b["enabled"].as_bool(), Some(false));
         assert_eq!(job_b["thread_id"].as_str(), Some("thread-456"));
+    }
+
+    const WRITEBACK_FIXTURE: &str = r#"
+[[jobs]]
+id = "goal"
+enabled = true
+schedule = "* * * * *"
+channel = "123"
+message = "m"
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_usercron_job_planted_tmp_symlink_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+        std::fs::write(&path, WRITEBACK_FIXTURE).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "original").unwrap();
+        let planted = dir.path().join("cronjob.toml.tmp");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        update_usercron_job(&path, "goal", Some(false), None).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(doc["jobs"][0]["enabled"].as_bool(), Some(false));
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn test_update_usercron_job_planted_tmp_file_is_untouched_and_no_temp_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+        std::fs::write(&path, WRITEBACK_FIXTURE).unwrap();
+        let planted = dir.path().join("cronjob.toml.tmp");
+        std::fs::write(&planted, "planted").unwrap();
+
+        update_usercron_job(&path, "goal", None, Some("thread-1")).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "planted");
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["cronjob.toml", "cronjob.toml.tmp"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_usercron_job_symlinked_destination_is_replaced_and_target_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, WRITEBACK_FIXTURE).unwrap();
+        let path = dir.path().join("cronjob.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        update_usercron_job(&path, "goal", Some(false), None).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), WRITEBACK_FIXTURE);
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(doc["jobs"][0]["enabled"].as_bool(), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_usercron_job_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+        std::fs::write(&path, WRITEBACK_FIXTURE).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        update_usercron_job(&path, "goal", Some(false), None).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn test_write_atomic_errors_when_destination_missing_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+
+        let err = write_atomic(&path, b"x").unwrap_err();
+
+        assert!(err.to_string().contains("failed to stat"), "{err:#}");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
