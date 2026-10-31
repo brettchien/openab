@@ -113,9 +113,22 @@ When a user selects a model with `/models`, OpenAB sends
 `session/set_config_option`. `agy-acp` stores the selected model for that session
 and adds `--model <model_id>` to subsequent `agy` invocations.
 
+For tab-separated `agy models` output (`model_id<TAB>display name`), the dropdown
+shows the display name and passes only the ID to `--model`. Older single-column
+model names remain supported. Display-name selections and saved values are
+resolved to IDs when the live or cached model list contains a matching name.
+Cached rows and model values saved by older adapters are handled automatically;
+no session reset or cache deletion is needed. Unknown values and single-column
+fallback names are passed through for the installed CLI to validate; the adapter
+does not guess IDs for models absent from the live or cached list.
+
 To select a default model for every new session, set `default_config_options`:
 
 ```toml
 [pool]
-default_config_options = { model = "Gemini 3.5 Flash (Medium)" }
+default_config_options = { model = "gemini-3.8-flash-high" }
 ```
+
+Use a model ID from the first column of `agy models` on your installation.
+Display names are also accepted when a matching ID is available in that list;
+using the ID avoids relying on CLI display-name support or name matching.
