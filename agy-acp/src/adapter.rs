@@ -468,6 +468,7 @@ mod tests {
             conversations_dir: root.join("conversations"),
             state_file: root.join("sessions.json"),
             available_models: Some(vec![row.to_string(), legacy.to_string()]),
+            mcp_env: HashMap::new(),
         };
         adapter.save_models_cache(adapter.available_models.as_ref().unwrap());
         adapter.available_models = adapter.load_cached_models();
@@ -511,8 +512,9 @@ mod tests {
             conversations_dir: root.join("conversations"),
             state_file: root.join("sessions.json"),
             available_models: Some(vec![row.to_string()]),
+            mcp_env: HashMap::new(),
         };
-        let created = adapter.handle_session_new(json!(1));
+        let created = adapter.handle_session_new(json!(1), &json!({}));
         let session_id = created.result.unwrap()["sessionId"]
             .as_str()
             .unwrap()
