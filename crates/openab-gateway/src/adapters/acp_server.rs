@@ -507,6 +507,77 @@ pub enum ReplyChunk {
     Keepalive,
     /// Agent finished responding
     Done,
+    /// mcp-elicitation ADR §2.4: ask this turn's client an agent `elicitation/create`. `id` is
+    /// the asker's handle for a later `ElicitCancel`; the client's `result` (or why it could not
+    /// be asked) goes back on `answer`.
+    Elicit {
+        id: String,
+        params: Value,
+        answer: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Withdraw the question `id` (timeout, agent cancel, turn end): `$/cancel_request` to the
+    /// client, and its late answer is dropped.
+    ElicitCancel { id: String },
+    /// The agent's `elicitation/complete` (URL mode finished): forwarded to the client.
+    ElicitComplete { params: Value },
+}
+
+/// What a prompt task needs to send the client its own requests (`elicitation/create`); the
+/// client's response is routed back by `route_client_response` through `pending`.
+#[derive(Clone)]
+pub struct ClientRequester {
+    pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+/// Ask the client of `channel_id`'s active turn an elicitation (in-process path, used by the
+/// unified adapter). `reply_to` is the turn's event id: a question from a superseded turn is
+/// refused (the stale-turn fence), as is one with no turn running. Resolves with the client's
+/// result; when `cancelled` resolves first, the question is withdrawn and `Err` returned.
+pub async fn request_elicitation(
+    registry: &AcpReplyRegistry,
+    channel_id: &str,
+    reply_to: &str,
+    params: Value,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<Value, String> {
+    let id = format!("elicit_{}", Uuid::new_v4());
+    let (answer_tx, answer_rx) = oneshot::channel();
+    {
+        let map = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let sink = match map.get(channel_id) {
+            Some(sink) if reply_to.is_empty() || reply_to == sink.turn_id => sink,
+            Some(_) => return Err("the asking turn is no longer active".into()),
+            None => return Err("no active turn for this channel".into()),
+        };
+        let chunk = ReplyChunk::Elicit {
+            id: id.clone(),
+            params,
+            answer: answer_tx,
+        };
+        if sink.tx.send(chunk).is_err() {
+            return Err("the turn's prompt task is gone".into());
+        }
+    }
+    tokio::select! {
+        r = answer_rx => r.unwrap_or_else(|_| Err("the turn ended before an answer".into())),
+        _ = cancelled => {
+            // Not fenced by turn: the question may belong to a turn that was just superseded,
+            // and its card must still close (Jellyfish nit a). The prompt task acts only on ids
+            // it opened, so nothing reaches another turn's client.
+            if let Some(sink) = registry.lock().unwrap_or_else(|e| e.into_inner()).get(channel_id) {
+                let _ = sink.tx.send(ReplyChunk::ElicitCancel { id });
+            }
+            Err("withdrawn".into())
+        }
+    }
+}
+
+/// Forward the agent's `elicitation/complete` to `channel_id`'s client (in-process path).
+pub fn complete_elicitation(registry: &AcpReplyRegistry, channel_id: &str, params: Value) {
+    if let Some(sink) = registry.lock().unwrap_or_else(|e| e.into_inner()).get(channel_id) {
+        let _ = sink.tx.send(ReplyChunk::ElicitComplete { params });
+    }
 }
 
 /// One active turn's reply sink plus the originating `GatewayEvent` id used to fence
@@ -2034,6 +2105,10 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let out_tx_clone = out_tx.clone();
                 let conn_for_prompt = connection_id.clone();
                 let elicitation_for_prompt = client_elicitation.clone();
+                let requester_for_prompt = ClientRequester {
+                    pending: pending_requests.clone(),
+                    next_id: next_req_id.clone(),
+                };
                 let handle = tokio::spawn(async move {
                     handle_session_prompt(
                         &state_clone,
@@ -2046,6 +2121,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &conn_for_prompt,
                         connection_generation,
                         elicitation_for_prompt,
+                        Some(requester_for_prompt),
                     )
                     .await;
                 });
@@ -2530,6 +2606,8 @@ async fn handle_session_prompt(
     // The connection's declared elicitation modes (`client_elicitation_modes`), forwarded on the
     // event so core mirrors them when it spawns this session's agent.
     client_elicitation: Option<Value>,
+    // Sends this turn's client requests (`elicitation/create`); `None` = cannot ask the client.
+    requester: Option<ClientRequester>,
 ) {
     // sessionId was validated + reserved by the caller; only the prompt body can still be bad.
     let parsed = extract_prompt_params(params.as_ref());
@@ -2607,7 +2685,7 @@ async fn handle_session_prompt(
         Vec::new(),
     );
     event.content.attachments = attachments;
-    event.client_capabilities = client_elicitation.map(|e| json!({ "elicitation": e }));
+    event.client_capabilities = client_elicitation.clone().map(|e| json!({ "elicitation": e }));
     let turn_id = event.event_id.clone();
 
     // Create reply channel for this prompt and register it, keyed by channel_id with the
@@ -2664,6 +2742,9 @@ async fn handle_session_prompt(
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
 
+    // This turn's questions on the client: asker id → gateway request id.
+    let mut open_elicitations: HashMap<String, u64> = HashMap::new();
+
     // Every client-visible chunk of the turn is one `session/update` notification.
     let send_update = |update: Value| {
         let notification = JsonRpcNotification {
@@ -2701,6 +2782,59 @@ async fn handle_session_prompt(
                     // Core is alive and the turn is still running; nothing to tell the client.
                     // Receiving it already restarted the idle wait.
                     Ok(Some(ReplyChunk::Keepalive)) => {}
+                    Ok(Some(ReplyChunk::Elicit { id, params, answer })) => {
+                        let mode = params.get("mode").and_then(Value::as_str).unwrap_or("form");
+                        let declared = client_elicitation
+                            .as_ref()
+                            .is_some_and(|m| m.get(mode).is_some());
+                        let Some(rq) = requester.as_ref().filter(|_| declared) else {
+                            let _ = answer.send(Err(format!(
+                                "client did not declare elicitation mode {mode:?}"
+                            )));
+                            continue;
+                        };
+                        let gid = rq.next_id.fetch_add(1, Ordering::Relaxed);
+                        let (frame_tx, frame_rx) = oneshot::channel();
+                        rq.pending.lock().await.insert(gid, frame_tx);
+                        let request = json!({
+                            "jsonrpc": "2.0",
+                            "id": gid,
+                            "method": "elicitation/create",
+                            "params": params,
+                        });
+                        if out_tx.send(request.to_string()).is_err() {
+                            rq.pending.lock().await.remove(&gid);
+                            let _ = answer.send(Err("client is gone".into()));
+                            continue;
+                        }
+                        open_elicitations.insert(id, gid);
+                        // Wait on a task so text and tool progress keep flowing meanwhile. No
+                        // timeout here: core owns it and withdraws with ElicitCancel (ADR §2.4).
+                        tokio::spawn(async move {
+                            let r = match frame_rx.await {
+                                Ok(frame) => match frame.get("result") {
+                                    Some(result) if frame.get("error").is_none() => Ok(result.clone()),
+                                    _ => Err(format!(
+                                        "client answered with an error: {}",
+                                        frame.get("error").cloned().unwrap_or(Value::Null)
+                                    )),
+                                },
+                                Err(_) => Err("withdrawn".into()),
+                            };
+                            let _ = answer.send(r);
+                        });
+                    }
+                    Ok(Some(ReplyChunk::ElicitCancel { id })) => {
+                        if let (Some(gid), Some(rq)) = (open_elicitations.remove(&id), requester.as_ref()) {
+                            withdraw_client_request(rq, gid, &out_tx).await;
+                        }
+                    }
+                    Ok(Some(ReplyChunk::ElicitComplete { params })) => {
+                        if client_elicitation.as_ref().is_some_and(|m| m.get("url").is_some()) {
+                            let n = json!({"jsonrpc": "2.0", "method": "elicitation/complete", "params": params});
+                            let _ = out_tx.send(n.to_string());
+                        }
+                    }
                     Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
                     Err(_) => {
                         warn!(session = %redact_id(&session_id), "ACP: prompt timed out waiting for reply");
@@ -2709,6 +2843,15 @@ async fn handle_session_prompt(
                     }
                 }
             }
+        }
+    }
+
+    // Withdraw this turn's unanswered questions: the turn ended, was cancelled, timed out, or its
+    // sink was taken over by a newer prompt (Jellyfish nit b). Dropping the pending entry makes the
+    // waiting task answer the asker `Err` → core replies `cancel` to the agent.
+    if let Some(rq) = requester.as_ref() {
+        for (_, gid) in open_elicitations.drain() {
+            withdraw_client_request(rq, gid, out_tx).await;
         }
     }
 
@@ -2739,6 +2882,15 @@ async fn handle_session_prompt(
         JsonRpcResponse::success(id, serde_json::to_value(&pr).unwrap())
     };
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+}
+
+/// Drop a still-pending client request and tell the client with `$/cancel_request`. A request
+/// already answered is left alone (nothing to withdraw).
+async fn withdraw_client_request(rq: &ClientRequester, gid: u64, out_tx: &mpsc::UnboundedSender<String>) {
+    if rq.pending.lock().await.remove(&gid).is_some() {
+        let n = json!({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": gid}});
+        let _ = out_tx.send(n.to_string());
+    }
 }
 
 /// MIME types an ACP `image` prompt block may carry: what `media::resize_and_compress` can decode
@@ -4868,7 +5020,7 @@ mod acp_review_fixes {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
-        handle_session_prompt(&state, &sessions, json!(7), Some(params), &out_tx, sid.clone(), cancel, "conn-test", 0, None)
+        handle_session_prompt(&state, &sessions, json!(7), Some(params), &out_tx, sid.clone(), cancel, "conn-test", 0, None, None)
             .await;
 
         // The final response (matching our request id) must carry stopReason "cancelled".
@@ -4950,7 +5102,7 @@ mod acp_review_fixes {
         let sid2 = sid.clone();
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, json!(11), Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0, None)
+            handle_session_prompt(&st2, &sessions2, json!(11), Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0, None, None)
                 .await;
         });
 
@@ -5017,7 +5169,7 @@ mod acp_review_fixes {
         let (st2, sessions2, sid2) = (state.clone(), sessions.clone(), sid.clone());
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, request_id, Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0, None)
+            handle_session_prompt(&st2, &sessions2, request_id, Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0, None, None)
                 .await;
         });
 
@@ -5068,7 +5220,7 @@ mod acp_review_fixes {
         ]});
         let (st2, sessions2, sid2, cancel2) = (state.clone(), sessions.clone(), sid.clone(), cancel.clone());
         let handle = tokio::spawn(async move {
-            handle_session_prompt(&st2, &sessions2, json!(5), Some(params), &out_tx, sid2, cancel2, "conn-test", 0, None).await;
+            handle_session_prompt(&st2, &sessions2, json!(5), Some(params), &out_tx, sid2, cancel2, "conn-test", 0, None, None).await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!handle.is_finished(), "the image must be waiting on a permit");
@@ -5117,7 +5269,7 @@ mod acp_review_fixes {
             {"type": "image", "data": png, "mimeType": "image/png"}
         ]});
         let handle = tokio::spawn(async move {
-            handle_session_prompt(&state, &sessions, json!(1), Some(params), &out_tx, sid, cancel, "conn-test", 0, None).await;
+            handle_session_prompt(&state, &sessions, json!(1), Some(params), &out_tx, sid, cancel, "conn-test", 0, None, None).await;
         });
 
         let raw = tokio::time::timeout(std::time::Duration::from_secs(10), event_rx.recv())
