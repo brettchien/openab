@@ -179,6 +179,7 @@ pub struct AcpConnection {
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    elicit_tx: SharedElicitationSink,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
@@ -233,6 +234,41 @@ fn build_agent_env(
     (result, inherited)
 }
 
+/// Agent → client elicitation traffic (mcp-elicitation ADR §2.3). The reader loop classifies it by
+/// method and hands it to the running turn's sink; it never goes through `notify_tx`, whose
+/// consumer treats any id-bearing message as the prompt's own response.
+#[derive(Debug)]
+pub enum ElicitationEvent {
+    /// `elicitation/create` request. The turn answers it with [`ElicitationResponder::reply`].
+    Create { agent_id: JsonRpcId, params: Value },
+    /// `$/cancel_request` notification: the agent abandoned its request `request_id`.
+    CancelRequest { request_id: Value },
+    /// `elicitation/complete` notification (URL mode finished out of band).
+    Complete { params: Value },
+}
+
+/// Where the reader loop hands [`ElicitationEvent`]s; set by the prompt loop for one turn.
+pub type ElicitationSink = mpsc::UnboundedSender<ElicitationEvent>;
+type SharedElicitationSink = Arc<Mutex<Option<ElicitationSink>>>;
+
+/// Answers the agent's `elicitation/create` requests without holding the connection lock.
+#[derive(Clone)]
+pub struct ElicitationResponder {
+    writer: Arc<Mutex<ChildStdin>>,
+}
+
+impl ElicitationResponder {
+    /// Send `result` (`{action, content?}`) as the response to agent request `agent_id`.
+    pub async fn reply(&self, agent_id: JsonRpcId, result: Value) {
+        write_json_rpc_reply(&self.writer, &JsonRpcResponse::new(agent_id, result)).await;
+    }
+}
+
+/// The answer given when nobody can be asked: no turn is running, or its sink is gone.
+pub fn elicitation_cancel_result() -> Value {
+    json!({ "action": "cancel" })
+}
+
 async fn write_json_rpc_reply<W, T>(writer: &Arc<Mutex<W>>, reply: &T)
 where
     W: AsyncWrite + Unpin,
@@ -256,6 +292,7 @@ pub(crate) async fn run_reader_loop<R, W>(
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    elicit_tx: SharedElicitationSink,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -296,7 +333,27 @@ pub(crate) async fn run_reader_loop<R, W>(
                 continue;
             }
 
-            // OpenAB advertises `clientCapabilities: {}`, so any other
+            if method == "elicitation/create" {
+                let event = ElicitationEvent::Create {
+                    agent_id: agent_request_id.clone(),
+                    params: msg.params.clone().unwrap_or(Value::Null),
+                };
+                let delivered = match elicit_tx.lock().await.as_ref() {
+                    Some(tx) => tx.send(event).is_ok(),
+                    None => false,
+                };
+                if !delivered {
+                    // No turn is running to ask anyone: settle it now instead of letting the
+                    // agent wait (ADR §2.3).
+                    info!("elicitation/create outside a turn; answering cancel");
+                    let reply =
+                        JsonRpcResponse::new(agent_request_id, elicitation_cancel_result());
+                    write_json_rpc_reply(&writer, &reply).await;
+                }
+                continue;
+            }
+
+            // OpenAB advertises no other client capability, so any other
             // agent-to-client request is a capability we never offered.
             // Surface it at warn level rather than only in the debug frame dump.
             warn!(
@@ -310,6 +367,30 @@ pub(crate) async fn run_reader_loop<R, W>(
             );
             write_json_rpc_reply(&writer, &reply).await;
             continue;
+        }
+
+        // Elicitation notifications go to the turn's sink, never to the prompt subscriber.
+        if msg.id.is_none() {
+            let event = match msg.method.as_deref() {
+                Some("$/cancel_request") => Some(ElicitationEvent::CancelRequest {
+                    request_id: msg
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("requestId"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                }),
+                Some("elicitation/complete") => Some(ElicitationEvent::Complete {
+                    params: msg.params.clone().unwrap_or(Value::Null),
+                }),
+                _ => None,
+            };
+            if let Some(event) = event {
+                if let Some(tx) = elicit_tx.lock().await.as_ref() {
+                    let _ = tx.send(event);
+                }
+                continue;
+            }
         }
 
         // Response (numeric id) → resolve pending AND forward to subscriber
@@ -499,12 +580,14 @@ impl AcpConnection {
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let elicit_tx: SharedElicitationSink = Arc::new(Mutex::new(None));
 
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
             stdin.clone(),
             pending.clone(),
             notify_tx.clone(),
+            elicit_tx.clone(),
         ));
 
         let activity = Arc::new(SessionActivity::new());
@@ -516,6 +599,7 @@ impl AcpConnection {
             next_id: AtomicU64::new(1),
             pending,
             notify_tx,
+            elicit_tx,
             acp_session_id: None,
             supports_load_session: false,
             agent_name: String::new(),
@@ -579,6 +663,20 @@ impl AcpConnection {
             return Err(anyhow!("{err}"));
         }
         Ok(resp)
+    }
+
+    /// Install (`Some`) or clear (`None`) the sink the reader loop hands elicitation traffic to.
+    /// The prompt loop sets it for the length of one turn; with none set, `elicitation/create`
+    /// is answered `cancel` at once.
+    pub async fn set_elicitation_sink(&self, sink: Option<ElicitationSink>) {
+        *self.elicit_tx.lock().await = sink;
+    }
+
+    /// A handle for answering the agent's `elicitation/create` from outside the connection lock.
+    pub fn elicitation_responder(&self) -> ElicitationResponder {
+        ElicitationResponder {
+            writer: self.stdin.clone(),
+        }
     }
 
     /// `elicitation`: the modes the session's front-end can render; declared verbatim so the
@@ -1067,6 +1165,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            Arc::new(Mutex::new(None)),
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
@@ -1110,6 +1209,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            Arc::new(Mutex::new(None)),
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
@@ -1150,6 +1250,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(agent_stdin_writer)),
             pending.clone(),
             notify_tx,
+            Arc::new(Mutex::new(None)),
         ));
 
         let request = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"agent/test\",\"params\":{}}\n";
@@ -1194,6 +1295,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(agent_stdin_writer)),
             pending.clone(),
             notify_tx,
+            Arc::new(Mutex::new(None)),
         ));
         let mut response_reader = BufReader::new(agent_stdin_reader);
 
@@ -1366,4 +1468,83 @@ mod reader_loop_tests {
         activity.set_in_flight(false);
         assert!(!activity.in_flight());
     }
+
+    async fn next_event(rx: &mut mpsc::UnboundedReceiver<ElicitationEvent>) -> ElicitationEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("event before timeout")
+            .expect("sink open")
+    }
+
+    async fn spawn_loop_with_sink(
+        sink: Option<ElicitationSink>,
+    ) -> (
+        tokio::io::DuplexStream,
+        BufReader<tokio::io::DuplexStream>,
+        mpsc::UnboundedReceiver<JsonRpcMessage>,
+        JoinHandle<()>,
+    ) {
+        let (agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, agent_stdin_reader) = duplex(8 * 1024);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (sub_tx, sub_rx) = mpsc::unbounded_channel();
+        let notify_tx = Arc::new(Mutex::new(Some(sub_tx)));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            Arc::new(Mutex::new(agent_stdin_writer)),
+            pending,
+            notify_tx,
+            Arc::new(Mutex::new(sink)),
+        ));
+        (agent_stdout_writer, BufReader::new(agent_stdin_reader), sub_rx, handle)
+    }
+
+    /// No turn running → `elicitation/create` is answered `cancel` at once, never forwarded.
+    #[tokio::test]
+    async fn elicitation_create_without_sink_is_cancelled() {
+        let (mut out, mut agent_in, mut sub_rx, handle) = spawn_loop_with_sink(None).await;
+        out.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"elicitation/create\",\"params\":{\"mode\":\"form\",\"message\":\"q\"}}\n").await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), agent_in.read_line(&mut line))
+            .await
+            .expect("reply before timeout")
+            .unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], json!(3));
+        assert_eq!(v["result"], json!({"action": "cancel"}));
+        assert!(sub_rx.try_recv().is_err(), "must not reach the prompt subscriber");
+        drop(out);
+        handle.await.unwrap();
+    }
+
+    /// With a sink, create / $/cancel_request / elicitation/complete go to it — and an agent
+    /// request id equal to a prompt id does not reach the prompt subscriber (ADR §4.2).
+    #[tokio::test]
+    async fn elicitation_traffic_goes_to_the_sink_only() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut out, _agent_in, mut sub_rx, handle) = spawn_loop_with_sink(Some(tx)).await;
+        out.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"elicitation/create\",\"params\":{\"mode\":\"form\"}}\n").await.unwrap();
+        out.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{\"requestId\":1}}\n").await.unwrap();
+        out.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/complete\",\"params\":{\"elicitationId\":\"e1\"}}\n").await.unwrap();
+        match next_event(&mut rx).await {
+            ElicitationEvent::Create { agent_id, params } => {
+                assert_eq!(agent_id, JsonRpcId::Unsigned(1));
+                assert_eq!(params["mode"], json!("form"));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            ElicitationEvent::CancelRequest { request_id } => assert_eq!(request_id, json!(1)),
+            other => panic!("expected CancelRequest, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            ElicitationEvent::Complete { params } => assert_eq!(params["elicitationId"], json!("e1")),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        assert!(sub_rx.try_recv().is_err(), "elicitation traffic must not reach notify_tx");
+        drop(out);
+        handle.await.unwrap();
+    }
+
 }
