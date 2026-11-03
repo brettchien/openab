@@ -522,6 +522,31 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Ask the session's front-end an agent `elicitation/create` (mcp-elicitation ADR §2.3) and
+    /// return its answer (`{action, content?}`). `params` is the agent's request plus
+    /// `_meta["openab/deadline"]`. When `cancel` fires (timeout, agent `$/cancel_request`, turn
+    /// end) the implementation must withdraw the question from the front-end and return `Err`.
+    /// Only called for sessions whose front-end declared an elicitation mode. Default: not
+    /// supported, which core answers `cancel`.
+    async fn request_elicitation(
+        &self,
+        _channel: &ChannelRef,
+        _params: serde_json::Value,
+        _cancel: crate::acp::elicitation::CancelSignal,
+    ) -> Result<serde_json::Value> {
+        Err(anyhow::anyhow!("elicitation is not supported by this adapter"))
+    }
+
+    /// Forward the agent's `elicitation/complete` (URL mode finished) so the front-end can close
+    /// that card. Default: no-op.
+    async fn complete_elicitation(
+        &self,
+        _channel: &ChannelRef,
+        _params: serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether this platform renders Markdown tables natively. When `true`, the
     /// router skips the `convert_tables` pre-pass (which rewrites tables into
     /// code blocks / bullet lists for platforms that cannot render them) and
@@ -849,6 +874,21 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    // Elicitations of this turn (mcp-elicitation ADR §2.3): only for sessions whose
+                    // front-end declared a mode; the sink lives exactly as long as the turn.
+                    let (elicit_tx, mut elicit_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let mut elicit_turn = if conn.elicitation.any() {
+                        conn.set_elicitation_sink(Some(elicit_tx)).await;
+                        Some(crate::acp::elicitation::ElicitationTurn::new(
+                            adapter.clone(),
+                            thread_channel.clone(),
+                            conn.elicitation_responder(),
+                            tokio::time::Instant::now() + prompt_hard_timeout,
+                        ))
+                    } else {
+                        drop(elicit_tx);
+                        None
+                    };
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
                     } else {
@@ -987,6 +1027,12 @@ impl AdapterRouter {
                     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         let notification = tokio::select! {
+                            Some(ev) = elicit_rx.recv(), if elicit_turn.is_some() => {
+                                if let Some(t) = elicit_turn.as_mut() {
+                                    t.handle(ev);
+                                }
+                                continue;
+                            }
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
                                 // Reader saw EOF: the agent's stdout closed. A *successful*
@@ -1253,6 +1299,12 @@ impl AdapterRouter {
                                 _ => {}
                             }
                         }
+                    }
+                    // Turn over: settle every open question as `cancel` and close its card, then drop
+                    // the sink — before the final message removes the gateway's reply sink (§2.3).
+                    if let Some(t) = elicit_turn.take() {
+                        t.finish().await;
+                        conn.set_elicitation_sink(None).await;
                     }
 
                     conn.prompt_done().await;
