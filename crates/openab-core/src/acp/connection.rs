@@ -1364,6 +1364,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(agent_stdin_writer)),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
         ));
         let request_id = (i64::MAX as u64) + 1;
         let request = format!(
@@ -1403,6 +1404,7 @@ mod reader_loop_tests {
             agent_stdout_reader,
             Arc::new(Mutex::new(agent_stdin_writer)),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
         ));
         let mut response_reader = BufReader::new(agent_stdin_reader);
