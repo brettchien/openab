@@ -1696,6 +1696,7 @@ pub async fn process_gateway_event(
     // Submit to dispatcher
     let adapter = ctx.adapter.clone();
     let dispatcher = ctx.dispatcher.clone();
+    let router = ctx.router.clone();
     let sender_name = event.sender.name.clone();
     let sender_id = event.sender.id.clone();
 
@@ -1722,7 +1723,7 @@ pub async fn process_gateway_event(
         // Mirror the front-end's elicitation modes onto this session's agent when it is spawned
         // (mcp-elicitation ADR §2.2). Unified path only: the WebSocket gateway path records
         // nothing, so its sessions keep declaring no elicitation.
-        ctx.router.pool().record_client_elicitation(
+        router.pool().record_client_elicitation(
             &format!("{}:{}", thread_channel.platform, thread_id),
             crate::acp::elicitation::ElicitationModes::from_client_capabilities(
                 event.client_capabilities.as_ref(),
