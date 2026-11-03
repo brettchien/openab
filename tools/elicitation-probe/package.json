@@ -1,0 +1,10 @@
+{
+  "name": "elicitation-probe",
+  "private": true,
+  "type": "module",
+  "description": "Reproduce MCP elicitation through the Claude Agent SDK / claude-agent-acp without a model or login",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.99.1",
+    "@anthropic-ai/claude-agent-sdk": "0.3.312"
+  }
+}
