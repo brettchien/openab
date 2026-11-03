@@ -2826,7 +2826,7 @@ async fn handle_session_prompt(
                     }
                     Ok(Some(ReplyChunk::ElicitCancel { id })) => {
                         if let (Some(gid), Some(rq)) = (open_elicitations.remove(&id), requester.as_ref()) {
-                            withdraw_client_request(rq, gid, &out_tx).await;
+                            withdraw_client_request(rq, gid, out_tx).await;
                         }
                     }
                     Ok(Some(ReplyChunk::ElicitComplete { params })) => {
