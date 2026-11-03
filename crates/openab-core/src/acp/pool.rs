@@ -69,6 +69,10 @@ pub struct SessionPool {
     facade_url: Option<String>,
     #[cfg(feature = "acp-mcp")]
     facade_pass_to_agent: bool,
+    /// Elicitation modes the front-end of each session declared, keyed like `state.active`
+    /// (`acp:<channel>`). Recorded from every incoming gateway event before dispatch, read when
+    /// the session's agent is spawned (mcp-elicitation ADR §2.2). No entry = declare nothing.
+    client_elicitation: std::sync::Mutex<HashMap<String, super::elicitation::ElicitationModes>>,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
@@ -376,7 +380,36 @@ impl SessionPool {
             facade_url: None,
             #[cfg(feature = "acp-mcp")]
             facade_pass_to_agent: false,
+            client_elicitation: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record the elicitation modes the front-end of `thread_id` declared on its latest event.
+    /// Takes effect when the session's agent is next spawned; a running agent keeps the modes it
+    /// was initialised with (capability drift, ADR §2.2).
+    pub fn record_client_elicitation(
+        &self,
+        thread_id: &str,
+        modes: super::elicitation::ElicitationModes,
+    ) {
+        let mut map = self
+            .client_elicitation
+            .lock()
+            .expect("client_elicitation poisoned");
+        if modes.any() {
+            map.insert(thread_id.to_string(), modes);
+        } else {
+            map.remove(thread_id);
+        }
+    }
+
+    fn client_elicitation_for(&self, thread_id: &str) -> super::elicitation::ElicitationModes {
+        self.client_elicitation
+            .lock()
+            .expect("client_elicitation poisoned")
+            .get(thread_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Wire the facade session-token registrar + facade URL, set by the root
@@ -595,7 +628,9 @@ impl SessionPool {
         )
         .await?;
 
-        new_conn.initialize().await?;
+        new_conn
+            .initialize(self.client_elicitation_for(thread_id))
+            .await?;
 
         #[cfg(feature = "acp-mcp")]
         if self.facade_pass_to_agent {

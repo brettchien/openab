@@ -192,6 +192,9 @@ pub struct AcpConnection {
     pub supports_http_mcp: bool,
     /// Sent as `mcpServers` in `session/new` / `session/load` (empty unless the pool sets it).
     pub mcp_servers: Vec<Value>,
+    /// Elicitation modes declared to the agent in `initialize` (none unless the session's
+    /// front-end can render them).
+    pub elicitation: super::elicitation::ElicitationModes,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
@@ -521,6 +524,7 @@ impl AcpConnection {
             activity,
             session_reset: false,
             supports_http_mcp: false,
+            elicitation: Default::default(),
             mcp_servers: Vec::new(),
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
@@ -577,13 +581,19 @@ impl AcpConnection {
         Ok(resp)
     }
 
-    pub async fn initialize(&mut self) -> Result<()> {
+    /// `elicitation`: the modes the session's front-end can render; declared verbatim so the
+    /// agent only sends `elicitation/create` when someone can answer it.
+    pub async fn initialize(
+        &mut self,
+        elicitation: super::elicitation::ElicitationModes,
+    ) -> Result<()> {
+        self.elicitation = elicitation;
         let resp = self
             .send_request(
                 "initialize",
                 Some(json!({
                     "protocolVersion": 1,
-                    "clientCapabilities": {},
+                    "clientCapabilities": elicitation.client_capabilities(),
                     "clientInfo": {"name": "openab", "version": "0.1.0"},
                 })),
             )

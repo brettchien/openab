@@ -1508,6 +1508,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // Monotonic id source for server-initiated requests (mcp/connect, mcp/message).
     let next_req_id = Arc::new(AtomicU64::new(1));
     let mut initialized = false;
+    // `clientCapabilities.elicitation` from this connection's `initialize`, stamped on every prompt
+    // event so core declares the same modes to the agent it spawns (mcp-elicitation ADR §2.2).
+    let mut client_elicitation: Option<Value> = None;
 
     // Track spawned prompt tasks so we can abort on disconnect
     let mut prompt_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -1747,6 +1750,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 if negotiated_ok {
                     initialized = true;
+                    client_elicitation = client_elicitation_modes(req.params.as_ref());
                 }
             }
             "session/new" => {
@@ -2029,6 +2033,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let sessions_clone = sessions.clone();
                 let out_tx_clone = out_tx.clone();
                 let conn_for_prompt = connection_id.clone();
+                let elicitation_for_prompt = client_elicitation.clone();
                 let handle = tokio::spawn(async move {
                     handle_session_prompt(
                         &state_clone,
@@ -2040,6 +2045,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         cancel,
                         &conn_for_prompt,
                         connection_generation,
+                        elicitation_for_prompt,
                     )
                     .await;
                 });
@@ -2161,6 +2167,20 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 // ---------------------------------------------------------------------------
 // Method handlers
 // ---------------------------------------------------------------------------
+
+/// The elicitation modes a client declared in `initialize`, normalised to `{"form": {}, "url": {}}`
+/// with only the modes present as objects. `None` when it declared none.
+fn client_elicitation_modes(params: Option<&Value>) -> Option<Value> {
+    let declared = params?
+        .pointer("/clientCapabilities/elicitation")?
+        .as_object()?;
+    let modes: serde_json::Map<String, Value> = ["form", "url"]
+        .into_iter()
+        .filter(|m| declared.get(*m).is_some_and(Value::is_object))
+        .map(|m| (m.to_string(), json!({})))
+        .collect();
+    (!modes.is_empty()).then_some(Value::Object(modes))
+}
 
 fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
@@ -2507,6 +2527,9 @@ async fn handle_session_prompt(
     // connection resuming the same session takes over the channel and an older one cannot clobber
     // it (F4).
     connection_generation: u64,
+    // The connection's declared elicitation modes (`client_elicitation_modes`), forwarded on the
+    // event so core mirrors them when it spawns this session's agent.
+    client_elicitation: Option<Value>,
 ) {
     // sessionId was validated + reserved by the caller; only the prompt body can still be bad.
     let parsed = extract_prompt_params(params.as_ref());
@@ -2584,6 +2607,7 @@ async fn handle_session_prompt(
         Vec::new(),
     );
     event.content.attachments = attachments;
+    event.client_capabilities = client_elicitation.map(|e| json!({ "elicitation": e }));
     let turn_id = event.event_id.clone();
 
     // Create reply channel for this prompt and register it, keyed by channel_id with the
@@ -4844,7 +4868,7 @@ mod acp_review_fixes {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
-        handle_session_prompt(&state, &sessions, json!(7), Some(params), &out_tx, sid.clone(), cancel, "conn-test", 0)
+        handle_session_prompt(&state, &sessions, json!(7), Some(params), &out_tx, sid.clone(), cancel, "conn-test", 0, None)
             .await;
 
         // The final response (matching our request id) must carry stopReason "cancelled".
@@ -4926,7 +4950,7 @@ mod acp_review_fixes {
         let sid2 = sid.clone();
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, json!(11), Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
+            handle_session_prompt(&st2, &sessions2, json!(11), Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0, None)
                 .await;
         });
 
@@ -4993,7 +5017,7 @@ mod acp_review_fixes {
         let (st2, sessions2, sid2) = (state.clone(), sessions.clone(), sid.clone());
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, request_id, Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
+            handle_session_prompt(&st2, &sessions2, request_id, Some(params), &out_tx, sid2.clone(), cancel, "conn-test", 0, None)
                 .await;
         });
 
@@ -5044,7 +5068,7 @@ mod acp_review_fixes {
         ]});
         let (st2, sessions2, sid2, cancel2) = (state.clone(), sessions.clone(), sid.clone(), cancel.clone());
         let handle = tokio::spawn(async move {
-            handle_session_prompt(&st2, &sessions2, json!(5), Some(params), &out_tx, sid2, cancel2, "conn-test", 0).await;
+            handle_session_prompt(&st2, &sessions2, json!(5), Some(params), &out_tx, sid2, cancel2, "conn-test", 0, None).await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!handle.is_finished(), "the image must be waiting on a permit");
@@ -5093,7 +5117,7 @@ mod acp_review_fixes {
             {"type": "image", "data": png, "mimeType": "image/png"}
         ]});
         let handle = tokio::spawn(async move {
-            handle_session_prompt(&state, &sessions, json!(1), Some(params), &out_tx, sid, cancel, "conn-test", 0).await;
+            handle_session_prompt(&state, &sessions, json!(1), Some(params), &out_tx, sid, cancel, "conn-test", 0, None).await;
         });
 
         let raw = tokio::time::timeout(std::time::Duration::from_secs(10), event_rx.recv())
@@ -7650,4 +7674,27 @@ mod acp_teardown_ownership {
         );
     }
 
+}
+
+#[cfg(test)]
+mod elicitation_caps_tests {
+    use super::client_elicitation_modes;
+    use serde_json::json;
+
+    #[test]
+    fn declared_modes_are_kept_and_normalised() {
+        let p = json!({"protocolVersion": 1, "clientCapabilities": {"elicitation": {"form": {"x": 1}, "url": {}}}});
+        assert_eq!(client_elicitation_modes(Some(&p)), Some(json!({"form": {}, "url": {}})));
+        let p = json!({"clientCapabilities": {"elicitation": {"form": {}}}});
+        assert_eq!(client_elicitation_modes(Some(&p)), Some(json!({"form": {}})));
+    }
+
+    #[test]
+    fn nothing_declared_is_none() {
+        assert_eq!(client_elicitation_modes(None), None);
+        assert_eq!(client_elicitation_modes(Some(&json!({"clientCapabilities": {}}))), None);
+        // A mode must be an object to count; `true` or unknown modes are ignored.
+        let p = json!({"clientCapabilities": {"elicitation": {"form": true, "bogus": {}}}});
+        assert_eq!(client_elicitation_modes(Some(&p)), None);
+    }
 }

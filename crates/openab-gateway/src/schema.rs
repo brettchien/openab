@@ -14,6 +14,11 @@ pub struct GatewayEvent {
     pub content: Content,
     pub mentions: Vec<String>,
     pub message_id: String,
+    /// ACP only: the client's declared `clientCapabilities` that core must mirror when it spawns
+    /// the agent for this session, e.g. `{"elicitation": {"form": {}}}` (Katashiro ADR
+    /// mcp-elicitation §2.2). Absent = nothing to mirror.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_capabilities: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +165,7 @@ impl GatewayEvent {
             },
             mentions,
             message_id: message_id.into(),
+            client_capabilities: None,
         }
     }
 }

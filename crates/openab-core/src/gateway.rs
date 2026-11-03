@@ -149,6 +149,10 @@ struct GatewayEvent {
     #[allow(dead_code)]
     mentions: Vec<String>,
     message_id: String,
+    /// ACP only: the front-end's declared `clientCapabilities` (elicitation modes) that the
+    /// session's agent must mirror (mcp-elicitation ADR §2.2).
+    #[serde(default)]
+    client_capabilities: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1715,6 +1719,15 @@ pub async fn process_gateway_event(
             .thread_id
             .as_deref()
             .unwrap_or(&thread_channel.channel_id);
+        // Mirror the front-end's elicitation modes onto this session's agent when it is spawned
+        // (mcp-elicitation ADR §2.2). Unified path only: the WebSocket gateway path records
+        // nothing, so its sessions keep declaring no elicitation.
+        ctx.router.pool().record_client_elicitation(
+            &format!("{}:{}", thread_channel.platform, thread_id),
+            crate::acp::elicitation::ElicitationModes::from_client_capabilities(
+                event.client_capabilities.as_ref(),
+            ),
+        );
         let thread_key = dispatcher.key(
             &thread_channel.platform,
             thread_id,
