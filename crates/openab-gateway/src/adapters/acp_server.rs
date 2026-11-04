@@ -7850,3 +7850,224 @@ mod elicitation_caps_tests {
         assert_eq!(client_elicitation_modes(Some(&p)), None);
     }
 }
+
+// mcp-elicitation ADR §4.2 (gateway half): the prompt loop asks its client, routes the answer
+// back to the asker, and withdraws what the turn leaves open.
+#[cfg(test)]
+mod elicitation_flow_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::time::{timeout, Duration};
+    use uuid::Uuid;
+
+    struct Harness {
+        registry: AcpReplyRegistry,
+        channel_id: String,
+        _event_rx: tokio::sync::broadcast::Receiver<String>,
+        out_rx: mpsc::UnboundedReceiver<String>,
+        pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+        handle: tokio::task::JoinHandle<()>,
+        turn_id: String,
+    }
+
+    /// One prompt running with the client's declared `modes` (None = declared nothing).
+    async fn start(modes: Option<Value>) -> Harness {
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let registry = new_reply_registry();
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(registry.clone());
+        let state = Arc::new(st);
+        let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let channel_id = format!("acp_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()) },
+        );
+        let pending = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let requester = ClientRequester { pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)) };
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+        let handle = tokio::spawn(async move {
+            let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
+            handle_session_prompt(&state, &sessions, json!(9), Some(params), &out_tx, sid.clone(), cancel, "conn-test", 0, modes, Some(requester))
+                .await;
+        });
+        let mut turn_id = None;
+        for _ in 0..10_000 {
+            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+                turn_id = Some(t);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let turn_id = turn_id.expect("handler must register a reply sink");
+        Harness { registry, channel_id, _event_rx: event_rx, out_rx, pending, handle, turn_id }
+    }
+
+    fn form_params() -> Value {
+        json!({"mode": "form", "sessionId": "s", "message": "approve?",
+               "requestedSchema": {"type": "object", "properties": {}},
+               "_meta": {"claudecode/serverName": "probe"}})
+    }
+
+    /// Ask on a task; `cancel` resolves the asker's cancellation when sent (or dropped).
+    fn ask(h: &Harness, reply_to: &str, params: Value) -> (tokio::task::JoinHandle<Result<Value, String>>, oneshot::Sender<()>) {
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let (registry, channel_id, reply_to) = (h.registry.clone(), h.channel_id.clone(), reply_to.to_string());
+        let task = tokio::spawn(async move {
+            request_elicitation(&registry, &channel_id, &reply_to, params, async move {
+                let _ = cancel_rx.await;
+            })
+            .await
+        });
+        (task, cancel_tx)
+    }
+
+    async fn next_frame(h: &mut Harness) -> Value {
+        let s = timeout(Duration::from_secs(5), h.out_rx.recv()).await.expect("a frame to the client").unwrap();
+        serde_json::from_str(&s).unwrap()
+    }
+
+    async fn end_turn(h: Harness) -> Vec<Value> {
+        let mut h = h;
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: h.turn_id.clone(),
+            platform: "acp".into(),
+            channel: crate::schema::ReplyChannel { id: h.channel_id.clone(), thread_id: None },
+            content: crate::schema::Content { content_type: "text".into(), text: "done".into(), attachments: Vec::new() },
+            command: None,
+            request_id: None,
+            quote_message_id: None,
+        };
+        handle_reply(&reply, &h.registry).await;
+        timeout(Duration::from_secs(5), &mut h.handle).await.expect("turn must end").unwrap();
+        let mut frames = Vec::new();
+        while let Ok(s) = h.out_rx.try_recv() {
+            frames.push(serde_json::from_str(&s).unwrap());
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_declared_form_question_reaches_the_client_and_its_answer_the_asker() {
+        let mut h = start(Some(json!({"form": {}}))).await;
+        let (task, _keep) = ask(&h, &h.turn_id.clone(), form_params());
+        let req = next_frame(&mut h).await;
+        assert_eq!(req["method"], json!("elicitation/create"));
+        assert_eq!(req["params"], form_params(), "params pass through unchanged, _meta included");
+        let gid = req["id"].clone();
+        let answer = json!({"action": "accept", "content": {"choice": "approve"}});
+        assert!(route_client_response(&h.pending, &json!({"jsonrpc": "2.0", "id": gid, "result": answer})).await);
+        assert_eq!(timeout(Duration::from_secs(5), task).await.unwrap().unwrap(), Ok(answer));
+        let frames = end_turn(h).await;
+        assert!(frames.iter().all(|f| f["method"] != json!("$/cancel_request")), "an answered question is not withdrawn: {frames:?}");
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_an_error_to_the_asker() {
+        let mut h = start(Some(json!({"form": {}}))).await;
+        let (task, _keep) = ask(&h, &h.turn_id.clone(), form_params());
+        let gid = next_frame(&mut h).await["id"].clone();
+        route_client_response(&h.pending, &json!({"jsonrpc": "2.0", "id": gid, "error": {"code": -32602, "message": "cannot render"}})).await;
+        let r = timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(r.as_ref().is_err_and(|e| e.contains("cannot render")), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_mode_is_refused_without_asking_the_client() {
+        let mut h = start(Some(json!({"form": {}}))).await;
+        let mut url = form_params();
+        url["mode"] = json!("url");
+        let (task, _keep) = ask(&h, &h.turn_id.clone(), url);
+        let r = timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(r.is_err(), "{r:?}");
+        // Nothing declared at all: refused the same way.
+        let mut h2 = start(None).await;
+        let (task, _keep2) = ask(&h2, &h2.turn_id.clone(), form_params());
+        assert!(timeout(Duration::from_secs(5), task).await.unwrap().unwrap().is_err());
+        assert!(h.out_rx.try_recv().is_err() && h2.out_rx.try_recv().is_err(), "the client must not be asked");
+        assert!(h.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_turn_or_a_superseded_turn_is_refused() {
+        let h = start(Some(json!({"form": {}}))).await;
+        let r = request_elicitation(&h.registry, "acp_nobody", "", form_params(), std::future::pending()).await;
+        assert!(r.is_err(), "{r:?}");
+        let r = request_elicitation(&h.registry, &h.channel_id, "evt_stale", form_params(), std::future::pending()).await;
+        assert!(r.is_err_and(|e| e.contains("no longer active")));
+    }
+
+    #[tokio::test]
+    async fn the_asker_withdrawing_sends_cancel_request_and_drops_a_late_answer() {
+        let mut h = start(Some(json!({"form": {}}))).await;
+        let (task, cancel) = ask(&h, &h.turn_id.clone(), form_params());
+        let gid = next_frame(&mut h).await["id"].clone();
+        cancel.send(()).unwrap();
+        let r = timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert_eq!(r, Err("withdrawn".to_string()));
+        let n = next_frame(&mut h).await;
+        assert_eq!(n["method"], json!("$/cancel_request"));
+        assert_eq!(n["params"]["requestId"], gid);
+        assert!(h.pending.lock().await.is_empty(), "the pending entry is dropped");
+        // The client's answer after the withdrawal is consumed and goes nowhere.
+        assert!(route_client_response(&h.pending, &json!({"jsonrpc": "2.0", "id": gid, "result": {"action": "accept"}})).await);
+        let frames = end_turn(h).await;
+        assert_eq!(frames.iter().filter(|f| f["method"] == json!("$/cancel_request")).count(), 0, "withdrawn once only: {frames:?}");
+    }
+
+    #[tokio::test]
+    async fn turn_end_withdraws_open_questions_before_the_final_response() {
+        let mut h = start(Some(json!({"form": {}}))).await;
+        let (task, _keep) = ask(&h, &h.turn_id.clone(), form_params());
+        let gid = next_frame(&mut h).await["id"].clone();
+        let frames = end_turn(h).await;
+        let cancel_at = frames.iter().position(|f| f["method"] == json!("$/cancel_request")).expect("withdrawn");
+        let final_at = frames.iter().position(|f| f.get("id") == Some(&json!(9))).expect("final response");
+        assert!(cancel_at < final_at, "{frames:?}");
+        assert_eq!(frames[cancel_at]["params"]["requestId"], gid);
+        assert!(timeout(Duration::from_secs(5), task).await.unwrap().unwrap().is_err());
+    }
+
+    // Jellyfish nit b: a newer prompt taking the channel's sink ends the old turn, and the old
+    // turn's open questions fail back to their asker instead of hanging until core's timeout.
+    #[tokio::test]
+    async fn a_takeover_fails_the_old_turns_questions() {
+        let mut h = start(Some(json!({"form": {}}))).await;
+        let (task, _keep) = ask(&h, &h.turn_id.clone(), form_params());
+        let gid = next_frame(&mut h).await["id"].clone();
+        let (new_tx, _new_rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        install_reply_sink(
+            &h.registry,
+            &h.channel_id,
+            ReplySink { turn_id: "evt_newer".into(), tx: new_tx, owner: "conn-test".into(), generation: 0 },
+        );
+        let r = timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(r.is_err(), "{r:?}");
+        timeout(Duration::from_secs(5), &mut h.handle).await.expect("old turn ends").unwrap();
+        let mut withdrawn = false;
+        while let Ok(s) = h.out_rx.try_recv() {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            withdrawn |= v["method"] == json!("$/cancel_request") && v["params"]["requestId"] == gid;
+        }
+        assert!(withdrawn, "the old question is withdrawn on the client");
+    }
+
+    #[tokio::test]
+    async fn complete_is_forwarded_only_to_a_url_client() {
+        let mut h = start(Some(json!({"form": {}, "url": {}}))).await;
+        complete_elicitation(&h.registry, &h.channel_id, json!({"elicitationId": "e1"}));
+        let n = next_frame(&mut h).await;
+        assert_eq!(n["method"], json!("elicitation/complete"));
+        assert_eq!(n["params"]["elicitationId"], json!("e1"));
+
+        let h2 = start(Some(json!({"form": {}}))).await;
+        complete_elicitation(&h2.registry, &h2.channel_id, json!({"elicitationId": "e1"}));
+        let frames = end_turn(h2).await;
+        assert!(frames.iter().all(|f| f["method"] != json!("elicitation/complete")), "{frames:?}");
+    }
+}

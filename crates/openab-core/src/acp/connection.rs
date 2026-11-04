@@ -254,13 +254,41 @@ type SharedElicitationSink = Arc<Mutex<Option<ElicitationSink>>>;
 /// Answers the agent's `elicitation/create` requests without holding the connection lock.
 #[derive(Clone)]
 pub struct ElicitationResponder {
-    writer: Arc<Mutex<ChildStdin>>,
+    writer: ResponderWriter,
+}
+
+#[derive(Clone)]
+enum ResponderWriter {
+    Agent(Arc<Mutex<ChildStdin>>),
+    /// Tests: the answers are recorded instead of written to an agent process.
+    #[cfg(test)]
+    Recorded(mpsc::UnboundedSender<(JsonRpcId, Value)>),
 }
 
 impl ElicitationResponder {
     /// Send `result` (`{action, content?}`) as the response to agent request `agent_id`.
     pub async fn reply(&self, agent_id: JsonRpcId, result: Value) {
-        write_json_rpc_reply(&self.writer, &JsonRpcResponse::new(agent_id, result)).await;
+        match &self.writer {
+            ResponderWriter::Agent(w) => {
+                write_json_rpc_reply(w, &JsonRpcResponse::new(agent_id, result)).await
+            }
+            #[cfg(test)]
+            ResponderWriter::Recorded(tx) => {
+                let _ = tx.send((agent_id, result));
+            }
+        }
+    }
+
+    /// A responder that records each answer on the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn recorded() -> (Self, mpsc::UnboundedReceiver<(JsonRpcId, Value)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                writer: ResponderWriter::Recorded(tx),
+            },
+            rx,
+        )
     }
 }
 
@@ -675,7 +703,7 @@ impl AcpConnection {
     /// A handle for answering the agent's `elicitation/create` from outside the connection lock.
     pub fn elicitation_responder(&self) -> ElicitationResponder {
         ElicitationResponder {
-            writer: self.stdin.clone(),
+            writer: ResponderWriter::Agent(self.stdin.clone()),
         }
     }
 

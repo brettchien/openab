@@ -354,4 +354,264 @@ mod tests {
         s.cancelled().await; // already cancelled: returns at once
     }
 
+    // --- ElicitationTurn (ADR §2.3 / §4.2): every question is answered exactly once ---
+
+    use crate::acp::connection::{ElicitationEvent, ElicitationResponder};
+    use crate::acp::protocol::JsonRpcId;
+    use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    /// How the fake front-end answers.
+    enum Answer {
+        Now(Value),
+        Fail,
+        /// Waits until the question is withdrawn, then reports it gone.
+        UntilWithdrawn,
+    }
+
+    struct AskAdapter {
+        answer: Answer,
+        asked: StdMutex<Vec<Value>>,
+        withdrawn: AtomicUsize,
+        completed: StdMutex<Vec<Value>>,
+    }
+
+    impl AskAdapter {
+        fn new(answer: Answer) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                asked: StdMutex::new(Vec::new()),
+                withdrawn: AtomicUsize::new(0),
+                completed: StdMutex::new(Vec::new()),
+            })
+        }
+        fn asked(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatAdapter for AskAdapter {
+        fn platform(&self) -> &'static str {
+            "unified"
+        }
+        fn message_limit(&self) -> usize {
+            4096
+        }
+        async fn send_message(&self, channel: &ChannelRef, _: &str) -> anyhow::Result<MessageRef> {
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "m".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            c: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> anyhow::Result<ChannelRef> {
+            Ok(c.clone())
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+        async fn request_elicitation(
+            &self,
+            _: &ChannelRef,
+            params: Value,
+            cancel: CancelSignal,
+        ) -> anyhow::Result<Value> {
+            self.asked.lock().unwrap().push(params);
+            match &self.answer {
+                Answer::Now(v) => Ok(v.clone()),
+                Answer::Fail => Err(anyhow::anyhow!("front-end unreachable")),
+                Answer::UntilWithdrawn => {
+                    cancel.cancelled().await;
+                    self.withdrawn.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!("withdrawn"))
+                }
+            }
+        }
+        async fn complete_elicitation(&self, _: &ChannelRef, params: Value) -> anyhow::Result<()> {
+            self.completed.lock().unwrap().push(params);
+            Ok(())
+        }
+    }
+
+    fn channel() -> ChannelRef {
+        ChannelRef {
+            platform: "acp".into(),
+            channel_id: "acp_test".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_1".into()),
+        }
+    }
+
+    fn turn(
+        adapter: Arc<AskAdapter>,
+        turn_left: Duration,
+    ) -> (ElicitationTurn, tokio::sync::mpsc::UnboundedReceiver<(JsonRpcId, Value)>) {
+        let (responder, answers) = ElicitationResponder::recorded();
+        let t = ElicitationTurn::new(
+            adapter,
+            channel(),
+            responder,
+            tokio::time::Instant::now() + turn_left,
+        );
+        (t, answers)
+    }
+
+    fn create(id: u64) -> ElicitationEvent {
+        ElicitationEvent::Create {
+            agent_id: JsonRpcId::Unsigned(id),
+            params: json!({"mode": "form", "message": "approve?",
+                           "requestedSchema": {"type": "object", "properties": {}},
+                           "_meta": {"claudecode/serverName": "probe"}}),
+        }
+    }
+
+    async fn next_answer(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(JsonRpcId, Value)>,
+    ) -> (JsonRpcId, Value) {
+        tokio::time::timeout(Duration::from_secs(3600), rx.recv())
+            .await
+            .expect("an answer")
+            .expect("responder alive")
+    }
+
+    #[tokio::test]
+    async fn an_accepted_answer_reaches_the_agent_with_the_deadline_shown() {
+        let ok = json!({"action": "accept", "content": {"choice": "approve"}});
+        let a = AskAdapter::new(Answer::Now(ok.clone()));
+        let (mut t, mut answers) = turn(a.clone(), Duration::from_secs(1800));
+        t.handle(create(7));
+        assert_eq!(next_answer(&mut answers).await, (JsonRpcId::Unsigned(7), ok));
+        let asked = a.asked.lock().unwrap()[0].clone();
+        assert_eq!(asked["_meta"]["claudecode/serverName"], json!("probe"));
+        assert!(asked["_meta"]["openab/deadline"].is_string(), "{asked}");
+        t.finish().await;
+        assert!(answers.try_recv().is_err(), "answered exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_answer_or_an_adapter_error_is_cancel() {
+        for answer in [Answer::Now(json!({"action": "maybe"})), Answer::Fail] {
+            let (mut t, mut answers) = turn(AskAdapter::new(answer), Duration::from_secs(1800));
+            t.handle(create(1));
+            assert_eq!(next_answer(&mut answers).await.1, json!({"action": "cancel"}));
+            t.finish().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_question_times_out_as_cancel_and_is_withdrawn() {
+        let a = AskAdapter::new(Answer::UntilWithdrawn);
+        let (mut t, mut answers) = turn(a.clone(), Duration::from_secs(1800));
+        let started = tokio::time::Instant::now();
+        t.handle(create(1));
+        assert_eq!(next_answer(&mut answers).await.1, json!({"action": "cancel"}));
+        assert_eq!(started.elapsed(), ELICITATION_TIMEOUT, "the 10-minute wait");
+        assert_eq!(a.withdrawn.load(Ordering::SeqCst), 1, "the card is closed");
+        t.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_never_outlives_the_turn() {
+        let a = AskAdapter::new(Answer::UntilWithdrawn);
+        let (mut t, mut answers) = turn(a, Duration::from_secs(90));
+        let started = tokio::time::Instant::now();
+        t.handle(create(1));
+        assert_eq!(next_answer(&mut answers).await.1, json!({"action": "cancel"}));
+        assert_eq!(started.elapsed(), Duration::from_secs(90), "clamped to what is left of the turn");
+        t.finish().await;
+    }
+
+    #[tokio::test]
+    async fn the_agent_cancelling_withdraws_the_question() {
+        let a = AskAdapter::new(Answer::UntilWithdrawn);
+        let (mut t, mut answers) = turn(a.clone(), Duration::from_secs(1800));
+        t.handle(create(4));
+        while a.asked() == 0 {
+            tokio::task::yield_now().await;
+        }
+        t.handle(ElicitationEvent::CancelRequest { request_id: json!(4) });
+        assert_eq!(next_answer(&mut answers).await, (JsonRpcId::Unsigned(4), json!({"action": "cancel"})));
+        assert_eq!(a.withdrawn.load(Ordering::SeqCst), 1);
+        t.finish().await;
+    }
+
+    // ADR §5.1 Q7: at most 3 wait at once; the 4th is answered cancel without asking, and a
+    // settled question frees its slot for the next one.
+    #[tokio::test]
+    async fn at_most_three_open_and_a_settled_one_frees_its_slot() {
+        let a = AskAdapter::new(Answer::UntilWithdrawn);
+        let (mut t, mut answers) = turn(a.clone(), Duration::from_secs(1800));
+        for id in 1..=4 {
+            t.handle(create(id));
+        }
+        assert_eq!(next_answer(&mut answers).await, (JsonRpcId::Unsigned(4), json!({"action": "cancel"})));
+        while a.asked() < 3 {
+            tokio::task::yield_now().await;
+        }
+        t.handle(ElicitationEvent::CancelRequest { request_id: json!(1) });
+        assert_eq!(next_answer(&mut answers).await.0, JsonRpcId::Unsigned(1));
+        t.handle(create(5));
+        while a.asked() < 4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(answers.try_recv().is_err(), "the 5th was admitted, not refused");
+        t.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_id_is_refused() {
+        let a = AskAdapter::new(Answer::UntilWithdrawn);
+        let (mut t, mut answers) = turn(a.clone(), Duration::from_secs(1800));
+        t.handle(create(1));
+        t.handle(create(1));
+        assert_eq!(next_answer(&mut answers).await, (JsonRpcId::Unsigned(1), json!({"action": "cancel"})));
+        t.finish().await;
+        assert_eq!(a.asked(), 1, "asked once");
+        assert_eq!(next_answer(&mut answers).await.0, JsonRpcId::Unsigned(1), "the original, at turn end");
+    }
+
+    #[tokio::test]
+    async fn turn_end_answers_every_open_question_cancel() {
+        let a = AskAdapter::new(Answer::UntilWithdrawn);
+        let (mut t, mut answers) = turn(a.clone(), Duration::from_secs(1800));
+        t.handle(create(1));
+        t.handle(create(2));
+        while a.asked() < 2 {
+            tokio::task::yield_now().await;
+        }
+        t.finish().await;
+        let mut ids = vec![answers.try_recv().unwrap(), answers.try_recv().unwrap()];
+        ids.sort_by_key(|(id, _)| id.as_u64());
+        assert_eq!(
+            ids,
+            vec![
+                (JsonRpcId::Unsigned(1), json!({"action": "cancel"})),
+                (JsonRpcId::Unsigned(2), json!({"action": "cancel"})),
+            ]
+        );
+        assert_eq!(a.withdrawn.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn complete_is_forwarded_to_the_adapter() {
+        let a = AskAdapter::new(Answer::Fail);
+        let (mut t, _answers) = turn(a.clone(), Duration::from_secs(1800));
+        t.handle(ElicitationEvent::Complete { params: json!({"elicitationId": "e1"}) });
+        t.finish().await;
+        assert_eq!(*a.completed.lock().unwrap(), vec![json!({"elicitationId": "e1"})]);
+    }
 }
