@@ -45,3 +45,18 @@ Observed on the wire:
   not (only `mode`, `sessionId`, `message`, `requestedSchema`) — hence the ADR's §2.10 adapter patch.
 - An interrupted elicitation is abandoned, not answered: with the 2026-07-28 flow the tool call is never
   retried, so the server sees nothing (no `cancel`). Tests should assert "no retry" for interrupt.
+
+## Results (2026-11-04, image layout: patched global claude-agent-acp 0.99.1 + `CLAUDE_CODE_EXECUTABLE` = global CLI 2.1.312)
+
+Same as the Dockerfiles: `npm install -g` both, run `tools/acp-adapter-patch/patch-elicitation-server-name.mjs`
+on the global adapter, `ACP_AGENT` / `CLAUDE_CODE_EXECUTABLE` pointed at the global binaries.
+
+| Run | Server's `input_responses.decision` | `elicitation/create` `_meta` |
+|---|---|---|
+| `acp_client none` | `decline` | — (no request) |
+| `acp_client form accept` | `accept` + content | `{"claudecode/serverName":"probe"}` |
+| `acp_client form decline` | `decline` | same |
+| `acp_client form error` | `cancel` | same |
+
+The previous pin (0.84.0 + CLI 2.1.284) fails the probe tool with "Handler returned an invalid result"
+with or without the capability: that CLI does not understand `InputRequiredResult`.
