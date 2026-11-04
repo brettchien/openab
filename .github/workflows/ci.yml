@@ -93,6 +93,14 @@ jobs:
         run: cargo test --features acp
       - name: cargo build (unified)
         run: cargo build --features unified
+      # TEMPORARY (drop before review): the elicitation e2e runs this binary outside CI.
+      - name: upload openab binary (elicitation e2e)
+        if: github.head_ref == 'feat/acp-elicitation'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openab-unified-debug
+          path: target/debug/openab
+          retention-days: 3
 
   operator:
     needs: changes

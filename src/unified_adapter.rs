@@ -255,6 +255,49 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    #[cfg(feature = "acp")]
+    async fn request_elicitation(
+        &self,
+        channel: &ChannelRef,
+        params: serde_json::Value,
+        cancel: openab_core::acp::elicitation::CancelSignal,
+    ) -> Result<serde_json::Value> {
+        if channel.platform != "acp" {
+            return Err(anyhow!("elicitation is only supported for acp sessions"));
+        }
+        let registry = self
+            .gw_state
+            .acp_reply_registry
+            .as_ref()
+            .ok_or_else(|| anyhow!("acp gateway is not running"))?;
+        let reply_to = channel.origin_event_id.clone().unwrap_or_default();
+        openab_gateway::adapters::acp_server::request_elicitation(
+            registry,
+            &channel.channel_id,
+            &reply_to,
+            params,
+            cancel.cancelled(),
+        )
+        .await
+        .map_err(|e| anyhow!(e))
+    }
+
+    #[cfg(feature = "acp")]
+    async fn complete_elicitation(
+        &self,
+        channel: &ChannelRef,
+        params: serde_json::Value,
+    ) -> Result<()> {
+        if let Some(registry) = self.gw_state.acp_reply_registry.as_ref() {
+            openab_gateway::adapters::acp_server::complete_elicitation(
+                registry,
+                &channel.channel_id,
+                params,
+            );
+        }
+        Ok(())
+    }
+
     async fn send_keepalive(&self, channel: &ChannelRef) -> Result<()> {
         let reply = self.build_reply(channel, "", Some("keepalive"), None);
         let _ = self.dispatch_reply(&reply).await?;
